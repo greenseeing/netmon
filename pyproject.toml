@@ -1,0 +1,33 @@
+[project]
+name = "netmon"
+version = "0.1.0"
+description = "Passive network monitor: DNS, TLS SNI, HTTP hosts, and connection flows with timestamped JSONL logging"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+dependencies = [
+    "scapy>=2.6.1",
+    "pydantic>=2.11",
+    "structlog>=25.1",
+    "cryptography>=44",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]

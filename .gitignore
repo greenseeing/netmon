@@ -1,0 +1,9 @@
+logs/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.claude/settings.local.json
+issues/
+docs/*.local.md
