@@ -24,6 +24,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `netmon` group (`chmod 0750 root:netmon` on the private interpreter, guarded against
   shared `/usr` targets) rather than every local user; `--uninstall` reverses everything.
 
+- **TUI freeze cues + `y` to copy** — when the live feed freezes (selecting or
+  scrolling off the top row = INSPECT, or `space` = PAUSED) the feed border and
+  title change colour and a reverse-video FOLLOW/INSPECT/PAUSED badge shows in the
+  capture panel, so a frozen feed can no longer be mistaken for a hang; `Esc`
+  resumes following alongside `g`. Press `y` to copy the selected packet's detail
+  to the clipboard (OSC 52 — reaches the local clipboard even over SSH).
+
 ### Changed
 
 - **`netmon run` is ephemeral unless `--log`.** Persisting your DNS/TLS/HTTP

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -44,6 +44,25 @@ _COLUMNS = ("TIME", "KIND", "DIR", "HOST / NAME", "DETAIL")
 # Newest events sit at the top; only the most recent slice is drawn (the full
 # history is in the JSONL files and the 1000-event ring backs the detail pane).
 _DISPLAY_ROWS = 500
+
+# The three feed states, surfaced three ways so a frozen feed is unmissable: a colored
+# feed border (CSS class), the feed's border title, and a reverse-video badge in the
+# health panel. FOLLOW = live; INSPECT = frozen on a click/scroll; PAUSED = space-held.
+_FEED_TITLE = {
+    "FOLLOW": "live feed",
+    "INSPECT": "live feed — INSPECT · g/Esc to follow",
+    "PAUSED": "live feed — PAUSED · space to resume",
+}
+_MODE_HINT = {
+    "FOLLOW": "FOLLOW",
+    "INSPECT": "INSPECT g/Esc=follow",
+    "PAUSED": "PAUSED space=resume",
+}
+_MODE_STYLE = {
+    "FOLLOW": "bold black on green",
+    "INSPECT": "bold black on yellow",
+    "PAUSED": "bold white on red",
+}
 
 
 _COL_IDEAL = {"time": 12, "kind": 12, "dir": 3, "host": 40, "detail": 60}
@@ -104,6 +123,8 @@ class NetmonApp(App[None]):
     #feed-col { width: 1fr; }
     #side { width: 30; }
     #feed { height: 3fr; border: round $primary; }
+    #feed.inspecting { border: round $warning; border-title-color: $warning; }
+    #feed.paused { border: round $error; border-title-color: $error; }
     #detail { height: 1fr; border: round $secondary; padding: 0 1; color: $text-muted; }
     #hosts, #kinds, #health { border: round $accent; padding: 0 1; }
     #eps { height: 5; border: round $accent; }
@@ -118,6 +139,8 @@ class NetmonApp(App[None]):
         Binding("space", "toggle_pause", "Pause"),
         Binding("f", "cycle_filter", "Filter"),
         Binding("g", "follow", "Follow"),
+        Binding("escape", "follow", "Follow", show=False),
+        Binding("y", "copy_detail", "Copy"),
     ]
 
     def __init__(self, session: Session, model: DashboardModel) -> None:
@@ -134,6 +157,8 @@ class NetmonApp(App[None]):
         self._last_feed_width = -1
         self._following = True  # True while pinned to the top, tracking the newest row
         self._frozen: list[tuple[str, Event]] | None = None  # snapshot shown while paused
+        self._detail_event: Event | None = None  # event in the detail pane, for `y` copy
+        self._indicated_mode: str | None = None  # last mode painted onto the feed border
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -206,7 +231,11 @@ class NetmonApp(App[None]):
 
     def _enter_inspect(self) -> None:
         # Freeze on what's shown now so a later resize/filter redraws the same events,
-        # not the live tail. Snapshot once; paused already holds one.
+        # not the live tail. Snapshot once; paused already holds one. Toast only on the
+        # FOLLOW->inspect transition: not while already PAUSED (whose own badge shows the
+        # freeze), and not on every arrow key that re-enters inspect.
+        if self._mode() == "FOLLOW":
+            self.notify("feed frozen (INSPECT) — press g or Esc to follow")
         self._following = False
         if self._frozen is None:
             self._frozen = self.model.newest_first()
@@ -241,7 +270,29 @@ class NetmonApp(App[None]):
             table.move_cursor(row=table.get_row_index(key), scroll=False)
         except RowDoesNotExist:
             self._selected_key = None
-            self.query_one("#detail", Static).update("(expired)")
+            self._set_detail(None, "(expired)")
+
+    def _set_detail(self, event: Event | None, placeholder: str = "(select a row)") -> None:
+        # Single source for the detail pane: tracks the shown event so `y` yanks exactly
+        # what is on screen, and never leaves a stale event pinned when the pane clears.
+        self._detail_event = event
+        self.query_one("#detail", Static).update(
+            _format_detail(event) if event is not None else placeholder
+        )
+
+    def _mode(self) -> Literal["FOLLOW", "INSPECT", "PAUSED"]:
+        return "PAUSED" if self.paused else ("FOLLOW" if self._following else "INSPECT")
+
+    def _refresh_mode_indicator(self, mode: str) -> None:
+        # Paint the feed border + title to match the mode; only on a change so the 10 Hz
+        # tick doesn't refresh the border every frame.
+        if mode == self._indicated_mode:
+            return
+        self._indicated_mode = mode
+        feed = self.query_one("#feed", DataTable)
+        feed.set_class(mode == "PAUSED", "paused")
+        feed.set_class(mode == "INSPECT", "inspecting")
+        feed.border_title = _FEED_TITLE[mode]
 
     def _render_panels(self) -> None:
         proc = self.session.processor
@@ -257,11 +308,14 @@ class NetmonApp(App[None]):
         self.query_one("#eps", Sparkline).data = self.model.rate_series() or [0.0]
         st = self.session.capture.stats()
         kd = "n/a" if st.kernel_dropped is None else st.kernel_dropped
-        mode = "PAUSED" if self.paused else ("FOLLOW" if self._following else "INSPECT g=follow")
-        self.query_one("#health", Static).update(
+        mode = self._mode()
+        health = Text(
             f"packets {proc.coverage.packets}\nqueue   {st.queued}\n"
-            f"udrop   {st.userspace_dropped}\nkdrop   {kd}\n{mode}"
+            f"udrop   {st.userspace_dropped}\nkdrop   {kd}\n"
         )
+        health.append(_MODE_HINT[mode], style=_MODE_STYLE[mode])
+        self.query_one("#health", Static).update(health)
+        self._refresh_mode_indicator(mode)
 
     def _rebuild_feed(self) -> None:
         # Redraw the feed newest-first (latest at the top, btop-style), applying the
@@ -287,14 +341,14 @@ class NetmonApp(App[None]):
         # pane rather than let it show a stale event.
         if not self._displayed:
             self._selected_key = None
-            self.query_one("#detail", Static).update("(no events)")
+            self._set_detail(None, "(no events)")
         elif self._selected_key is None:
             pass
         elif self._selected_key in self._displayed:
             self._resync_cursor(table)
         else:
             self._selected_key = None
-            self.query_one("#detail", Static).update("(expired)")
+            self._set_detail(None, "(expired)")
 
     # --- events & actions ----------------------------------------------------
     def on_data_table_row_highlighted(self, message: DataTable.RowHighlighted) -> None:
@@ -306,10 +360,7 @@ class NetmonApp(App[None]):
         if message.cursor_row != 0:
             self._enter_inspect()
             self._selected_key = key
-        event = self.model.event_by_key(key) if key is not None else None
-        self.query_one("#detail", Static).update(
-            _format_detail(event) if event is not None else "(select a row)"
-        )
+        self._set_detail(self.model.event_by_key(key) if key is not None else None)
 
     async def action_quit(self) -> None:
         # Stop capture and let the consume worker finish and call exit(); this runs
@@ -340,6 +391,17 @@ class NetmonApp(App[None]):
     def action_follow(self) -> None:
         self._resume_follow()
         self.notify("following newest")
+
+    def action_copy_detail(self) -> None:
+        # Yank the selected packet's detail (the text shown in the pane) to the system
+        # clipboard via OSC 52 — reaches the local clipboard even over SSH, terminal
+        # permitting. Works whenever a packet is selected (any mode); the guard covers the
+        # empty feed / nothing-picked case.
+        if self._detail_event is None:
+            self.notify("no packet selected", severity="warning")
+            return
+        self.copy_to_clipboard(_format_detail(self._detail_event))
+        self.notify("copied packet detail to clipboard")
 
 
 async def run_dashboard(session: Session, args: argparse.Namespace) -> None:

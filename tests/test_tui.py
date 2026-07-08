@@ -20,7 +20,7 @@ from netmon import (
     Session,
     TlsSniEvent,
 )
-from netmon_tui import NetmonApp, run_dashboard
+from netmon_tui import NetmonApp, _format_detail, run_dashboard
 
 TS = "2025-07-02T23:46:40.123+00:00"
 PKT_TIME = 1751500000.123
@@ -328,6 +328,122 @@ class TestNetmonAppHardening:
             assert app.paused is False
             assert app._following is True
             assert app._frozen is None
+            await app.action_quit()
+
+    async def test_inspect_mode_is_highlighted(self, tmp_path: Path) -> None:
+        # Freezing on a click/nav must be unmissable: the feed box gets the `inspecting`
+        # class (colored border) and its title + the health badge say INSPECT. Resuming
+        # with `g` clears the highlight and the badge returns to FOLLOW.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test(size=(100, 24)) as pilot:
+            for i in range(5):
+                model.add_event(q(f"h{i}.example.com"))
+            app._render()
+            await pilot.pause()
+            feed = app.query_one("#feed", DataTable)
+            feed.move_cursor(row=2)  # navigate off the top -> INSPECT
+            await pilot.pause()
+            assert app._following is False
+            app._render()  # repaint the mode indicator
+            await pilot.pause()
+            assert feed.has_class("inspecting")
+            assert "INSPECT" in str(feed.border_title)
+            assert "INSPECT" in str(app.query_one("#health", Static).render())
+            await pilot.press("g")  # follow again
+            app._render()
+            await pilot.pause()
+            assert not feed.has_class("inspecting")
+            assert str(feed.border_title) == "live feed"
+            assert "FOLLOW" in str(app.query_one("#health", Static).render())
+            await app.action_quit()
+
+    async def test_pause_is_highlighted(self, tmp_path: Path) -> None:
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            model.add_event(q("a.com"))
+            app._render()
+            app.action_toggle_pause()
+            app._render()
+            await pilot.pause()
+            feed = app.query_one("#feed", DataTable)
+            assert feed.has_class("paused")
+            assert "PAUSED" in str(app.query_one("#health", Static).render())
+            await app.action_quit()
+
+    async def test_escape_resumes_follow(self, tmp_path: Path) -> None:
+        # Esc is a second way out of INSPECT, alongside `g`.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test(size=(100, 24)) as pilot:
+            for i in range(5):
+                model.add_event(q(f"h{i}.example.com"))
+            app._render()
+            await pilot.pause()
+            app.query_one("#feed", DataTable).move_cursor(row=2)
+            await pilot.pause()
+            assert app._following is False
+            await pilot.press("escape")
+            assert app._following is True
+            await app.action_quit()
+
+    async def test_copy_detail_yanks_selected_event(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # `y` copies the selected packet's detail text (the same text shown in the pane)
+        # to the clipboard via the app's copy_to_clipboard (OSC 52).
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        copied: list[str] = []
+        async with app.run_test() as pilot:
+            monkeypatch.setattr(app, "copy_to_clipboard", lambda text: copied.append(text))
+            event = q("copyme.example.com")
+            model.add_event(event)
+            app._render()
+            app.query_one("#feed", DataTable).move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("y")
+            assert copied == [_format_detail(event)]
+            assert "copyme.example.com" in copied[0]
+            await app.action_quit()
+
+    async def test_pause_while_following_then_click_stays_paused_no_inspect_toast(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Pausing keeps _following True; clicking a row then must NOT pop an INSPECT toast
+        # that contradicts the PAUSED border/badge. The toast fires only from FOLLOW.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        toasts: list[str] = []
+        async with app.run_test(size=(100, 24)) as pilot:
+            monkeypatch.setattr(app, "notify", lambda msg, **kw: toasts.append(msg))
+            for i in range(5):
+                model.add_event(q(f"h{i}.example.com"))
+            app._render()
+            await pilot.pause()
+            app.action_toggle_pause()  # paused, but still following
+            assert app.paused is True
+            app.query_one("#feed", DataTable).move_cursor(row=2)  # nav while paused
+            await pilot.pause()
+            app._render()
+            await pilot.pause()
+            assert not any("INSPECT" in t for t in toasts)
+            feed = app.query_one("#feed", DataTable)
+            assert feed.has_class("paused")
+            assert not feed.has_class("inspecting")
+            assert "PAUSED" in str(app.query_one("#health", Static).render())
+            await app.action_quit()
+
+    async def test_copy_detail_without_selection_copies_nothing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        copied: list[str] = []
+        async with app.run_test() as pilot:
+            monkeypatch.setattr(app, "copy_to_clipboard", lambda text: copied.append(text))
+            await pilot.press("y")  # nothing selected
+            assert copied == []
             await app.action_quit()
 
     async def test_quit_exits_cleanly_and_marks_worker_done(self, tmp_path: Path) -> None:
