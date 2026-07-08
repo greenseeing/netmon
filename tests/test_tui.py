@@ -9,8 +9,10 @@ pytest.importorskip("textual")
 from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import Ether
+from structlog.testing import capture_logs
 from textual.widgets import DataTable, Static
 
+import netmon_tui
 from netmon import (
     CaptureStats,
     DashboardModel,
@@ -392,12 +394,19 @@ class TestNetmonAppHardening:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         # `y` copies the selected packet's detail text (the same text shown in the pane)
-        # to the clipboard via the app's copy_to_clipboard (OSC 52).
+        # through the clipboard helper; a confirmed local copy toasts success.
         model = DashboardModel()
         app = NetmonApp(make_session(tmp_path), model)
         copied: list[str] = []
+        toasts: list[str] = []
+
+        def fake_copy(text: str, *, env, write) -> netmon_tui.CopyResult:
+            copied.append(text)
+            return netmon_tui.CopyResult.LOCAL
+
         async with app.run_test() as pilot:
-            monkeypatch.setattr(app, "copy_to_clipboard", lambda text: copied.append(text))
+            monkeypatch.setattr(netmon_tui, "copy_to_clipboard", fake_copy)
+            monkeypatch.setattr(app, "notify", lambda msg, **kw: toasts.append(msg))
             event = q("copyme.example.com")
             model.add_event(event)
             app._render()
@@ -406,6 +415,7 @@ class TestNetmonAppHardening:
             await pilot.press("y")
             assert copied == [_format_detail(event)]
             assert "copyme.example.com" in copied[0]
+            assert toasts == ["copied packet detail to clipboard"]
             await app.action_quit()
 
     async def test_pause_while_following_then_click_stays_paused_no_inspect_toast(
@@ -439,11 +449,97 @@ class TestNetmonAppHardening:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         app = NetmonApp(make_session(tmp_path), DashboardModel())
-        copied: list[str] = []
+        calls: list[str] = []
+        toasts: list[tuple[str, dict]] = []
         async with app.run_test() as pilot:
-            monkeypatch.setattr(app, "copy_to_clipboard", lambda text: copied.append(text))
+            monkeypatch.setattr(
+                netmon_tui, "copy_to_clipboard", lambda *a, **k: calls.append("called")
+            )
+            monkeypatch.setattr(app, "notify", lambda msg, **kw: toasts.append((msg, kw)))
             await pilot.press("y")  # nothing selected
-            assert copied == []
+            assert calls == []
+            assert toasts and "no packet selected" in toasts[0][0]
+            assert toasts[0][1].get("severity") == "warning"
+            await app.action_quit()
+
+    async def test_copy_detail_terminal_result_reports_best_effort(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # OSC-52-only copies are unconfirmable, so the toast must not claim success.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        toasts: list[str] = []
+        async with app.run_test() as pilot:
+            monkeypatch.setattr(
+                netmon_tui,
+                "copy_to_clipboard",
+                lambda text, *, env, write: netmon_tui.CopyResult.TERMINAL,
+            )
+            monkeypatch.setattr(app, "notify", lambda msg, **kw: toasts.append(msg))
+            model.add_event(q("x.example.com"))
+            app._render()
+            app.query_one("#feed", DataTable).move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("y")
+            assert toasts and "OSC 52" in toasts[0]
+            await app.action_quit()
+
+    async def test_copy_detail_failed_result_warns(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        toasts: list[tuple[str, dict]] = []
+        async with app.run_test() as pilot:
+            monkeypatch.setattr(
+                netmon_tui,
+                "copy_to_clipboard",
+                lambda text, *, env, write: netmon_tui.CopyResult.FAILED,
+            )
+            monkeypatch.setattr(app, "notify", lambda msg, **kw: toasts.append((msg, kw)))
+            model.add_event(q("x.example.com"))
+            app._render()
+            app.query_one("#feed", DataTable).move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("y")
+            assert toasts and "copy failed" in toasts[0][0]
+            assert toasts[0][1].get("severity") == "warning"
+            await app.action_quit()
+
+    async def test_copy_detail_logs_clipboard_event(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            monkeypatch.setattr(
+                netmon_tui,
+                "copy_to_clipboard",
+                lambda text, *, env, write: netmon_tui.CopyResult.LOCAL,
+            )
+            event = q("logme.example.com")
+            model.add_event(event)
+            app._render()
+            app.query_one("#feed", DataTable).move_cursor(row=0)
+            await pilot.pause()
+            with capture_logs() as logs:
+                await pilot.press("y")
+            entries = [e for e in logs if e.get("event") == "clipboard_copy"]
+            assert entries and entries[0]["result"] == "local"
+            assert entries[0]["chars"] == len(_format_detail(event))
+            await app.action_quit()
+
+    async def test_term_write_emits_via_driver_from_worker_thread(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The OSC 52 fallback reaches the terminal through the private driver, marshalled
+        # back onto the event loop from the clipboard worker thread by call_from_thread.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        written: list[str] = []
+        async with app.run_test():
+            monkeypatch.setattr(app._driver, "write", lambda seq: written.append(seq))
+            await asyncio.to_thread(app._term_write, "\x1b]52;c;QUJD\a")
+            assert written == ["\x1b]52;c;QUJD\a"]
             await app.action_quit()
 
     async def test_quit_exits_cleanly_and_marks_worker_done(self, tmp_path: Path) -> None:

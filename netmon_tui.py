@@ -7,10 +7,12 @@ feeds the model, a 10 Hz timer snapshots the model + processor + capture and rep
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from typing import TYPE_CHECKING, ClassVar, Literal
 
+import structlog
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,12 +23,14 @@ from textual.widgets.data_table import RowDoesNotExist
 
 from netmon import (
     KIND_STYLE,
+    CopyResult,
     DashboardModel,
     Event,
     Session,
     announce_start,
     configure_logging,
     consume,
+    copy_to_clipboard,
     event_to_cells,
     open_private_new,
     persist_enabled,
@@ -34,6 +38,8 @@ from netmon import (
 
 if TYPE_CHECKING:
     import argparse
+
+log = structlog.get_logger()
 
 # `f` cycles the feed through these substring filters (matched against kind / host /
 # detail by DashboardModel.passes); None shows everything.
@@ -392,16 +398,41 @@ class NetmonApp(App[None]):
         self._resume_follow()
         self.notify("following newest")
 
-    def action_copy_detail(self) -> None:
+    def _term_write(self, seq: str) -> None:
+        # Raw escape bytes to the terminal, for the OSC 52 fallback. Textual exposes no
+        # public raw-write API, so we reuse the private driver its own copy_to_clipboard
+        # writes through. Invoked from the clipboard worker thread, so hop back onto the
+        # event loop via call_from_thread — a driver write must not race the compositor.
+        # The guard covers the pre-mount / post-shutdown window when there is no driver.
+        driver = self._driver
+        if driver is not None:
+            self.call_from_thread(driver.write, seq)
+
+    async def action_copy_detail(self) -> None:
         # Yank the selected packet's detail (the text shown in the pane) to the system
-        # clipboard via OSC 52 — reaches the local clipboard even over SSH, terminal
-        # permitting. Works whenever a packet is selected (any mode); the guard covers the
-        # empty feed / nothing-picked case.
+        # clipboard. A local session copies via a clipboard CLI (confirmable, bypasses
+        # tmux); otherwise it falls back to OSC 52 (best-effort). The toast reflects which
+        # happened instead of always claiming success. The CLI spawn can block for up to a
+        # couple seconds, so it runs off the event loop to keep the TUI responsive. Works
+        # whenever a packet is selected; the guard covers the nothing-picked case.
         if self._detail_event is None:
             self.notify("no packet selected", severity="warning")
             return
-        self.copy_to_clipboard(_format_detail(self._detail_event))
-        self.notify("copied packet detail to clipboard")
+        text = _format_detail(self._detail_event)
+        result = await asyncio.to_thread(
+            copy_to_clipboard, text, env=os.environ, write=self._term_write
+        )
+        emit = log.warning if result is CopyResult.FAILED else log.info
+        emit("clipboard_copy", result=result.value, chars=len(text))
+        if result is CopyResult.LOCAL:
+            self.notify("copied packet detail to clipboard")
+        elif result is CopyResult.TERMINAL:
+            self.notify(
+                "copy sent to terminal (OSC 52) — needs terminal/tmux clipboard support",
+                timeout=6,
+            )
+        else:
+            self.notify("copy failed: no clipboard available", severity="warning")
 
 
 async def run_dashboard(session: Session, args: argparse.Namespace) -> None:

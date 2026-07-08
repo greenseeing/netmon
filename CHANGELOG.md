@@ -28,8 +28,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scrolling off the top row = INSPECT, or `space` = PAUSED) the feed border and
   title change colour and a reverse-video FOLLOW/INSPECT/PAUSED badge shows in the
   capture panel, so a frozen feed can no longer be mistaken for a hang; `Esc`
-  resumes following alongside `g`. Press `y` to copy the selected packet's detail
-  to the clipboard (OSC 52 — reaches the local clipboard even over SSH).
+  resumes following alongside `g`. Press `y` to copy the selected packet's
+  detail to the clipboard: a local session copies through a clipboard tool
+  (`wl-copy`/`xclip`/`xsel`/`pbcopy`/`clip.exe`), which is confirmable and works
+  through `tmux`/`screen`; SSH/remote sessions fall back to OSC 52. The toast
+  reports which path was taken instead of always claiming success, and each
+  attempt logs a `clipboard_copy` event.
 
 ### Changed
 

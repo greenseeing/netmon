@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -15,10 +16,11 @@ import subprocess
 import sys
 import time
 from collections import Counter, OrderedDict
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol, TextIO, cast
 
@@ -1944,6 +1946,67 @@ def configure_logging(stream: TextIO | None = None) -> None:
         wrapper_class=structlog.make_filtering_bound_logger(20),
         logger_factory=structlog.PrintLoggerFactory(file=stream or sys.stdout),
     )
+
+
+class CopyResult(StrEnum):
+    LOCAL = "local"  # a local clipboard CLI confirmed the copy (exit 0)
+    TERMINAL = "terminal"  # OSC 52 emitted to the terminal — best-effort, unconfirmable
+    FAILED = "failed"  # no clipboard path available
+
+
+def _local_clipboard_argv(
+    env: Mapping[str, str], which: Callable[[str], str | None]
+) -> list[str] | None:
+    # The first reachable local clipboard sink, or None. Wayland/X11 are gated on their
+    # display env var so we never spawn a tool that will just fail to connect.
+    if env.get("WAYLAND_DISPLAY") and (exe := which("wl-copy")):
+        return [exe]
+    if env.get("DISPLAY"):
+        if exe := which("xclip"):
+            return [exe, "-selection", "clipboard"]
+        if exe := which("xsel"):
+            return [exe, "--clipboard", "--input"]
+    if exe := which("pbcopy"):
+        return [exe]
+    if exe := which("clip.exe"):
+        return [exe]
+    return None
+
+
+def copy_to_clipboard(
+    text: str,
+    *,
+    env: Mapping[str, str],
+    write: Callable[[str], None] | None = None,
+    run: Callable[..., Any] = subprocess.run,
+    which: Callable[[str], str | None] = shutil.which,
+) -> CopyResult:
+    # Two layered paths. A local, non-SSH session writes straight to the OS clipboard via
+    # a CLI: it bypasses the terminal and any tmux/screen in the way, and its exit code is
+    # a real success signal. Otherwise (remote, or no local sink) fall back to OSC 52,
+    # which is the only thing that can reach the user's clipboard down an SSH pipe but is
+    # unconfirmable — the terminal, or an outer tmux with `set-clipboard on`, decides
+    # whether it sticks.
+    #
+    # `env` selects the branch only; the spawned CLI inherits the real process environment
+    # (DISPLAY/XAUTHORITY/PATH), never a stripped-down copy. SSH_CONNECTION/SSH_TTY guard
+    # against writing the wrong machine's clipboard, but this is best-effort under sudo: a
+    # bare `sudo` (env_reset) drops those vars, so a remote session that kept a local
+    # DISPLAY through sudoers could misread as local. The --setcap deployment (no sudo)
+    # has no such gap.
+    remote = bool(env.get("SSH_CONNECTION") or env.get("SSH_TTY"))
+    if not remote and (argv := _local_clipboard_argv(env, which)) is not None:
+        try:
+            proc = run(argv, input=text.encode(), capture_output=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            return CopyResult.LOCAL
+    if write is not None:
+        payload = base64.b64encode(text.encode()).decode("ascii")
+        write(f"\x1b]52;c;{payload}\a")
+        return CopyResult.TERMINAL
+    return CopyResult.FAILED
 
 
 @dataclass
