@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import struct
 from pathlib import Path
 from typing import Any
@@ -650,6 +651,54 @@ class TestQuestionList:
 
     def test_none_is_empty(self) -> None:
         assert question_list(None) == []
+
+
+class TestMalformedPacketResilience:
+    # A passive monitor ingests untrusted traffic; scapy accepts many malformed packets
+    # and only raises when a field is read. process() must survive any such packet,
+    # account it, and keep going — one bad packet cannot kill the capture loop.
+    @staticmethod
+    def _pkt(dns_bytes: bytes):
+        p = Ether(bytes(Ether() / IP(src="10.0.0.5", dst="10.0.0.1")
+                        / UDP(sport=40000, dport=53) / dns_bytes))
+        p.time = PKT_TIME
+        return p
+
+    def test_malformed_dns_packet_accounted_not_crashed(self) -> None:
+        # A real fuzzed port-53 packet that scapy accepts but whose record-field read
+        # (here .type) raises; _process would die, process() must catch and account it.
+        raw = bytes.fromhex(
+            "000081000001000100000000016103636f6d00c6010001016103636f6d37"
+            "000100010000001a000401010101"
+        )
+        proc = PacketProcessor(local_ips=frozenset())
+        assert proc.process(self._pkt(raw)) == []
+        assert proc.coverage.fate["parse_error"] == 1
+        assert proc.summary()["coverage"]["parse_failed"]["packet"] == 1
+
+    def test_fuzzed_malformed_packets_never_crash_the_worker(self) -> None:
+        seeds = [
+            bytes(DNS(rd=1, qd=DNSQR(qname="example.com", qtype="A"))),
+            bytes(DNS(qr=1, qd=DNSQR(qname="a.com"),
+                      an=DNSRR(rrname="a.com", type="A", rdata="1.1.1.1"), ancount=1)),
+            bytes(DNS(rd=1, qd=DNSQR(qname="x.com"), ar=DNSRROPT(rrname=""))),
+        ]
+        rng = random.Random(20260708)
+        proc = PacketProcessor(local_ips=frozenset())
+        for _ in range(3000):
+            b = bytearray(rng.choice(seeds))
+            if rng.random() < 0.7:
+                struct.pack_into(">H", b, rng.choice([4, 6, 8, 10]), rng.randint(0, 5))
+            for _ in range(rng.randint(0, 6)):
+                b[rng.randrange(len(b))] = rng.randrange(256)
+            proc.process(self._pkt(bytes(b)))  # must not raise
+        assert proc.coverage.fate["parse_error"] > 0  # the fuzz actually hit the guard
+
+    def test_well_formed_dns_unaffected_by_guard(self) -> None:
+        proc = PacketProcessor(local_ips=frozenset())
+        events = proc.process(self._pkt(bytes(DNS(rd=1, qd=DNSQR(qname="good.example.com")))))
+        assert any(isinstance(e, DnsQueryEvent) and e.qname == "good.example.com" for e in events)
+        assert proc.coverage.fate["parse_error"] == 0
 
 
 class TestDnsEvents:

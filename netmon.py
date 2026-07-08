@@ -1353,7 +1353,19 @@ class PacketProcessor:
         return events
 
     def process(self, pkt: Packet) -> list[Event]:
+        # A passive monitor ingests untrusted, often malformed traffic; scapy accepts
+        # many such packets and only raises when a field is read (a truncated record,
+        # a header count that lies). One bad packet must never kill the capture loop,
+        # so every parse runs under this guard: account the packet as a parse error and
+        # move on. The packet is still counted (saw) so the fate ledger stays complete.
         self.coverage.saw()
+        try:
+            return self._process(pkt)
+        except Exception:
+            self.coverage.mark("parse_error")
+            return []
+
+    def _process(self, pkt: Packet) -> list[Event]:
         t = float(pkt.time)
         if self._is_loopback_duplicate(pkt, t):
             self.coverage.mark("loopback_dup")
@@ -1717,6 +1729,7 @@ class PacketProcessor:
             },
             "parse_failed": {
                 "quic_initial": self.quic.decrypt_failures,
+                "packet": self.coverage.fate["parse_error"],
             },
         }
 

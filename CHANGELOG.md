@@ -52,14 +52,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Capture crash on some scapy builds (`AttributeError: qname`).** On scapy
-  versions that represent a DNS message's sections as one linked record chain
-  (rather than lists), walking the question section ran past the questions into
-  the resource records; reading a question's name off a resource record killed
-  the capture worker — taking the `--tui` dashboard down with it and crashing the
-  headless path too. Questions are now filtered to actual question records at
-  every site that walks one (DNS, LLMNR, and off-port/TCP DNS recognition), so a
-  resource record can never be mistaken for a question.
+- **Capture crash on malformed packets (`AttributeError`).** A truncated or
+  malformed packet on a DNS port is accepted by the parser but raises when a
+  record field is read, which killed the capture worker — taking the `--tui`
+  dashboard down with it, and crashing the headless path too. Packet processing
+  is now resilient: any parser failure is caught and counted as `parse_failed`
+  (`packet`) in the coverage summary instead of aborting the run, so one bad
+  packet can no longer stop monitoring. DNS/LLMNR question parsing was
+  additionally hardened to never mistake a resource record for a question.
 
 ## [0.1.0] – Initial public release
 
