@@ -2,6 +2,7 @@ import argparse
 import json
 import struct
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -32,11 +33,14 @@ from scapy.packet import Packet
 from scapy.utils import wrpcap
 
 from netmon import (
+    KIND_STYLE,
+    KIND_TO_FILE,
     QUIC_V1,
     QUIC_V2,
     RA_RDNSS_NAME,
     ArpEvent,
     BoundedCounter,
+    DashboardModel,
     DnsAnswerEvent,
     DnsEcsEvent,
     DnsHttpsEvent,
@@ -55,11 +59,16 @@ from netmon import (
     NbnsEvent,
     PacketProcessor,
     QuicReassembler,
+    RateBucketer,
     ReplayCapture,
     TcpReassembler,
     TlsSniEvent,
     _client_stream_start,
     derive_initial_keys,
+    event_detail,
+    event_direction,
+    event_host,
+    event_to_cells,
     header_protection_mask,
     packet_nonce,
     parse_client_hello,
@@ -2191,3 +2200,271 @@ class TestDnsTcpVsTlsRouting:
         answers = [e for e in proc.process(seg2) if isinstance(e, DnsAnswerEvent)]
         assert len(answers) == 1
         assert answers[0].rtype == "TXT"
+
+
+TS = "2025-07-02T23:46:40.123+00:00"
+
+
+def q(name: str = "example.com") -> DnsQueryEvent:
+    return DnsQueryEvent(
+        ts=TS, src="10.0.0.5", dst="10.0.0.1", transport="udp", qname=name, qtype="A"
+    )
+
+
+class _Clock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class TestRateBucketer:
+    def test_counts_per_second_and_windows(self) -> None:
+        r = RateBucketer(window=60)
+        r.tick(1000.0)
+        r.tick(1000.4)
+        r.tick(1001.0)
+        assert r.series(1001.0)[-1] == 1.0
+        assert r.series(1001.0)[-2] == 2.0
+        assert len(r.series(1001.0)) == 60
+
+    def test_old_buckets_trimmed_beyond_window(self) -> None:
+        r = RateBucketer(window=60)
+        r.tick(1000.0)
+        r.tick(2000.0)
+        series = r.series(2000.0)
+        assert series[-1] == 1.0
+        assert sum(series) == 1.0  # the 1000.0 bucket aged out
+
+
+class TestDashboardModelRing:
+    def test_ring_caps_and_drops_oldest(self) -> None:
+        m = DashboardModel(cap=10)
+        for i in range(15):
+            m.add_event(q(f"h{i}"))
+        assert len(m.recent(1000)) == 10
+        # the first 5 keys (seq 0..4) were evicted
+        assert m.event_by_key("0") is None
+        assert m.event_by_key("14") is not None
+
+    def test_drain_new_returns_deltas_then_resets(self) -> None:
+        m = DashboardModel(cap=100)
+        m.add_event(q("a"))
+        m.add_event(q("b"))
+        added, evicted = m.drain_new()
+        assert [k for k, _ in added] == ["0", "1"]
+        assert evicted == []
+        m.add_event(q("c"))
+        added2, _ = m.drain_new()
+        assert [k for k, _ in added2] == ["2"]
+
+    def test_drain_reports_evicted_keys(self) -> None:
+        m = DashboardModel(cap=2)
+        for i in range(4):
+            m.add_event(q(f"h{i}"))
+        _, evicted = m.drain_new()
+        assert evicted == ["0", "1"]
+
+    def test_rate_series_uses_injected_clock(self) -> None:
+        clk = _Clock(1000.0)
+        m = DashboardModel(clock=clk)
+        m.add_event(q("a"))
+        m.add_event(q("b"))
+        m.add_event(q("c"))
+        clk.t = 1001.0
+        m.add_event(q("d"))
+        m.add_event(q("e"))
+        series = m.rate_series()
+        assert series[-1] == 2.0
+        assert series[-2] == 3.0
+
+
+class TestDashboardModelFilter:
+    def test_no_filter_passes_all(self) -> None:
+        m = DashboardModel()
+        assert m.passes(q("x")) is True
+
+    def test_filter_matches_kind(self) -> None:
+        m = DashboardModel()
+        m.filter = "tls"
+        sni = TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="github.com")
+        assert m.passes(sni) is True
+        assert m.passes(q("x")) is False
+
+    def test_filter_matches_host_substring(self) -> None:
+        m = DashboardModel()
+        m.filter = "github"
+        sni = TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="api.github.com")
+        assert m.passes(sni) is True
+
+    def test_filter_never_drops_from_ring(self) -> None:
+        m = DashboardModel(cap=100)
+        m.filter = "nomatch"
+        m.add_event(q("a"))  # filter is a view; ring keeps everything
+        assert len(m.recent(1000)) == 1
+
+
+class TestEventDirection:
+    def test_query_is_outbound(self) -> None:
+        assert event_direction(q("x")) == "→"
+
+    def test_answer_is_inbound(self) -> None:
+        a = DnsAnswerEvent(
+            ts=TS, resolver="10.0.0.1", qname="x", rtype="A", value="1.2.3.4", ttl=60
+        )
+        assert event_direction(a) == "←"
+
+    def test_flow_uses_its_direction(self) -> None:
+        def flow(direction: str) -> FlowEvent:
+            return FlowEvent(
+                ts=TS, proto="tcp", direction=direction, scope="internet", birth="observed",
+                local_ip="10.0.0.5", local_port=51000, remote_ip="1.2.3.4", remote_port=443,
+                service="https", hostname="github.com",
+            )
+        assert event_direction(flow("outbound")) == "→"
+        assert event_direction(flow("inbound")) == "←"
+        assert event_direction(flow("transit")) == "↔"
+
+    def test_arp_is_link_local_glyph(self) -> None:
+        arp = ArpEvent(
+            ts=TS, op="who-has", sender_ip="10.0.0.5",
+            sender_mac="aa:bb:cc:dd:ee:ff", target_ip="10.0.0.1",
+        )
+        assert event_direction(arp) == "·"
+
+
+class TestEventToCells:
+    def test_five_columns_and_time_slice(self) -> None:
+        cells = event_to_cells(q("example.com"))
+        assert len(cells) == 5
+        assert cells[0] == "23:46:40.123"
+        assert cells[1] == "dns_query"
+        assert cells[3] == "example.com"
+
+    def test_ech_only_sni_shows_cover_marker(self) -> None:
+        sni = TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="", ech=True)
+        assert event_host(sni) == "(ech)"
+
+    def test_inbound_flow_host_is_hostname_then_ip(self) -> None:
+        named = FlowEvent(
+            ts=TS, proto="tcp", direction="inbound", scope="internet", birth="pre-existing",
+            local_ip="10.0.0.5", local_port=443, remote_ip="1.2.3.4", remote_port=51000,
+            service="https", hostname="github.com",
+        )
+        anon = named.model_copy(update={"hostname": None})
+        assert event_host(named) == "github.com"
+        assert event_host(anon) == "1.2.3.4"
+
+    def test_http_detail_has_method_and_path(self) -> None:
+        h = HttpEvent(
+            ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=80, method="GET",
+            host="neverssl.com", path="/", user_agent="curl",
+        )
+        assert event_detail(h) == "GET /"
+
+    def test_every_event_kind_renders_without_error(self) -> None:
+        samples = [
+            q("x"),
+            DnsAnswerEvent(
+                ts=TS, resolver="10.0.0.1", qname="x", rtype="A", value="1.2.3.4", ttl=60
+            ),
+            DnsResponseEvent(ts=TS, resolver="10.0.0.1", qname="x", qtype="A", rcode="NXDOMAIN"),
+            DnsHttpsEvent(
+                ts=TS, resolver="10.0.0.1", qname="x", rtype="HTTPS", priority=1,
+                target=".", alpn=["h3"], ech=True, ttl=60,
+            ),
+            DnsEcsEvent(
+                ts=TS, src="10.0.0.5", dst="10.0.0.1", qname="x", client_subnet="1.2.3.0/24"
+            ),
+            TlsSniEvent(
+                ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="github.com", alpn=["h2"]
+            ),
+            HttpEvent(
+                ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=80, method="GET",
+                host="x", path="/", user_agent=None,
+            ),
+            FlowEvent(
+                ts=TS, proto="udp", direction="outbound", scope="lan", birth="datagram",
+                local_ip="10.0.0.5", local_port=5353, remote_ip="224.0.0.251",
+                remote_port=5353, service="mdns", hostname=None,
+            ),
+            ArpEvent(
+                ts=TS, op="who-has", sender_ip="10.0.0.5",
+                sender_mac="aa:bb:cc:dd:ee:ff", target_ip="10.0.0.1",
+            ),
+            Icmp6RaEvent(
+                ts=TS, router="fe80::1", prefixes=["2001:db8::/64"], rdnss=["2001:db8::1"]
+            ),
+            LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="wpad", qtype="A"),
+            NbnsEvent(ts=TS, src="10.0.0.5", dst="10.0.0.255", qname="WORKGROUP"),
+        ]
+        seen = {e.kind for e in samples}
+        assert seen == set(KIND_TO_FILE)  # one sample per emitted kind
+        for e in samples:
+            cells = event_to_cells(e)
+            assert len(cells) == 5
+            assert all(isinstance(c, str) for c in cells)
+
+
+class TestKindStyle:
+    def test_every_emitted_kind_has_a_color(self) -> None:
+        assert set(KIND_TO_FILE) <= set(KIND_STYLE)
+
+
+class TestRenderHelpersAcrossModuleCopies:
+    # Running `netmon.py` as a script makes its Event classes `__main__.*`, while
+    # netmon_tui imports the `netmon.*` copies — so class-identity dispatch (isinstance
+    # / case ClassName()) silently misses every event and blanks HOST/DETAIL in the TUI.
+    # Loading a second module copy reproduces that split; the helpers must dispatch on
+    # .kind and keep working.
+    def _alt_module(self) -> Any:
+        import importlib.util
+
+        import netmon
+
+        spec = importlib.util.spec_from_file_location("netmon_altcopy", netmon.__file__)
+        assert spec is not None and spec.loader is not None
+        alt = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(alt)
+        return alt
+
+    def test_host_detail_direction_survive_foreign_event_classes(self) -> None:
+        import netmon
+
+        alt = self._alt_module()
+        http = alt.HttpEvent(
+            ts=TS, src="127.0.0.1", dst="127.0.0.1", dport=43383, method="GET",
+            host="127.0.0.1:43383", path="/rest/system/error", user_agent=None,
+        )
+        flow = alt.FlowEvent(
+            ts=TS, proto="tcp", direction="outbound", scope="internet", birth="observed",
+            local_ip="127.0.0.1", local_port=1, remote_ip="160.79.104.10", remote_port=443,
+            service="https", hostname="github.com",
+        )
+        assert not isinstance(http, netmon.HttpEvent)  # genuinely a different class object
+        assert event_host(http) == "127.0.0.1:43383"
+        assert event_detail(http) == "GET /rest/system/error"
+        assert event_direction(flow) == "→"  # not the "·" fallback
+        assert event_host(flow) == "github.com"
+        assert event_to_cells(http)[3:] == ["127.0.0.1:43383", "GET /rest/system/error"]
+
+
+class TestRunTuiMode:
+    async def test_tui_replay_writes_summary_jsonl_and_redirects_log(self, tmp_path: Path) -> None:
+        pytest.importorskip("textual")
+        pcap = tmp_path / "replay.pcap"
+        write_replay_pcap(pcap)
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False, tui=True,
+        )
+        await run(args)  # run_dashboard runs headless (no tty), consumes replay, finalizes
+        run_dir = next((tmp_path / "logs").iterdir())
+        summary = json.loads((run_dir / "summary.json").read_text())
+        assert summary["events"]["dns_query"] == 1
+        assert summary["events"]["tls_sni"] == 1
+        assert (run_dir / "dns.jsonl").exists()
+        assert (run_dir / "tls.jsonl").exists()
+        # structlog is redirected off stdout into the run dir while the TUI is up
+        assert (run_dir / "netmon.log").exists()

@@ -12,12 +12,16 @@ dependencies = [
     "cryptography>=44",
 ]
 
+[project.optional-dependencies]
+tui = ["textual>=0.80"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.9",
     "mypy>=1.14",
+    "textual>=0.80",
 ]
 
 [tool.ruff]

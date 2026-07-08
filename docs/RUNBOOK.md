@@ -63,6 +63,10 @@ Startup prints `capture_started` with the interface list and detected local IPs 
 
 `--read file.pcap` replays a capture file through the same pipeline instead of sniffing live — no privileges needed; useful for testing and offline analysis.
 
+### Live dashboard (`--tui`)
+
+`uv sync --extra tui` (pulls in Textual), then `uv run netmon.py --tui` for a btop-style live view: a colour-coded feed of every DNS/SNI/HTTP/flow event (newest at the top, columns fit to terminal width) plus top-hosts, per-kind, events/sec, and capture-health panels. Keys: `q` quit, `space` pause, `f` cycle filter, ↑/↓ inspect a row for its full record, `g` follow the newest. Scrolling down or selecting a row freezes the feed (the health panel shows FOLLOW/INSPECT/PAUSED) so history can be read without it snapping back; `g` resumes the live tail. Requires an interactive terminal (both stdin and stdout a tty) — it exits `2` otherwise, so it is **not** for systemd/headless use; those keep using `-q`. The JSONL files are still written, and structlog is redirected to `<run>/netmon.log` so it can't garble the display. Only `q`/`ctrl+q`/`ctrl+c` quit from the keyboard; an external `kill -TERM <pid>` also stops it cleanly and writes the summary. The headless deploy needs only `netmon.py` (the `--tui` import is lazy); add the `tui` extra only where you want the dashboard.
+
 ## 5. Verify capture is working
 
 From a second terminal, generate one known event of each type:

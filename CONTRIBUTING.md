@@ -1,14 +1,15 @@
 # Contributing to netmon
 
-Thanks for your interest. netmon is a single-file passive network monitor; the
-whole implementation lives in `netmon.py`, with tests in `tests/test_netmon.py`.
+Thanks for your interest. netmon is a passive network monitor; the capture/parse
+core lives in `netmon.py` and the optional live dashboard in `netmon_tui.py`, with
+tests in `tests/test_netmon.py` (pure, Textual-free) and `tests/test_tui.py`.
 
 ## Development setup
 
 Requires Python ≥ 3.13 and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv sync
+uv sync --extra tui   # --extra tui pulls in Textual for the --tui dashboard
 ```
 
 ## Before you open a PR
@@ -16,9 +17,9 @@ uv sync
 Run the full local gate — all three must be clean:
 
 ```sh
-uv run pytest -q          # tests
-uv run ruff check .       # lint + import order
-uv run mypy netmon.py     # types
+uv run pytest -q                     # tests
+uv run ruff check .                  # lint + import order
+uv run mypy netmon.py netmon_tui.py  # types
 ```
 
 The tests decode crafted packets with scapy in-process — no capture privileges
@@ -31,7 +32,9 @@ or network access are needed to run them.
   RFC reference), not *what*. Prefer precise names over comments.
 - Add or update a test for any behavior change; a bug fix should come with a
   regression test that fails before the fix.
-- Keep it dependency-light and single-file unless there's a strong reason not to.
+- Keep the capture/parse **core** dependency-light and in `netmon.py`; the
+  headless tool runs with no Textual installed. UI-only code and its dependency
+  belong in `netmon_tui.py` behind the `tui` optional extra.
 
 ## Licensing of contributions
 

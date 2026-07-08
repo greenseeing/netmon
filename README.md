@@ -33,6 +33,17 @@ uv run netmon.py
 
 `-q/--quiet` suppresses per-event stdout (files are always written). A stats line is logged every 30 s. Stop with Ctrl-C — the summary is written on exit.
 
+### Live dashboard
+
+For a btop-style live view instead of stdout logs, install the extra and pass `--tui`:
+
+```sh
+uv sync --extra tui
+sudo $(command -v uv) run netmon.py --tui
+```
+
+One colour-coded feed shows every DNS / SNI / HTTP / flow event as it happens (kind, direction, host, detail) with the newest at the top, alongside panels for top hosts, per-kind counts, an events/sec sparkline, and capture health (queue depth, drops). The columns resize to fit any terminal width. Keys: `q` quit, `space` pause, `f` cycle filter (all → dns → tls → http → flow), ↑/↓ to inspect a row's full record, `g` to follow the newest again. Scrolling down or selecting a row freezes the feed so you can read history without it snapping back; `g` resumes the live tail. The JSONL log files are still written underneath; structlog output goes to `logs/run-*/netmon.log` while the dashboard owns the screen.
+
 ## Reading the results
 
 What your ISP sees even with HTTPS: everything in `dns.jsonl` (unless you use encrypted DNS), every `sni` value in `tls.jsonl`, and every remote IP in `flows.jsonl`. Quick looks:
@@ -43,7 +54,7 @@ jq -r 'select(.kind=="dns_query") | .qname' logs/run-*/dns.jsonl | sort -u
 jq -r 'select(.scope=="internet") | .hostname // .remote_ip' logs/run-*/flows.jsonl | sort | uniq -c | sort -rn
 ```
 
-Mitigating what the ISP sees: [docs/MITIGATIONS.md](docs/MITIGATIONS.md). Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).
+Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Limitations
 

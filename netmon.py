@@ -11,12 +11,14 @@ import signal
 import socket
 import struct
 import sys
+import time
 from collections import Counter, OrderedDict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol, TextIO
+from typing import Any, Literal, NamedTuple, Protocol, TextIO, cast
 
 import structlog
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -315,6 +317,227 @@ KIND_TO_FILE = {
 
 def iso(ts: float) -> str:
     return datetime.fromtimestamp(float(ts), tz=UTC).isoformat(timespec="milliseconds")
+
+
+# --- Live dashboard (--tui) presentation model -------------------------------
+# All of this is Textual-free so it unit-tests as plain Python; netmon_tui.py is
+# the only place that imports Textual. The rule matches the rest of the tool: one
+# authority per fact — the feed's per-kind colour, direction glyph, and the
+# HOST/NAME and DETAIL projections of an Event all live here, once.
+
+# One truecolor style token per emitted kind, so a row is recognisable by colour
+# at a glance. An invariant test asserts every KIND_TO_FILE key is covered.
+KIND_STYLE: dict[str, str] = {
+    "dns_query": "cyan",
+    "dns_answer": "blue",
+    "dns_https": "blue",
+    "dns_response": "blue",
+    "dns_ecs": "magenta",
+    "tls_sni": "green",
+    "http": "yellow",
+    "flow": "white",
+    "arp": "bright_black",
+    "icmp6_ra": "magenta",
+    "llmnr": "red",
+    "nbns": "red",
+}
+
+# Client-originated disclosures leave the host (→ what you leak); resolver replies
+# come back (←). Flows carry their own direction; link-scope frames get a dot.
+_CLIENT_KINDS = frozenset({"dns_query", "tls_sni", "http", "dns_ecs", "llmnr", "nbns"})
+_SERVER_KINDS = frozenset({"dns_answer", "dns_response", "dns_https"})
+_FLOW_GLYPH = {"outbound": "→", "inbound": "←", "transit": "↔"}
+
+
+# Dispatch on event.kind (the stable string discriminator), never on class identity.
+# Running netmon.py as a script makes its Event classes `__main__.*`, while netmon_tui
+# imports the `netmon.*` copies — so isinstance / class-pattern matching silently misses
+# every event and blanks the HOST/DETAIL cells. cast is a runtime no-op, so it keeps
+# mypy's field typing without depending on which module copy built the event.
+def event_direction(event: Event) -> str:
+    if event.kind == "flow":
+        return _FLOW_GLYPH.get(cast(FlowEvent, event).direction, "·")
+    if event.kind in _CLIENT_KINDS:
+        return "→"
+    if event.kind in _SERVER_KINDS:
+        return "←"
+    return "·"
+
+
+_NAME_KINDS = frozenset(
+    {"dns_query", "dns_answer", "dns_response", "dns_https", "dns_ecs", "llmnr", "nbns"}
+)
+
+
+def event_host(event: Event) -> str:
+    # The single most identifying name for the row, pulled to the front column.
+    match event.kind:
+        case "tls_sni":
+            return cast(TlsSniEvent, event).sni or "(ech)"
+        case "http":
+            http = cast(HttpEvent, event)
+            return http.host or http.dst
+        case "flow":
+            flow = cast(FlowEvent, event)
+            return flow.hostname or flow.remote_ip
+        case "icmp6_ra":
+            return cast(Icmp6RaEvent, event).router
+        case "arp":
+            return cast(ArpEvent, event).target_ip
+        case k if k in _NAME_KINDS:
+            return cast(DnsQueryEvent, event).qname  # every name-kind shares `qname`
+        case _:
+            return ""
+
+
+def event_detail(event: Event) -> str:
+    # The compact remainder that doesn't fit HOST/NAME, per kind.
+    match event.kind:
+        case "dns_query" | "llmnr":
+            return cast(DnsQueryEvent, event).qtype
+        case "nbns":
+            return "name-query"
+        case "dns_answer":
+            a = cast(DnsAnswerEvent, event)
+            base = f"{a.rtype} {a.value} ttl={a.ttl}"
+            return base if a.section == "answer" else f"{base} {a.section}"
+        case "dns_response":
+            r = cast(DnsResponseEvent, event)
+            return f"{r.qtype} {r.rcode}"
+        case "dns_https":
+            h = cast(DnsHttpsEvent, event)
+            parts = [h.rtype]
+            if h.alpn:
+                parts.append("alpn=" + ",".join(h.alpn))
+            if h.ech:
+                parts.append("ech")
+            hints = h.ipv4hint + h.ipv6hint
+            if hints:
+                parts.append("hints=" + ",".join(hints))
+            return " ".join(parts)
+        case "dns_ecs":
+            return f"ecs {cast(DnsEcsEvent, event).client_subnet}"
+        case "tls_sni":
+            s = cast(TlsSniEvent, event)
+            parts = [s.transport]
+            if s.alpn:
+                parts.append(",".join(s.alpn))
+            if s.ech:
+                parts.append("ech")
+            return " ".join(parts)
+        case "http":
+            p = cast(HttpEvent, event)
+            base = f"{p.method} {p.path}"
+            return f"{base} [{p.tag}]" if p.tag else base
+        case "flow":
+            f = cast(FlowEvent, event)
+            base = f"{f.service} {f.scope} {f.remote_ip}:{f.remote_port} {f.birth}"
+            return f"{base} ({f.note})" if f.note else base
+        case "arp":
+            p2 = cast(ArpEvent, event)
+            return f"{p2.op} {p2.sender_ip}={p2.sender_mac}"
+        case "icmp6_ra":
+            ra = cast(Icmp6RaEvent, event)
+            parts = []
+            if ra.prefixes:
+                parts.append("pfx=" + ",".join(ra.prefixes))
+            if ra.rdnss:
+                parts.append("rdnss=" + ",".join(ra.rdnss))
+            return " ".join(parts)
+        case _:
+            return ""
+
+
+def event_to_cells(event: Event) -> list[str]:
+    # TIME | KIND | DIR | HOST/NAME | DETAIL. Time is the HH:MM:SS.mmm slice of the
+    # ISO ts the event already carries.
+    return [
+        event.ts[11:23],
+        event.kind,
+        event_direction(event),
+        event_host(event),
+        event_detail(event),
+    ]
+
+
+class RateBucketer:
+    # Events-per-second over a sliding window, for the feed's rate sparkline — the
+    # processor has counts but no time axis. Buckets are keyed by integer second
+    # and trimmed to the window so memory is bounded regardless of run length.
+    def __init__(self, window: int = 60) -> None:
+        self.window = window
+        self._buckets: OrderedDict[int, int] = OrderedDict()
+
+    def tick(self, now: float) -> None:
+        sec = int(now)
+        self._buckets[sec] = self._buckets.get(sec, 0) + 1
+        cutoff = sec - self.window + 1
+        while self._buckets and next(iter(self._buckets)) < cutoff:
+            self._buckets.popitem(last=False)
+
+    def series(self, now: float) -> list[float]:
+        sec = int(now)
+        start = sec - self.window + 1
+        return [float(self._buckets.get(s, 0)) for s in range(start, sec + 1)]
+
+
+class DashboardModel:
+    # The Textual-free view state the processor doesn't keep: a bounded ring of the
+    # most recent events (whole Event retained so the detail pane can show every
+    # field) plus the events/sec bucketer. Per-kind counts, top hosts and coverage
+    # are read straight off the PacketProcessor at render time — never duplicated
+    # here. The substring `filter` is a view: add_event never drops, so toggling a
+    # filter re-reveals events already in the ring.
+    def __init__(
+        self, cap: int = 1000, rate_window: int = 60, clock: Callable[[], float] = time.time
+    ) -> None:
+        self.cap = cap
+        self._clock = clock
+        self.rate = RateBucketer(rate_window)
+        self.filter: str | None = None
+        self._recent: OrderedDict[str, Event] = OrderedDict()
+        self._seq = 0
+        self._added: list[tuple[str, Event]] = []
+        self._evicted: list[str] = []
+
+    def add_event(self, event: Event) -> None:
+        self.rate.tick(self._clock())
+        key = str(self._seq)
+        self._seq += 1
+        self._recent[key] = event
+        self._added.append((key, event))
+        while len(self._recent) > self.cap:
+            old_key, _ = self._recent.popitem(last=False)
+            self._evicted.append(old_key)
+
+    def drain_new(self) -> tuple[list[tuple[str, Event]], list[str]]:
+        added, evicted = self._added, self._evicted
+        self._added, self._evicted = [], []
+        return added, evicted
+
+    def recent(self, n: int) -> list[tuple[str, Event]]:
+        return list(self._recent.items())[-n:]
+
+    def newest_first(self) -> list[tuple[str, Event]]:
+        # For a btop-style feed the latest event belongs at the top, so the ring is
+        # walked from the most recent backwards.
+        return list(self._recent.items())[::-1]
+
+    def event_by_key(self, key: str) -> Event | None:
+        return self._recent.get(key)
+
+    def rate_series(self) -> list[float]:
+        return self.rate.series(self._clock())
+
+    def passes(self, event: Event) -> bool:
+        if not self.filter:
+            return True
+        needle = self.filter.lower()
+        return (
+            needle in event.kind
+            or needle in event_host(event).lower()
+            or needle in event_detail(event).lower()
+        )
 
 
 EXT_SERVER_NAME = 0x0000
@@ -1659,7 +1882,9 @@ def check_capture_privileges() -> None:
         sys.exit(1)
 
 
-def configure_logging() -> None:
+def configure_logging(stream: TextIO | None = None) -> None:
+    # stream lets --tui redirect structlog off stdout (which Textual owns) into a
+    # file, so a stray log line never garbles the compositor.
     structlog.configure(
         processors=[
             structlog.processors.add_log_level,
@@ -1667,10 +1892,21 @@ def configure_logging() -> None:
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(20),
+        logger_factory=structlog.PrintLoggerFactory(file=stream or sys.stdout),
     )
 
 
-async def run(args: argparse.Namespace) -> None:
+@dataclass
+class Session:
+    # One run's live state, so the headless loop and the --tui App share exactly
+    # the same capture/parse/write pipeline and differ only in the per-event sink.
+    out_dir: Path
+    processor: PacketProcessor
+    writer: JsonlWriter
+    capture: Capture
+
+
+def build_session(args: argparse.Namespace) -> Session:
     os.umask(0o077)
     out_dir = Path(args.output) / datetime.now(tz=UTC).strftime("run-%Y%m%d-%H%M%S")
     processor = PacketProcessor(local_addresses(), redact_query=not args.keep_query)
@@ -1678,66 +1914,106 @@ async def run(args: argparse.Namespace) -> None:
     capture: Capture
     if args.read:
         capture = ReplayCapture(Path(args.read))
-        log.info("replay_started", pcap=args.read, output=str(out_dir))
     else:
         # scapy's iface=None means conf.iface (default route only), not all interfaces
         ifaces = [args.iface] if args.iface else [i.name for i in get_working_ifaces()]
         capture = LiveCapture(ifaces, args.bpf)
+    return Session(out_dir, processor, writer, capture)
+
+
+def announce_start(args: argparse.Namespace, session: Session) -> None:
+    if args.read:
+        log.info("replay_started", pcap=args.read, output=str(session.out_dir))
+    elif isinstance(session.capture, LiveCapture):
         log.info(
             "capture_started",
-            ifaces=ifaces,
+            ifaces=session.capture.ifaces,
             bpf=args.bpf,
-            output=str(out_dir),
-            local_ips=sorted(processor.local_ips),
+            output=str(session.out_dir),
+            local_ips=sorted(session.processor.local_ips),
         )
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, capture.stop)
 
-    async def stats() -> None:
-        while True:
-            await asyncio.sleep(30)
-            st = capture.stats()
-            log.info(
-                "stats",
-                packets=processor.coverage.packets,
-                events=dict(processor.event_counts),
-                queue=st.queued,
-                userspace_dropped=st.userspace_dropped,
-                kernel_dropped="unavailable" if st.kernel_dropped is None else st.kernel_dropped,
-                kernel_delivered=(
-                    "unavailable" if st.kernel_delivered is None else st.kernel_delivered
-                ),
-            )
 
-    stats_task = asyncio.create_task(stats())
-    try:
-        # aclosing: if the loop body raises (e.g. disk full in writer.write),
-        # finalize the generator — stop the sniffer, harvest the last tp_drops,
-        # close the sockets — before the summary below is written.
-        async with aclosing(capture.packets()) as packets:
-            async for pkt in packets:
-                for event in processor.process(pkt):
-                    writer.write(event)
-                    if not args.quiet:
-                        log.info(
-                            event.kind, **event.model_dump(exclude={"kind"}, exclude_none=True)
-                        )
-    finally:
-        stats_task.cancel()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(sig)
-        st = capture.stats()
-        summary = processor.summary()
-        summary["capture"] = {
-            "userspace_dropped": st.userspace_dropped,
-            "kernel_dropped": "unavailable" if st.kernel_dropped is None else st.kernel_dropped,
-            "kernel_delivered": (
+def log_event(event: Event) -> None:
+    log.info(event.kind, **event.model_dump(exclude={"kind"}, exclude_none=True))
+
+
+async def stats_loop(session: Session) -> None:
+    while True:
+        await asyncio.sleep(30)
+        st = session.capture.stats()
+        log.info(
+            "stats",
+            packets=session.processor.coverage.packets,
+            events=dict(session.processor.event_counts),
+            queue=st.queued,
+            userspace_dropped=st.userspace_dropped,
+            kernel_dropped="unavailable" if st.kernel_dropped is None else st.kernel_dropped,
+            kernel_delivered=(
                 "unavailable" if st.kernel_delivered is None else st.kernel_delivered
             ),
-        }
-        writer.write_summary(summary)
-        writer.close()
+        )
+
+
+async def consume(session: Session, on_event: Callable[[Event], None]) -> None:
+    # The single shared loop. JSONL is written in both modes; only on_event differs
+    # (per-event structlog when headless, model.add_event under --tui). The periodic
+    # sleep(0) hands the event loop a turn every 64 packets so a burst drained from
+    # the queue — or a synchronous pcap replay — cannot starve a co-running TUI
+    # compositor or the 30 s stats task.
+    n = 0
+    async with aclosing(session.capture.packets()) as packets:
+        async for pkt in packets:
+            for event in session.processor.process(pkt):
+                session.writer.write(event)
+                on_event(event)
+            n += 1
+            if n % 64 == 0:
+                await asyncio.sleep(0)
+
+
+def finalize(session: Session) -> dict[str, Any]:
+    st = session.capture.stats()
+    summary = session.processor.summary()
+    summary["capture"] = {
+        "userspace_dropped": st.userspace_dropped,
+        "kernel_dropped": "unavailable" if st.kernel_dropped is None else st.kernel_dropped,
+        "kernel_delivered": (
+            "unavailable" if st.kernel_delivered is None else st.kernel_delivered
+        ),
+    }
+    session.writer.write_summary(summary)
+    session.writer.close()
+    return summary
+
+
+async def run(args: argparse.Namespace) -> None:
+    session = build_session(args)
+    tui = getattr(args, "tui", False)  # Namespace in tests may lack .tui — never bare-access
+    if not tui:
+        announce_start(args, session)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, session.capture.stop)
+    # No per-event stdout logging or 30 s stats line under --tui: both would write to
+    # stdout, which Textual owns — the dashboard's own panels replace them.
+    stats_task = None if tui else asyncio.create_task(stats_loop(session))
+    try:
+        if tui:
+            from netmon_tui import run_dashboard
+
+            await run_dashboard(session, args)
+        else:
+            await consume(session, log_event if not args.quiet else (lambda _e: None))
+    finally:
+        if stats_task is not None:
+            stats_task.cancel()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+        # Runs on every exit path (quit, signal, exception): summary + coverage +
+        # JSONL are flushed and the capture generator's own finally already harvested
+        # the last tp_drops and closed the sockets via aclosing() in consume().
+        summary = finalize(session)
         log.info(
             "capture_stopped",
             **{k: v for k, v in summary.items() if not k.startswith("top_")},
@@ -1760,11 +2036,21 @@ def main() -> None:
     parser.add_argument("-o", "--output", default="logs", help="output directory (default: logs)")
     parser.add_argument("-q", "--quiet", action="store_true", help="no per-event stdout logging")
     parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="live btop-style dashboard instead of stdout logs (JSONL still written)",
+    )
+    parser.add_argument(
         "--keep-query",
         action="store_true",
         help="log full HTTP request paths incl. query strings (may contain credentials)",
     )
     args = parser.parse_args()
+    # Textual's driver reads raw stdin even when only stdout is a tty, so `--tui <file`
+    # would parse file bytes as keystrokes — require both ends to be a real terminal.
+    if args.tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("--tui requires an interactive terminal (stdin and stdout)", file=sys.stderr)
+        sys.exit(2)
     if not args.read:
         check_capture_privileges()
     configure_logging()

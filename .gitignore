@@ -7,3 +7,5 @@ __pycache__/
 .claude/settings.local.json
 issues/
 docs/*.local.md
+docs/*.pdf
+docs/MITIGATIONS.md
