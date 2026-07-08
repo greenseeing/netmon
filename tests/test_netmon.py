@@ -707,6 +707,40 @@ class TestMalformedPacketResilience:
         assert proc.coverage.fate["parse_error"] == 0
 
 
+class TestNonDnsTrafficOnDnsPorts:
+    # scapy binds a DNS layer to UDP 53/5353 by port alone, so non-DNS noise that
+    # squats there (BitTorrent DHT, QUIC, scans) gets force-decoded into a bogus DNS
+    # layer with a garbage qname/qtype. Detection must gate on shape, not the port
+    # binding, so this never surfaces as a dns_query. Re-dissect via Ether(bytes(...))
+    # so the port bindings actually fire, as they do on a live capture.
+    @staticmethod
+    def _udp(port: int, payload: bytes) -> Packet:
+        p = Ether(bytes(Ether() / IP(src="115.55.224.86", dst="192.168.11.32")
+                        / UDP(sport=port, dport=port) / payload))
+        p.time = PKT_TIME
+        return p
+
+    # A BitTorrent DHT find_node datagram (bencode) like the ones in the report.
+    _DHT = (b"d1:ad2:id20:" + bytes(range(20)) + b"6:target20:" + bytes(range(20, 40))
+            + b"e1:q9:find_node1:t4:abcd1:y1:qe")
+
+    @pytest.mark.parametrize("port", [53, 5353])
+    def test_dht_noise_is_not_reported_as_dns(self, port: int) -> None:
+        proc = PacketProcessor(local_ips=frozenset())
+        events = proc.process(self._udp(port, self._DHT))
+        assert not [e for e in events if isinstance(e, DnsQueryEvent)]
+        assert proc.coverage.fate["parse_error"] == 0  # rejected by shape, not a crash
+
+    def test_real_mdns_on_5353_still_parses(self) -> None:
+        proc = PacketProcessor(local_ips=frozenset())
+        events = proc.process(
+            self._udp(5353, bytes(DNS(rd=0, qd=DNSQR(qname="_airplay._tcp.local", qtype="PTR"))))
+        )
+        assert any(
+            isinstance(e, DnsQueryEvent) and e.qname == "_airplay._tcp.local" for e in events
+        )
+
+
 class TestDnsEvents:
     def test_dns_query_event_fields(self, processor: PacketProcessor) -> None:
         pkt = (

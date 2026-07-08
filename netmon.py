@@ -1437,9 +1437,12 @@ class PacketProcessor:
             elif pkt.haslayer(NBNSQueryRequest):
                 events.extend(self._nbns_events(ts, net, pkt[NBNSQueryRequest]))
             else:
-                # Recognise DNS by its layer on a bound port, else by shape on any
-                # port (local forwarders / dnscrypt-proxy on custom ports).
-                dns = pkt[DNS] if pkt.haslayer(DNS) else parse_dns_message(datagram)
+                # Recognise DNS by shape on every port, never by scapy's port
+                # binding alone: 53/5353 attract non-DNS noise (BitTorrent DHT,
+                # QUIC, scans) that scapy will force-decode into a bogus DNS layer.
+                # Shape validation is the single gate; it also covers local
+                # forwarders / dnscrypt-proxy on custom ports.
+                dns = parse_dns_message(datagram)
                 if dns is not None:
                     events.extend(self._dns_events(ts, net, dns, "udp"))
                 elif _is_quic_long_header(datagram):

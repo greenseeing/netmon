@@ -52,6 +52,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Non-DNS traffic on ports 53/5353 reported as bogus `dns_query`.** scapy binds
+  a DNS layer to UDP 53 and 5353 by port number alone, so any non-DNS datagram
+  squatting there (BitTorrent DHT, QUIC, scans, spoofed packets) was force-decoded
+  into a DNS message with a garbage `qname` and `qtype` and surfaced as a
+  `dns_query`. DNS is now recognised by message shape on every port — the same
+  validation already used on unbound ports — instead of trusting scapy's port
+  binding, so junk on the DNS ports is dropped while genuine DNS and mDNS are
+  unaffected.
+
 - **Timestamps use the local timezone.** Every timestamp netmon reports — the
   `--tui` feed and detail pane, the JSONL `ts` field, structlog lines, and the run
   directory name — now renders in the local timezone of the host running it,
