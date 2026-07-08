@@ -954,6 +954,13 @@ def rr_list(field: Any) -> list[Any]:
     return out
 
 
+def question_list(field: Any) -> list[Any]:
+    # Questions are DNSQR. Older scapy links a DNS message's sections into one payload
+    # chain (qd -> an/ns/ar), so walking qd runs into resource records; filter to DNSQR
+    # so a DNSRR never reaches a .qname reader (a crash) or inflates the question count.
+    return [q for q in rr_list(field) if isinstance(q, DNSQR)]
+
+
 def decode_dns_name(value: Any) -> str:
     if isinstance(value, bytes):
         value = value.decode("utf-8", "replace")
@@ -1003,7 +1010,7 @@ def parse_dns_message(payload: bytes) -> DNS | None:
     except Exception:
         return None
     if (
-        len(rr_list(dns.qd)) != qd
+        len(question_list(dns.qd)) != qd
         or len(rr_list(dns.an)) != an
         or len(rr_list(dns.ns)) != ns
         or len(rr_list(dns.ar)) != ar
@@ -1452,7 +1459,7 @@ class PacketProcessor:
 
     def _dns_events(self, ts: str, net: Any, dns: Any, transport: str) -> list[Event]:
         events: list[Event] = []
-        queries = rr_list(dns.qd)
+        queries = question_list(dns.qd)
         queried = decode_dns_name(queries[0].qname) if queries else ""
         if dns.qr == 0:
             for q in queries:
@@ -1600,7 +1607,7 @@ class PacketProcessor:
         if int(llmnr.qr) != 0:
             return []
         events: list[Event] = []
-        for q in rr_list(llmnr.qd):
+        for q in question_list(llmnr.qd):
             qname = decode_dns_name(q.qname)
             qtype = dnsqtypes.get(q.qtype, str(q.qtype))
             if not self.name_query_seen.add(("llmnr", net.src, qname, qtype)):

@@ -50,6 +50,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   logging continues underneath; the headless, `-q`, and systemd paths are unchanged
   and need no Textual installed.
 
+### Fixed
+
+- **Capture crash on some scapy builds (`AttributeError: qname`).** On scapy
+  versions that represent a DNS message's sections as one linked record chain
+  (rather than lists), walking the question section ran past the questions into
+  the resource records; reading a question's name off a resource record killed
+  the capture worker — taking the `--tui` dashboard down with it and crashing the
+  headless path too. Questions are now filtered to actual question records at
+  every site that walks one (DNS, LLMNR, and off-port/TCP DNS recognition), so a
+  resource record can never be mistaken for a question.
+
 ## [0.1.0] – Initial public release
 
 Passive network monitor that logs, as timestamped JSONL, what a host discloses on

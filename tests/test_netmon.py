@@ -77,6 +77,7 @@ from netmon import (
     packet_nonce,
     parse_client_hello,
     parse_http_request,
+    question_list,
     remote_scope,
     run,
 )
@@ -636,6 +637,21 @@ class TestParseHttpRequest:
         assert parse_http_request(b"GET /path SOMETHINGELSE\r\n\r\n") is None
 
 
+class TestQuestionList:
+    def test_drops_resource_records_from_linked_question_chain(self) -> None:
+        # Older-scapy shape: qd is a DNSQR whose payload runs into the message's records.
+        linked = DNSQR(qname="a.com") / DNSRR(rrname="a.com", type="A", rdata="1.2.3.4")
+        assert [type(q).__name__ for q in question_list(linked)] == ["DNSQR"]
+
+    def test_drops_non_questions_from_list_form(self) -> None:
+        # Newer-scapy list form: a stray non-DNSQR must still not reach a .qname reader.
+        mixed = [DNSQR(qname="a.com"), DNSRR(rrname="a.com", type="A", rdata="1.2.3.4")]
+        assert [type(q).__name__ for q in question_list(mixed)] == ["DNSQR"]
+
+    def test_none_is_empty(self) -> None:
+        assert question_list(None) == []
+
+
 class TestDnsEvents:
     def test_dns_query_event_fields(self, processor: PacketProcessor) -> None:
         pkt = (
@@ -655,6 +671,28 @@ class TestDnsEvents:
         assert event.transport == "udp"
         assert event.qname == "example.com"
         assert event.qtype == "A"
+
+    def test_dns_query_with_linked_resource_records_does_not_crash(
+        self, processor: PacketProcessor
+    ) -> None:
+        # Regression: older scapy links a DNS message's sections into one payload chain
+        # (qd -> an/ns/ar), so dns.qd is a DNSQR whose payload runs into resource records.
+        # rr_list walked that chain across the question/RR boundary and _dns_events then
+        # read .qname off a DNSRR, killing the capture worker with AttributeError. The
+        # question walk must stop at the questions.
+        class LinkedDNS:  # the shape older scapy hands us; DNS() on 2.7 flattens qd to a list
+            qr = 0
+            qd = DNSQR(qname="example.com", qtype="A") / DNSRR(
+                rrname="example.com", type="A", ttl=300, rdata="93.184.216.34"
+            )
+            an = ns = ar = None
+
+        net = IP(src="192.168.1.50", dst="8.8.8.8")
+        events = processor._dns_events(EXPECTED_ISO, net, LinkedDNS(), "udp")
+        query_events = [e for e in events if isinstance(e, DnsQueryEvent)]
+        assert len(query_events) == 1
+        assert query_events[0].qname == "example.com"
+        assert query_events[0].qtype == "A"
 
     def test_dns_answer_a_record_populates_ip_to_name(self, processor: PacketProcessor) -> None:
         pkt = (
@@ -1800,6 +1838,21 @@ class TestLlmnrNbns:
         pkt = Ether(bytes(pkt))
         pkt.time = PKT_TIME
         assert [e for e in proc.process(pkt) if isinstance(e, LlmnrEvent)] == []
+
+    def test_llmnr_query_with_linked_resource_records_does_not_crash(self) -> None:
+        # LLMNR reuses DNS's qd machinery, so the same older-scapy linked-chain over-walk
+        # applies: walking llmnr.qd into a resource record and reading .qname must not crash.
+        proc = local_processor("192.168.1.50")
+
+        class LinkedLlmnr:
+            qr = 0
+            qd = DNSQR(qname="wpad", qtype="A") / DNSRR(rrname="wpad", type="A", rdata="1.2.3.4")
+
+        net = IP(src="192.168.1.50", dst="224.0.0.252")
+        events = proc._llmnr_events(EXPECTED_ISO, net, LinkedLlmnr())
+        llmnr = [e for e in events if isinstance(e, LlmnrEvent)]
+        assert len(llmnr) == 1
+        assert llmnr[0].qname == "wpad"
 
 
 def ra_packet(
