@@ -26,6 +26,12 @@ sudo bash install.sh                  # add --enable-service and/or --setcap
 
 It clones to `/opt/netmon`, builds an isolated uv-managed venv, and installs a `netmon` launcher on your PATH. Options: `--enable-service` also installs and starts a hardened systemd recorder; `--setcap` grants `CAP_NET_RAW` to the private interpreter so the interactive TUI runs without sudo — scoped to the `netmon` group (you're added automatically), not every local user. Remove everything with `sudo bash install.sh --uninstall`.
 
+If you'd rather have a single command and accept the risk of running unreviewed code as root, the pipe form is equivalent to the three steps above:
+
+```sh
+curl -fsSL https://git.disroot.org/afk/netmon/raw/branch/main/install.sh | sudo bash
+```
+
 ## Run
 
 ```sh
