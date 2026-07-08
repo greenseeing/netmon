@@ -135,9 +135,18 @@ class TestNetmonAppHardening:
         async with app.run_test(size=(120, 16)) as pilot:
             for i in range(60):  # far more rows than the viewport -> vertical scrollbar
                 model.add_event(q(f"h{i}.example.com"))
-            app._render()
-            await pilot.pause()
             table = app.query_one("#feed", DataTable)
+            # The scrollbar materialises asynchronously; the columns refit on the next
+            # render once the region reflects it. Pump render/pause until it settles so
+            # the assertion isn't racing that reflow (it converges in 1-2 frames).
+            for _ in range(10):
+                app._render()
+                await pilot.pause()
+                if (
+                    table.show_vertical_scrollbar
+                    and table.virtual_size.width <= table.scrollable_content_region.width
+                ):
+                    break
             assert table.show_vertical_scrollbar is True  # precondition for the bug
             assert table.virtual_size.width <= table.scrollable_content_region.width
             assert table.show_horizontal_scrollbar is False  # nothing clipped off the right

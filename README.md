@@ -12,37 +12,57 @@ Passive network monitor for auditing what your device leaks to the ISP and which
 | `flows.jsonl` | Every new connection: protocol, direction, local/remote IP+port, service guess, hostname (reverse-mapped from observed DNS answers), scope (`internet`, `lan`, or `multicast`), and a `note` on disclosive services (NTP, STARTTLS mail) |
 | `summary.json` | Written on exit: top DNS names, top SNI hostnames, top internet hosts, event counts |
 
-All events carry ISO 8601 UTC timestamps with millisecond precision. Each run writes to `logs/run-<stamp>/`.
+All events carry ISO 8601 UTC timestamps with millisecond precision. Runs that persist — `netmon run --log`, the background recorder, or the legacy `python netmon.py` form — write to `<output>/run-<stamp>/`.
+
+## Install
+
+One command — but read it before you run it (never pipe a script you haven't seen):
+
+```sh
+curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh
+less install.sh                       # inspect
+sudo bash install.sh                  # add --enable-service and/or --setcap
+```
+
+It clones to `/opt/netmon`, builds an isolated uv-managed venv, and installs a `netmon` launcher on your PATH. Options: `--enable-service` also installs and starts a hardened systemd recorder; `--setcap` grants `CAP_NET_RAW` to the private interpreter so the interactive TUI runs without sudo — scoped to the `netmon` group (you're added automatically), not every local user. Remove everything with `sudo bash install.sh --uninstall`.
 
 ## Run
 
-Capture needs raw-socket privileges:
-
 ```sh
-sudo $(command -v uv) run netmon.py            # all interfaces
-sudo $(command -v uv) run netmon.py -i wlan0   # one interface
-sudo $(command -v uv) run netmon.py --bpf 'not port 22' -q
+netmon run              # live btop-style dashboard — ephemeral, nothing written
+netmon run --log        # ...and persist the JSONL record to logs/run-<stamp>/
+netmon run --headless   # classic per-event stdout logs instead of the dashboard
+netmon update           # pull latest + re-sync deps; restart the recorder if running
+netmon service status   # background recorder: start|stop|status|enable|disable|logs
 ```
 
-Or grant the capability once and drop sudo:
+Live capture needs `CAP_NET_RAW`: with `--setcap` it just runs; otherwise the launcher re-execs under `sudo` (one prompt). Capture flags carry over — `-i wlan0`, `--bpf 'not port 22'`, `-q`, `-r <pcap>` (replay, no privilege), `--keep-query`. Stop with Ctrl-C.
+
+`netmon run` is **ephemeral by design**: it shows traffic live and writes nothing. Your DNS/TLS/HTTP history — the whole point of this tool — only lands on disk when you ask, via `--log` or the recorder.
+
+### Background recorder
+
+For always-on logging, enable the systemd unit that `install.sh` drops in:
 
 ```sh
-sudo setcap cap_net_raw+eip "$(readlink -f .venv/bin/python3)"
-uv run netmon.py
+sudo systemctl enable --now netmon.service    # or: netmon service enable
+netmon service logs                           # follow it
 ```
 
-`-q/--quiet` suppresses per-event stdout (files are always written). A stats line is logged every 30 s. Stop with Ctrl-C — the summary is written on exit.
+It records headless to `/var/log/netmon/run-<stamp>/` as a non-root `netmon` user holding a single Linux capability (`CAP_NET_RAW`) via systemd's `AmbientCapabilities` — no root shell, no setcap on a shared interpreter.
 
-### Live dashboard
+### From a git checkout (dev)
 
-For a btop-style live view instead of stdout logs, install the extra and pass `--tui`:
+The historical flat form is unchanged, so a working tree still runs directly:
 
 ```sh
 uv sync --extra tui
-sudo $(command -v uv) run netmon.py --tui
+sudo $(command -v uv) run netmon.py --tui     # == netmon run --log
 ```
 
-One colour-coded feed shows every DNS / SNI / HTTP / flow event as it happens (kind, direction, host, detail) with the newest at the top, alongside panels for top hosts, per-kind counts, an events/sec sparkline, and capture health (queue depth, drops). The columns resize to fit any terminal width. Keys: `q` quit, `space` pause, `f` cycle filter (all → dns → tls → http → flow), ↑/↓ to inspect a row's full record, `g` to follow the newest again. Scrolling down or selecting a row freezes the feed so you can read history without it snapping back; `g` resumes the live tail. The JSONL log files are still written underneath; structlog output goes to `logs/run-*/netmon.log` while the dashboard owns the screen.
+### Dashboard
+
+One colour-coded feed shows every DNS / SNI / HTTP / flow event as it happens (kind, direction, host, detail) with the newest at the top, alongside panels for top hosts, per-kind counts, an events/sec sparkline, and capture health (queue depth, drops). The columns resize to fit any terminal width. Keys: `q` quit, `space` pause, `f` cycle filter (all → dns → tls → http → flow), ↑/↓ to inspect a row's full record, `g` to follow the newest again. Scrolling down or selecting a row freezes the feed so you can read history without it snapping back; `g` resumes the live tail. With `--log`, the JSONL record plus a `netmon.log` diagnostic are written to `logs/run-*/` underneath while the dashboard owns the screen; without it the view is purely ephemeral.
 
 ## Reading the results
 

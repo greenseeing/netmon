@@ -64,12 +64,16 @@ from netmon import (
     TcpReassembler,
     TlsSniEvent,
     _client_stream_start,
+    _legacy_parser,
+    _parse_run_args,
+    _run_parser,
     derive_initial_keys,
     event_detail,
     event_direction,
     event_host,
     event_to_cells,
     header_protection_mask,
+    main,
     packet_nonce,
     parse_client_hello,
     parse_http_request,
@@ -2467,4 +2471,92 @@ class TestRunTuiMode:
         assert (run_dir / "dns.jsonl").exists()
         assert (run_dir / "tls.jsonl").exists()
         # structlog is redirected off stdout into the run dir while the TUI is up
+        assert (run_dir / "netmon.log").exists()
+
+
+class TestCliDispatch:
+    def test_run_defaults_to_tui_and_ephemeral(self) -> None:
+        args = _parse_run_args([])
+        assert args.tui is True
+        assert args.headless is False
+        assert args.log is False
+
+    def test_run_headless_disables_tui(self) -> None:
+        assert _parse_run_args(["--headless"]).tui is False
+
+    def test_run_log_sets_persistence_flag(self) -> None:
+        args = _parse_run_args(["--log", "-i", "eth0"])
+        assert args.log is True
+        assert args.iface == "eth0"
+
+    def test_run_carries_capture_flags(self) -> None:
+        args = _parse_run_args(["-r", "x.pcap", "-q", "--bpf", "not port 22", "--keep-query"])
+        assert args.read == "x.pcap"
+        assert args.quiet is True
+        assert args.bpf == "not port 22"
+        assert args.keep_query is True
+
+    def test_legacy_form_keeps_tui_flag_without_log(self) -> None:
+        args = _legacy_parser().parse_args(["--tui", "-q"])
+        assert args.tui is True
+        assert not hasattr(args, "log")  # absent log => build_session keeps writing files
+
+    def test_update_subcommand_dispatches_and_propagates_exit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        seen: list[list[str]] = []
+        monkeypatch.setattr(netmon, "cmd_update", lambda a: (seen.append(a), 3)[1])
+        with pytest.raises(SystemExit) as exc:
+            main(["update", "--force"])
+        assert exc.value.code == 3
+        assert seen == [["--force"]]
+
+    def test_service_subcommand_dispatches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "cmd_service", lambda a: 0)
+        with pytest.raises(SystemExit) as exc:
+            main(["service", "status"])
+        assert exc.value.code == 0
+
+    def test_run_parser_rejects_unknown_flag(self) -> None:
+        with pytest.raises(SystemExit):
+            _run_parser().parse_args(["--definitely-not-a-flag"])
+
+
+class TestRunPersistence:
+    async def test_headless_without_log_writes_nothing(self, tmp_path: Path) -> None:
+        pcap = tmp_path / "replay.pcap"
+        write_replay_pcap(pcap)
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False, tui=False, log=False,
+        )
+        await run(args)
+        assert not (tmp_path / "logs").exists()  # ephemeral: no run dir, no JSONL
+
+    async def test_tui_without_log_writes_nothing(self, tmp_path: Path) -> None:
+        pytest.importorskip("textual")
+        pcap = tmp_path / "replay.pcap"
+        write_replay_pcap(pcap)
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False, tui=True, log=False,
+        )
+        await run(args)
+        assert not (tmp_path / "logs").exists()
+
+    async def test_tui_with_log_persists_record(self, tmp_path: Path) -> None:
+        pytest.importorskip("textual")
+        pcap = tmp_path / "replay.pcap"
+        write_replay_pcap(pcap)
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False, tui=True, log=True,
+        )
+        await run(args)
+        run_dir = next((tmp_path / "logs").iterdir())
+        assert (run_dir / "dns.jsonl").exists()
         assert (run_dir / "netmon.log").exists()

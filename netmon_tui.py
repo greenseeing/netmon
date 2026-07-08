@@ -7,6 +7,7 @@ feeds the model, a 10 Hz timer snapshots the model + processor + capture and rep
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import TYPE_CHECKING, ClassVar
 
@@ -28,6 +29,7 @@ from netmon import (
     consume,
     event_to_cells,
     open_private_new,
+    persist_enabled,
 )
 
 if TYPE_CHECKING:
@@ -346,7 +348,13 @@ async def run_dashboard(session: Session, args: argparse.Namespace) -> None:
     # capture_stopped prints cleanly after the terminal is released. Headless when
     # there is no tty (tests) — production reaches here only past main()'s tty guard.
     app = NetmonApp(session, DashboardModel())
-    with open_private_new(session.out_dir / "netmon.log") as fp:
+    # --log persists diagnostics next to the JSONL record; without it the run is
+    # ephemeral so structlog goes to the void — never stdout, which Textual owns.
+    if persist_enabled(args):
+        diag = open_private_new(session.out_dir / "netmon.log")
+    else:
+        diag = os.fdopen(os.open(os.devnull, os.O_WRONLY), "w", encoding="utf-8")
+    with diag as fp:
         configure_logging(stream=fp)
         announce_start(args, session)  # capture_started/replay_started -> the log file
         try:

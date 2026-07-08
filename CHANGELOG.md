@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`netmon` command with subcommands** — a console entry point (`pip`/`uv`
+  installable) replaces the long `sudo $(command -v uv) run netmon.py` form.
+  `netmon run` opens the live TUI; `netmon run --log` also persists the record;
+  `netmon run --headless` gives the classic stdout stream; `netmon update` pulls
+  the latest revision and re-syncs deps (refusing a dirty tree); `netmon service`
+  drives the background recorder via systemd. The historical `python netmon.py
+  [flags]` form is preserved byte-for-byte.
+- **`install.sh`** — a reviewable one-command installer: clones to `/opt/netmon`,
+  builds an isolated uv-managed venv, installs a `netmon` launcher (which re-execs
+  under sudo only when live capture needs `CAP_NET_RAW`), and — with
+  `--enable-service` — a hardened `netmon.service` that records as a non-root
+  `netmon` user holding only `CAP_NET_RAW` via systemd `AmbientCapabilities`.
+  `--setcap` enables a passwordless interactive TUI, scoping the capability to the
+  `netmon` group (`chmod 0750 root:netmon` on the private interpreter, guarded against
+  shared `/usr` targets) rather than every local user; `--uninstall` reverses everything.
+
+### Changed
+
+- **`netmon run` is ephemeral unless `--log`.** Persisting your DNS/TLS/HTTP
+  history to disk is now an explicit opt-in for the new `run` subcommand — bare
+  `netmon run` writes nothing. The legacy `python netmon.py`/`--tui` form still
+  writes files as before, so existing scripts and the systemd `ExecStart` are
+  unaffected.
+
 - **Live dashboard (`--tui`)** — an opt-in btop-style terminal view built on
   Textual (install with `uv sync --extra tui`). A single colour-coded feed shows
   every DNS/SNI/HTTP/flow event as it happens (kind, direction, host, detail),

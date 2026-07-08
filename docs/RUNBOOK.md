@@ -11,12 +11,26 @@ How to deploy, run, verify, and read the passive network monitor on any Linux ho
 
 ## 2. Install
 
+**Recommended — the installer** (clones to `/opt/netmon`, builds an isolated
+uv-managed venv, installs a `netmon` launcher, and optionally the systemd recorder):
+
 ```sh
-# copy the project to the target host, e.g.:
-rsync -a netmon.py pyproject.toml uv.lock README.md docs/RUNBOOK.md host:/opt/netmon/
-ssh host
-cd /opt/netmon
-uv sync --no-dev
+curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh
+less install.sh                          # read before running
+sudo bash install.sh                     # + --enable-service and/or --setcap
+```
+
+`--enable-service` installs and starts the section-7 unit; `--setcap` grants
+`CAP_NET_RAW` to the private interpreter (needs `libcap2-bin`); `--uninstall`
+reverses everything. It clones over **HTTPS** so `netmon update` (`git pull`) works
+without an SSH key. Thereafter: `netmon update` pulls the latest revision and
+re-syncs; it refuses if the working tree has local edits (`git stash` first).
+
+**Manual** (a dev checkout, or no installer):
+
+```sh
+rsync -a netmon.py netmon_tui.py pyproject.toml uv.lock README.md docs/ host:/opt/netmon/
+ssh host && cd /opt/netmon && uv sync --no-dev
 ```
 
 Without uv: `python3.13 -m venv .venv && .venv/bin/pip install scapy pydantic structlog cryptography`, then substitute `.venv/bin/python netmon.py` for `uv run netmon.py` everywhere below.
@@ -39,6 +53,8 @@ sudo $(command -v uv) run netmon.py
 sudo setcap cap_net_raw+eip "$(readlink -f .venv/bin/python3)"
 ```
 
+`install.sh --setcap` does exactly this, but safely: it targets the private uv-managed interpreter under `/opt/netmon/pythons` (refusing any target under `/usr`), and — because a file capability is usable by *anyone who can execute the binary* — it then `chown root:netmon` + `chmod 0750`s that interpreter so only root and the `netmon` group get it. The installing user is added to the group automatically (`usermod -aG netmon`); add other interactive users the same way. Everyone else falls back to a sudo prompt.
+
 Caveat: `.venv/bin/python3` is a symlink; the capability lands on the **real** interpreter it points to. If that's the system `/usr/bin/python3.13`, every venv on the host built from it can open raw sockets. Acceptable on a personal machine; on shared hosts build the venv with a private interpreter first (`uv venv --python 3.13` uses a uv-managed copy under `~/.local/share/uv/python/`). Revoke anytime:
 
 ```sh
@@ -49,23 +65,34 @@ sudo setcap -r "$(readlink -f .venv/bin/python3)"
 
 ## 4. Run
 
+With the installer's launcher (it re-execs under `sudo` when live capture needs
+`CAP_NET_RAW`, unless you used `--setcap`):
+
 ```sh
-uv run netmon.py                     # all interfaces incl. loopback/VPN-tun/docker
-uv run netmon.py -q                  # files only (recommended for long runs)
-uv run netmon.py -i wlan0            # single interface
-uv run netmon.py --bpf 'not port 22' # exclude your own SSH session noise
-uv run netmon.py -o /var/log/netmon  # custom output root (default: ./logs)
+netmon run                           # live TUI dashboard — ephemeral, writes nothing
+netmon run --log                     # ...and persist the JSONL record
+netmon run --headless -q             # classic stdout stream (files only with --log)
+netmon run -i wlan0 --log            # single interface
+netmon run --bpf 'not port 22' --log # exclude your own SSH session noise
+netmon run --log -o /var/log/netmon  # custom output root (default: ./logs)
 ```
 
-Each start creates a fresh `logs/run-YYYYMMDD-HHMMSS/`. Stop with `Ctrl-C` (or `kill -TERM <pid>`) — the summary is only written on clean shutdown.
+From a checkout the historical flat form is unchanged and still writes files:
+`uv run netmon.py -q`, `uv run netmon.py -i wlan0`, etc.
+
+A persisting run (`--log`, the recorder, or the legacy form) creates a fresh
+`<output>/run-YYYYMMDD-HHMMSS/`; a bare `netmon run` creates nothing. Stop with
+`Ctrl-C` (or `kill -TERM <pid>`) — the summary is only written on clean shutdown.
 
 Startup prints `capture_started` with the interface list and detected local IPs — check that list; direction (inbound/outbound) classification depends on it. A `stats` line is logged every 30 s with packets, event counts, queue depth, `userspace_dropped` (netmon's own queue overflowed) and `kernel_dropped` (the kernel's `tp_drops`: packets the socket buffer shed before netmon ever saw them). `kernel_dropped: "unavailable"` means the source can't report it (e.g. pcap replay).
 
 `--read file.pcap` replays a capture file through the same pipeline instead of sniffing live — no privileges needed; useful for testing and offline analysis.
 
-### Live dashboard (`--tui`)
+### Live dashboard (`netmon run`)
 
-`uv sync --extra tui` (pulls in Textual), then `uv run netmon.py --tui` for a btop-style live view: a colour-coded feed of every DNS/SNI/HTTP/flow event (newest at the top, columns fit to terminal width) plus top-hosts, per-kind, events/sec, and capture-health panels. Keys: `q` quit, `space` pause, `f` cycle filter, ↑/↓ inspect a row for its full record, `g` follow the newest. Scrolling down or selecting a row freezes the feed (the health panel shows FOLLOW/INSPECT/PAUSED) so history can be read without it snapping back; `g` resumes the live tail. Requires an interactive terminal (both stdin and stdout a tty) — it exits `2` otherwise, so it is **not** for systemd/headless use; those keep using `-q`. The JSONL files are still written, and structlog is redirected to `<run>/netmon.log` so it can't garble the display. Only `q`/`ctrl+q`/`ctrl+c` quit from the keyboard; an external `kill -TERM <pid>` also stops it cleanly and writes the summary. The headless deploy needs only `netmon.py` (the `--tui` import is lazy); add the `tui` extra only where you want the dashboard.
+`netmon run` opens the btop-style live view (the installer already added the `tui`
+extra; from a checkout, `uv sync --extra tui` then `netmon run` or the equivalent
+`uv run netmon.py --tui`). A colour-coded feed of every DNS/SNI/HTTP/flow event (newest at the top, columns fit to terminal width) plus top-hosts, per-kind, events/sec, and capture-health panels. Keys: `q` quit, `space` pause, `f` cycle filter, ↑/↓ inspect a row for its full record, `g` follow the newest. Scrolling down or selecting a row freezes the feed (the health panel shows FOLLOW/INSPECT/PAUSED) so history can be read without it snapping back; `g` resumes the live tail. Requires an interactive terminal (both stdin and stdout a tty) — it exits `2` otherwise, so it is **not** for systemd/headless use; those use `netmon run --headless --log -q`. By default `netmon run` is ephemeral (writes nothing); add `--log` to persist the JSONL record, which also redirects structlog to `<run>/netmon.log` so it can't garble the display. Only `q`/`ctrl+q`/`ctrl+c` quit from the keyboard; an external `kill -TERM <pid>` also stops it cleanly and writes the summary (when `--log`). The headless deploy needs only `netmon.py` (the TUI import is lazy); add the `tui` extra only where you want the dashboard.
 
 ## 5. Verify capture is working
 
@@ -115,36 +142,42 @@ jq -rs 'sort_by(.ts) | .[] | "\(.ts) \(.kind) \(.sni // .qname // .hostname // .
 
 ## 7. Continuous monitoring (systemd)
 
-`/etc/systemd/system/netmon.service`:
+`install.sh --enable-service` sets this all up: a dedicated non-root `netmon` user,
+`/var/log/netmon` (mode `0700`), and the unit below at `/etc/systemd/system/netmon.service`.
+Drive it with `netmon service {start,stop,status,enable,disable,logs}` (thin
+`systemctl`/`journalctl` wrappers) or `systemctl` directly.
 
 ```ini
 [Unit]
-Description=netmon passive network monitor
+Description=netmon passive network recorder
 After=network.target
 
 [Service]
-WorkingDirectory=/opt/netmon
-ExecStart=/opt/netmon/.venv/bin/python netmon.py -q -o /var/log/netmon
+User=netmon
+ExecStart=/opt/netmon/.venv/bin/netmon run --headless --log -q -o /var/log/netmon
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
-NoNewPrivileges=true
+NoNewPrivileges=yes
 ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
 ReadWritePaths=/var/log/netmon
 Restart=on-failure
-KillSignal=SIGTERM
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+To wire it up by hand instead:
+
 ```sh
-sudo mkdir -p /var/log/netmon
 sudo systemctl daemon-reload
-sudo systemctl enable --now netmon
-journalctl -u netmon -f          # structlog JSON: capture_started, stats, capture_stopped
+sudo systemctl enable --now netmon      # or: netmon service enable
+netmon service logs                     # structlog JSON: capture_started, stats, capture_stopped
 ```
 
-`AmbientCapabilities` makes setcap (section 3B) unnecessary for the service. Each restart opens a new run directory, which doubles as log rotation. Prune old runs:
+`--headless --log` is required: the recorder must persist (`--log`) and must not try
+to open a TUI without a tty (`--headless`). `AmbientCapabilities` makes setcap (section 3B) unnecessary for the service — it runs unprivileged with exactly one capability. Each restart opens a new run directory, which doubles as log rotation. Prune old runs:
 
 ```sh
 find /var/log/netmon -maxdepth 1 -name 'run-*' -mtime +30 -exec rm -r {} +
@@ -154,8 +187,10 @@ find /var/log/netmon -maxdepth 1 -name 'run-*' -mtime +30 -exec rm -r {} +
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `insufficient_privileges` at startup | No root/CAP_NET_RAW — section 3. After rebuilding `.venv` (e.g. `uv sync` upgraded Python), setcap must be re-applied. |
-| `sudo: uv: command not found` | Use `sudo $(command -v uv) run netmon.py`. |
+| `insufficient_privileges` at startup | No root/CAP_NET_RAW — section 3. After `netmon update`/`uv sync` rebuilds `.venv` (e.g. Python upgraded), a `--setcap` grant is on the old interpreter — re-run `sudo bash install.sh --setcap`. |
+| `netmon run` prompts for a sudo password | Expected without `--setcap`: the launcher re-execs under sudo to get `CAP_NET_RAW`. Run `sudo bash install.sh --setcap` for a passwordless TUI, or use the systemd recorder for unattended capture. |
+| `netmon update` refuses: "working tree has local changes" | You edited files under `/opt/netmon`. `sudo git -C /opt/netmon stash` (or discard) then retry; update does a `--ff-only` pull and won't clobber local edits. |
+| `sudo: uv: command not found` | Use `sudo $(command -v uv) run netmon.py`, or the `netmon` launcher (which execs the venv directly, no uv on PATH needed). |
 | Starts, but zero packets in `stats` | Wrong `-i` name (check `ip link`); or a too-narrow `--bpf` expression. |
 | `--bpf` raises an error | `tcpdump` not installed — scapy needs it to compile the filter. |
 | `userspace_dropped` > 0 in stats | Consumer can't keep up (very busy link). Narrow with `--bpf` or `-i`, and use `-q`. |

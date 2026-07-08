@@ -7,9 +7,11 @@ import hmac
 import ipaddress
 import json
 import os
+import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 from collections import Counter, OrderedDict
@@ -1720,6 +1722,12 @@ def open_private_new(path: Path) -> TextIO:
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
+class Writer(Protocol):
+    def write(self, event: Event) -> None: ...
+    def write_summary(self, summary: dict[str, Any]) -> None: ...
+    def close(self) -> None: ...
+
+
 class JsonlWriter:
     # The run directory is the user's browsing history — keep it owner-only.
     def __init__(self, out_dir: Path) -> None:
@@ -1747,6 +1755,14 @@ class JsonlWriter:
     def close(self) -> None:
         for f in self._files.values():
             f.close()
+
+
+class NullWriter:
+    # Ephemeral capture (`netmon run` without --log): stream to the live TUI only,
+    # never touch disk — the DNS/TLS/HTTP record stays in memory and evaporates.
+    def write(self, event: Event) -> None: ...
+    def write_summary(self, summary: dict[str, Any]) -> None: ...
+    def close(self) -> None: ...
 
 
 # Python's socket module exposes neither constant (verified against
@@ -1902,15 +1918,23 @@ class Session:
     # the same capture/parse/write pipeline and differ only in the per-event sink.
     out_dir: Path
     processor: PacketProcessor
-    writer: JsonlWriter
+    writer: Writer
     capture: Capture
+
+
+def persist_enabled(args: argparse.Namespace) -> bool:
+    # Single source of truth for "does this run write its DNS/TLS/HTTP record to disk".
+    # Privacy-relevant, so both the JSONL writer and the TUI diagnostic log read it here
+    # rather than each re-deciding. Absent `log` means a programmatic caller (the tests)
+    # that wants files; the CLI sets it — `run` -> False (ephemeral), `run --log`/legacy -> True.
+    return getattr(args, "log", True)
 
 
 def build_session(args: argparse.Namespace) -> Session:
     os.umask(0o077)
     out_dir = Path(args.output) / datetime.now(tz=UTC).strftime("run-%Y%m%d-%H%M%S")
     processor = PacketProcessor(local_addresses(), redact_query=not args.keep_query)
-    writer = JsonlWriter(out_dir)
+    writer: Writer = JsonlWriter(out_dir) if persist_enabled(args) else NullWriter()
     capture: Capture
     if args.read:
         capture = ReplayCapture(Path(args.read))
@@ -2020,35 +2044,145 @@ async def run(args: argparse.Namespace) -> None:
         )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Passive network monitor: logs DNS, TLS SNI, HTTP hosts, and flows as JSONL"
-    )
-    parser.add_argument("-i", "--iface", default=None, help="interface to capture (default: all)")
-    parser.add_argument("--bpf", default=None, help="BPF capture filter, e.g. 'not port 22'")
-    parser.add_argument(
+def _add_capture_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-i", "--iface", default=None, help="interface to capture (default: all)")
+    p.add_argument("--bpf", default=None, help="BPF capture filter, e.g. 'not port 22'")
+    p.add_argument(
         "-r",
         "--read",
         default=None,
         metavar="PCAP",
         help="replay packets from a pcap file instead of capturing live",
     )
-    parser.add_argument("-o", "--output", default="logs", help="output directory (default: logs)")
-    parser.add_argument("-q", "--quiet", action="store_true", help="no per-event stdout logging")
-    parser.add_argument(
-        "--tui",
-        action="store_true",
-        help="live btop-style dashboard instead of stdout logs (JSONL still written)",
-    )
-    parser.add_argument(
+    p.add_argument("-o", "--output", default="logs", help="output directory (default: logs)")
+    p.add_argument("-q", "--quiet", action="store_true", help="no per-event stdout logging")
+    p.add_argument(
         "--keep-query",
         action="store_true",
         help="log full HTTP request paths incl. query strings (may contain credentials)",
     )
-    args = parser.parse_args()
+
+
+def _legacy_parser() -> argparse.ArgumentParser:
+    # The historical flat form (python netmon.py [flags]) — kept byte-for-byte so the
+    # systemd unit, docs, and existing muscle memory keep working unchanged.
+    p = argparse.ArgumentParser(
+        description="Passive network monitor: logs DNS, TLS SNI, HTTP hosts, and flows as JSONL"
+    )
+    _add_capture_flags(p)
+    p.add_argument(
+        "--tui",
+        action="store_true",
+        help="live btop-style dashboard instead of stdout logs (JSONL still written)",
+    )
+    return p
+
+
+def _run_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="netmon run", description="live btop-style TUI dashboard (ephemeral unless --log)"
+    )
+    _add_capture_flags(p)
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="no dashboard; classic per-event stdout logging",
+    )
+    p.add_argument(
+        "--log",
+        action="store_true",
+        help="persist the JSONL record (and TUI diagnostics) to the output dir",
+    )
+    return p
+
+
+def _install_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def cmd_update(argv: list[str]) -> int:
+    # git pull + uv sync against this checkout. No raw socket, so no privileges needed
+    # for the git/uv work itself (restarting the service does need root — see below).
+    dir_ = _install_dir()
+    git, uv = shutil.which("git"), shutil.which("uv")
+    if not git or not uv:
+        print("netmon update needs both git and uv on PATH", file=sys.stderr)
+        return 1
+
+    def git_(*a: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [git, "-C", str(dir_), *a], text=True, capture_output=True, check=False
+        )
+
+    if git_("rev-parse", "--is-inside-work-tree").returncode != 0:
+        print(f"{dir_} is not a git checkout — reinstall via install.sh", file=sys.stderr)
+        return 1
+    if git_("status", "--porcelain").stdout.strip():
+        print(
+            "refusing to update: working tree has local changes (git stash first)",
+            file=sys.stderr,
+        )
+        return 1
+    old = git_("rev-parse", "--short", "HEAD").stdout.strip()
+    pull = git_("pull", "--ff-only", "origin", "main")
+    if pull.returncode != 0:
+        print(pull.stderr.strip() or "git pull failed", file=sys.stderr)
+        return 1
+    sync = subprocess.run(
+        [uv, "sync", "--extra", "tui", "--no-dev"], cwd=dir_, text=True, check=False
+    )
+    if sync.returncode != 0:
+        print("uv sync failed", file=sys.stderr)
+        return 1
+    new = git_("rev-parse", "--short", "HEAD").stdout.strip()
+    systemctl = shutil.which("systemctl")
+    if systemctl and subprocess.run(
+        [systemctl, "is-active", "--quiet", "netmon.service"], check=False
+    ).returncode == 0:
+        subprocess.run([systemctl, "restart", "netmon.service"], check=False)
+        print("restarted netmon.service")
+    print(f"netmon updated {old} -> {new}" if old != new else f"already up to date ({new})")
+    return 0
+
+
+def cmd_service(argv: list[str]) -> int:
+    # Thin systemctl/journalctl passthrough for the background recorder unit.
+    actions = {"start", "stop", "restart", "status", "enable", "disable", "logs"}
+    if len(argv) != 1 or argv[0] not in actions:
+        print(f"usage: netmon service {{{'|'.join(sorted(actions))}}}", file=sys.stderr)
+        return 2
+    action = argv[0]
+    if action == "logs":
+        tool = shutil.which("journalctl")
+        cmd = [tool, "-u", "netmon.service", "-f"] if tool else []
+    else:
+        tool = shutil.which("systemctl")
+        cmd = [tool, action, "netmon.service"] if tool else []
+    if not cmd:
+        print("systemd not available on this host", file=sys.stderr)
+        return 1
+    return subprocess.run(cmd, check=False).returncode
+
+
+def _parse_run_args(argv: list[str]) -> argparse.Namespace:
+    args = _run_parser().parse_args(argv)
+    args.tui = not args.headless  # `run` shows the dashboard unless --headless
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "update":
+        sys.exit(cmd_update(argv[1:]))
+    if argv and argv[0] == "service":
+        sys.exit(cmd_service(argv[1:]))
+    if argv and argv[0] == "run":
+        args = _parse_run_args(argv[1:])
+    else:
+        args = _legacy_parser().parse_args(argv)
     # Textual's driver reads raw stdin even when only stdout is a tty, so `--tui <file`
     # would parse file bytes as keystrokes — require both ends to be a real terminal.
-    if args.tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if getattr(args, "tui", False) and not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("--tui requires an interactive terminal (stdin and stdout)", file=sys.stderr)
         sys.exit(2)
     if not args.read:
