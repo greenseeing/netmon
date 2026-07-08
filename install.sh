@@ -26,8 +26,10 @@
 #     repo or its pinned dependency tree can reach root on every host that updates.
 set -euo pipefail
 
-# NETMON_REPO lets a fork (or a local test) override the source; defaults to upstream.
+# NETMON_REPO/NETMON_REF let a fork (or a pre-merge branch test) override the source and
+# branch/tag; default to upstream main. Note `netmon update` always tracks origin main.
 REPO_HTTPS="${NETMON_REPO:-https://git.disroot.org/afk/netmon.git}"
+NETMON_REF="${NETMON_REF:-main}"
 NETMON_DIR="${NETMON_PREFIX:-/opt/netmon}"
 LAUNCHER="/usr/local/bin/netmon"
 SERVICE="/etc/systemd/system/netmon.service"
@@ -72,11 +74,12 @@ ensure_tools() {
 
 clone_or_pull() {
   if [ -d "$NETMON_DIR/.git" ]; then
-    echo "==> updating existing checkout in $NETMON_DIR"
-    git -C "$NETMON_DIR" pull --ff-only origin main
+    echo "==> updating existing checkout in $NETMON_DIR ($NETMON_REF)"
+    git -C "$NETMON_DIR" fetch --depth 1 origin "$NETMON_REF"
+    git -C "$NETMON_DIR" checkout -B "$NETMON_REF" FETCH_HEAD
   else
-    echo "==> cloning netmon into $NETMON_DIR"
-    git clone --depth 1 "$REPO_HTTPS" "$NETMON_DIR"
+    echo "==> cloning netmon into $NETMON_DIR ($NETMON_REF)"
+    git clone --depth 1 --branch "$NETMON_REF" "$REPO_HTTPS" "$NETMON_DIR"
   fi
 }
 
