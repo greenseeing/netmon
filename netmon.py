@@ -18,7 +18,7 @@ from collections import Counter, OrderedDict
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol, TextIO, cast
 
@@ -318,7 +318,10 @@ KIND_TO_FILE = {
 
 
 def iso(ts: float) -> str:
-    return datetime.fromtimestamp(float(ts), tz=UTC).isoformat(timespec="milliseconds")
+    # Local wall-clock time with the local UTC offset (e.g. ...+08:00): netmon reports in
+    # the timezone of whoever runs it — the feed, the detail pane, and the JSONL record
+    # all read from this one authority. The offset keeps every timestamp unambiguous.
+    return datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="milliseconds")
 
 
 # --- Live dashboard (--tui) presentation model -------------------------------
@@ -451,8 +454,8 @@ def event_detail(event: Event) -> str:
 
 
 def event_to_cells(event: Event) -> list[str]:
-    # TIME | KIND | DIR | HOST/NAME | DETAIL. Time is the HH:MM:SS.mmm slice of the
-    # ISO ts the event already carries.
+    # TIME | KIND | DIR | HOST/NAME | DETAIL. Time is the HH:MM:SS.mmm slice of the ISO
+    # ts the event already carries, which iso() renders in the host's local timezone.
     return [
         event.ts[11:23],
         event.kind,
@@ -1918,13 +1921,21 @@ def check_capture_privileges() -> None:
         sys.exit(1)
 
 
+def _stamp_local_time(_logger: Any, _method: str, event_dict: Any) -> Any:
+    # One timestamp authority: log lines carry the same local-with-offset ISO stamp as
+    # event ts (structlog's own TimeStamper drops the offset), so a log line and the
+    # event it describes are directly comparable.
+    event_dict["timestamp"] = iso(time.time())
+    return event_dict
+
+
 def configure_logging(stream: TextIO | None = None) -> None:
     # stream lets --tui redirect structlog off stdout (which Textual owns) into a
     # file, so a stray log line never garbles the compositor.
     structlog.configure(
         processors=[
             structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            _stamp_local_time,
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(20),
@@ -1952,7 +1963,7 @@ def persist_enabled(args: argparse.Namespace) -> bool:
 
 def build_session(args: argparse.Namespace) -> Session:
     os.umask(0o077)
-    out_dir = Path(args.output) / datetime.now(tz=UTC).strftime("run-%Y%m%d-%H%M%S")
+    out_dir = Path(args.output) / datetime.now().strftime("run-%Y%m%d-%H%M%S")
     processor = PacketProcessor(local_addresses(), redact_query=not args.keep_query)
     writer: Writer = JsonlWriter(out_dir) if persist_enabled(args) else NullWriter()
     capture: Capture

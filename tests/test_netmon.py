@@ -1,11 +1,15 @@
 import argparse
+import io
 import json
+import os
 import random
 import struct
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from scapy.config import conf
 from scapy.layers.dns import (
@@ -68,12 +72,14 @@ from netmon import (
     _legacy_parser,
     _parse_run_args,
     _run_parser,
+    configure_logging,
     derive_initial_keys,
     event_detail,
     event_direction,
     event_host,
     event_to_cells,
     header_protection_mask,
+    iso,
     main,
     packet_nonce,
     parse_client_hello,
@@ -2440,9 +2446,36 @@ class TestEventDirection:
         assert event_direction(arp) == "·"
 
 
+class TestIso:
+    def test_defaults_to_utc_under_conftest(self) -> None:
+        # The suite is pinned to UTC (conftest), so iso() renders the UTC fixture value.
+        assert iso(PKT_TIME) == EXPECTED_ISO
+
+    def test_renders_local_time_with_offset(self) -> None:
+        # netmon stamps events in the host's local zone: in +08:00, 23:46:40.123 UTC is
+        # 07:46:40.123 the next day carrying a +08:00 offset.
+        os.environ["TZ"] = "Asia/Shanghai"  # UTC+8, no DST
+        time.tzset()
+        assert iso(PKT_TIME) == "2025-07-03T07:46:40.123+08:00"
+
+    def test_log_line_timestamp_is_local_with_offset(self) -> None:
+        # structlog lines carry the same local-with-offset stamp as event ts.
+        os.environ["TZ"] = "Asia/Shanghai"
+        time.tzset()
+        buf = io.StringIO()
+        configure_logging(stream=buf)
+        try:
+            structlog.get_logger().info("capture_started", iface="eth0")
+            line = json.loads(buf.getvalue())
+        finally:
+            configure_logging()
+        assert line["event"] == "capture_started"
+        assert line["timestamp"].endswith("+08:00")
+
+
 class TestEventToCells:
     def test_five_columns_and_time_slice(self) -> None:
-        cells = event_to_cells(q("example.com"))
+        cells = event_to_cells(q("example.com"))  # q() carries the UTC TS literal
         assert len(cells) == 5
         assert cells[0] == "23:46:40.123"
         assert cells[1] == "dns_query"

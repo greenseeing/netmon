@@ -12,7 +12,7 @@ Passive network monitor for auditing what your device leaks to the ISP and which
 | `flows.jsonl` | Every new connection: protocol, direction, local/remote IP+port, service guess, hostname (reverse-mapped from observed DNS answers), scope (`internet`, `lan`, or `multicast`), and a `note` on disclosive services (NTP, STARTTLS mail) |
 | `summary.json` | Written on exit: top DNS names, top SNI hostnames, top internet hosts, event counts |
 
-All events carry ISO 8601 UTC timestamps with millisecond precision. Runs that persist — `netmon run --log`, the background recorder, or the legacy `python netmon.py` form — write to `<output>/run-<stamp>/`.
+All events carry ISO 8601 timestamps in the host's local timezone (with an explicit UTC offset) at millisecond precision. Runs that persist — `netmon run --log`, the background recorder, or the legacy `python netmon.py` form — write to `<output>/run-<stamp>/`.
 
 ## Install
 

@@ -52,6 +52,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Timestamps use the local timezone.** Every timestamp netmon reports — the
+  `--tui` feed and detail pane, the JSONL `ts` field, structlog lines, and the run
+  directory name — now renders in the local timezone of the host running it,
+  instead of UTC. Event and record timestamps keep an explicit ISO 8601 offset
+  (e.g. `+08:00`) so they stay unambiguous.
+
 - **Capture crash on malformed packets (`AttributeError`).** A truncated or
   malformed packet on a DNS port is accepted by the parser but raises when a
   record field is read, which killed the capture worker — taking the `--tui`
