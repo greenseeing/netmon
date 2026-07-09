@@ -56,6 +56,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A reused IP is named for the site you most recently visited.** The IP→hostname
+  ledger kept the first name an address was ever seen with, so a shared or CDN edge
+  that later served a different site mislabeled every subsequent flow with the stale
+  first name (an early `imgs.example.com` shadowing a later `login.bank.com`).
+  Attribution is now last-writer-wins: a newer DNS answer or SNI re-attributes the
+  address, tracking CDN/DHCP reuse by temporal locality and self-healing after a
+  one-off wrong answer. The per-flow `hostname` stays a best-effort hint — the
+  authoritative per-connection SNI is in `tls.jsonl` — and an RA's RDNSS placeholder
+  never overwrites a real learned name.
+
 - **DNS-over-TCP no longer goes blind on a long-lived connection.** The
   DNS-over-TCP reassembler capped a stream by its *cumulative* bytes and never freed
   a message once parsed, so a persistent connection — an Android "Private DNS" (DoT)

@@ -988,11 +988,62 @@ class TestNameLedger:
     def test_lookup_miss_returns_none(self) -> None:
         assert NameLedger(cap=8).lookup("1.2.3.4") is None
 
-    def test_first_observation_wins(self) -> None:
+    def test_last_observation_wins(self) -> None:
+        # A shared/CDN IP that later serves a different site must re-attribute to the
+        # most recent name (temporal locality), not stay pinned to the first.
         ledger = NameLedger(cap=8)
         ledger.observe("1.2.3.4", "first.example.com")
         ledger.observe("1.2.3.4", "second.example.com")
-        assert ledger.lookup("1.2.3.4") == "first.example.com"
+        assert ledger.lookup("1.2.3.4") == "second.example.com"
+
+    def test_reobserving_ip_does_not_grow_or_evict(self) -> None:
+        ledger = NameLedger(cap=8)
+        ledger.observe("1.2.3.4", "a.example.com")
+        ledger.observe("1.2.3.4", "b.example.com")
+        assert len(ledger) == 1
+        assert ledger.evicted == 0
+
+    def test_reobserve_at_capacity_does_not_evict(self) -> None:
+        ledger = NameLedger(cap=2)
+        ledger.observe("1.1.1.1", "a")
+        ledger.observe("2.2.2.2", "b")
+        ledger.observe("1.1.1.1", "a2")  # re-observe while full: no drift, no eviction
+        assert ledger.evicted == 0
+        assert len(ledger) == 2
+        assert ledger.lookup("1.1.1.1") == "a2"
+        assert ledger.lookup("2.2.2.2") == "b"
+
+    def test_placeholder_never_clobbers_a_real_name(self) -> None:
+        ledger = NameLedger(cap=8)
+        ledger.observe("2001:db8::53", "dns.example.com")  # real name learned first
+        ledger.observe_if_absent("2001:db8::53", RA_RDNSS_NAME)
+        assert ledger.lookup("2001:db8::53") == "dns.example.com"
+
+    def test_placeholder_fills_gap_then_yields_to_real_name(self) -> None:
+        ledger = NameLedger(cap=8)
+        ledger.observe_if_absent("2001:db8::53", RA_RDNSS_NAME)
+        assert ledger.lookup("2001:db8::53") == RA_RDNSS_NAME  # gap filled
+        ledger.observe("2001:db8::53", "dns.example.com")  # real name later wins
+        assert ledger.lookup("2001:db8::53") == "dns.example.com"
+
+    def test_flow_hostname_reflects_latest_name_for_reused_ip(self) -> None:
+        # End to end: a CDN edge resolved first for imgs, then for login; a later flow
+        # to that edge must name the site the client most recently asked for.
+        proc = local_processor("192.168.1.50")
+        proc.process(
+            dns_response(
+                DNSQR(qname="imgs.example.com"),
+                DNSRR(rrname="imgs.example.com", type="A", ttl=60, rdata="93.184.216.34"),
+            )
+        )
+        proc.process(
+            dns_response(
+                DNSQR(qname="login.bank.com"),
+                DNSRR(rrname="login.bank.com", type="A", ttl=60, rdata="93.184.216.34"),
+            )
+        )
+        flow = single_flow(proc.process(make_syn("192.168.1.50", "93.184.216.34", 51000, 443)))
+        assert flow.hostname == "login.bank.com"
 
     def test_cap_enforced_under_distinct_flood(self) -> None:
         ledger = NameLedger(cap=10)

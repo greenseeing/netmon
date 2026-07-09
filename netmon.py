@@ -1263,9 +1263,12 @@ class LruSet[K]:
 
 
 class NameLedger:
-    # The one authority for IP→hostname naming: first observation wins (the
-    # DNS answer or SNI that first explained the address), LRU-bounded so CDN
-    # sharding and IPv6 churn cannot grow it for the life of the process.
+    # The one authority for IP→hostname naming: last observation wins, so a shared
+    # or CDN edge address re-attributes to the site the client most recently
+    # resolved to it (temporal locality) instead of staying pinned to the first
+    # name forever. LRU-bounded so CDN sharding and IPv6 churn cannot grow it for
+    # the life of the process. The per-flow name is a best-effort hint — the
+    # authoritative per-connection SNI lives in tls.jsonl.
     def __init__(self, cap: int) -> None:
         self.cap = cap
         self.evicted = 0
@@ -1273,12 +1276,20 @@ class NameLedger:
 
     def observe(self, ip: str, name: str) -> None:
         if ip in self._names:
+            self._names[ip] = name  # re-attribute a reused IP to the newest name
             self._names.move_to_end(ip)
             return
         self._names[ip] = name
         if len(self._names) > self.cap:
             self._names.popitem(last=False)
             self.evicted += 1
+
+    def observe_if_absent(self, ip: str, name: str) -> None:
+        # A weak/placeholder name (e.g. an RA's RDNSS marker) only fills a gap: it
+        # must never overwrite a real DNS/SNI name under last-wins, though a real
+        # name observed later may still replace it.
+        if ip not in self._names:
+            self.observe(ip, name)
 
     def lookup(self, ip: str) -> str | None:
         name = self._names.get(ip)
@@ -1703,7 +1714,7 @@ class PacketProcessor:
         if not self.ra_seen.add((router, tuple(prefixes), tuple(rdnss))):
             return []
         for addr in rdnss:
-            self.names.observe(addr, RA_RDNSS_NAME)
+            self.names.observe_if_absent(addr, RA_RDNSS_NAME)
         return [Icmp6RaEvent(ts=ts, router=router, prefixes=prefixes, rdnss=rdnss)]
 
     def _llmnr_events(self, ts: str, net: Any, llmnr: Any) -> list[Event]:
