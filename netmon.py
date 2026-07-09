@@ -1214,6 +1214,13 @@ def _dns_tcp_start(payload: bytes) -> bool:
 
 
 def local_addresses() -> frozenset[str]:
+    # conf.ifaces caches its enumeration at import; reload so a mid-run refresh sees
+    # addresses assigned since boot-time (an RFC 4941 rotation, a DHCP renewal). A
+    # failed reload keeps the cached view — stale beats dead for a passive monitor.
+    # Safe to call off the event loop only because LiveCapture's packet hot path
+    # never consults conf.ifaces after its sockets are opened; keep it that way.
+    with contextlib.suppress(Exception):
+        conf.ifaces.reload()
     ips: set[str] = set()
     for iface in conf.ifaces.values():
         data = getattr(iface, "ips", None)
@@ -2007,6 +2014,15 @@ class PacketProcessor:
             return []
         return [NbnsEvent(ts=ts, src=net.src, dst=net.dst, qname=qname)]
 
+    def refresh_local_ips(self, ips: frozenset[str]) -> None:
+        # Address rotation (RFC 4941 privacy addresses, a DHCP renewal) adds own
+        # addresses mid-run; a frozen set would misclassify their egress as transit.
+        # Replaces the set atomically — reassembly, ledgers, and seen flows are
+        # untouched. An empty set is a failed enumeration, never the new truth:
+        # keeping the last-known addresses beats flipping every own flow to transit.
+        if ips:
+            self.local_ips = ips
+
     def _endpoint_is_local(self, ip: str) -> bool:
         # Local = an address on this host OR one that is structurally on-link
         # (private/link-local/loopback). The own-IP half keeps a globally-addressed
@@ -2582,6 +2598,23 @@ async def stats_loop(session: Session) -> None:
         )
 
 
+async def refresh_local_ips_loop(session: Session, interval: float = 60.0) -> None:
+    # Unlike stats_loop this also runs under --tui (it touches no stdout) — the
+    # classification must stay correct in every live mode. local_addresses() does
+    # blocking interface I/O, so it runs in the default executor off the event loop.
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            ips = await asyncio.get_running_loop().run_in_executor(None, local_addresses)
+            session.processor.refresh_local_ips(ips)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A refresh hiccup must not silently kill the loop for the rest of the
+            # run — direction classification would quietly freeze on the old set.
+            _log_write_failure("local_ips_refresh_failed", exc)
+
+
 async def consume(session: Session, on_event: Callable[[Event], None]) -> None:
     # The single shared loop. JSONL is written in both modes; only on_event differs
     # (per-event structlog when headless, model.add_event under --tui). The periodic
@@ -2643,6 +2676,9 @@ async def run(args: argparse.Namespace) -> None:
     # No per-event stdout logging or 30 s stats line under --tui: both would write to
     # stdout, which Textual owns — the dashboard's own panels replace them.
     stats_task = None if tui else asyncio.create_task(stats_loop(session))
+    # A replay analyses another moment's traffic; only a live capture tracks the
+    # host's current addresses.
+    refresh_task = None if read else asyncio.create_task(refresh_local_ips_loop(session))
     try:
         if tui:
             from netmon_tui import run_dashboard
@@ -2653,6 +2689,8 @@ async def run(args: argparse.Namespace) -> None:
     finally:
         if stats_task is not None:
             stats_task.cancel()
+        if refresh_task is not None:
+            refresh_task.cancel()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(sig)
         # Runs on every exit path (quit, signal, exception): summary + coverage +

@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mid-run local-address refresh** — the host's own-address set is re-enumerated
+  every 60 s during a live capture (headless and `--tui` alike), so an address
+  assigned mid-run — an RFC 4941 IPv6 privacy-address rotation, a DHCP renewal —
+  classifies its egress as `outbound` instead of `transit`. A failed enumeration
+  keeps the last-known set (stale beats dead); replays are untouched.
 - **TLS 1.2 server-certificate SAN naming** — on the still-common TLS 1.2 path the
   server's certificate crosses the wire in cleartext, and netmon now reassembles the
   server→client handshake flight, reads the leaf certificate's SubjectAltName DNS

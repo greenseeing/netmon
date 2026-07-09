@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import errno
 import io
 import json
@@ -97,12 +98,14 @@ from netmon import (
     finalize,
     header_protection_mask,
     iso,
+    local_addresses,
     main,
     packet_nonce,
     parse_client_hello,
     parse_handshake_client_hello,
     parse_http_request,
     question_list,
+    refresh_local_ips_loop,
     remote_scope,
     run,
 )
@@ -817,6 +820,69 @@ class TestTls12CertificateSan:
         proc.process(tcp_segment(hello[:800], flags="A", seq=BASE_SEQ))
         assert not proc.certs._pending
         assert not proc.certs._flows
+
+
+class TestRefreshLocalAddresses:
+    def test_flow_from_a_new_own_address_reclassifies_outbound(self) -> None:
+        # An RFC 4941 rotation / DHCP renewal adds an own global address mid-run;
+        # before a refresh its egress misclassifies as transit, after it is outbound.
+        # Genuinely global addresses (not TEST-NET, which classifies as on-link).
+        proc = local_processor("93.184.216.40")
+        before = single_flow(proc.process(make_syn("93.184.216.50", "104.16.1.1", 40000, 443)))
+        assert before.direction == "transit"
+        proc.refresh_local_ips(frozenset({"93.184.216.40", "93.184.216.50"}))
+        after = single_flow(proc.process(make_syn("93.184.216.50", "104.16.1.1", 40001, 443)))
+        assert after.direction == "outbound"
+
+    def test_local_addresses_reenumerates_interfaces_via_reload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # conf.ifaces caches enumeration at import; without a reload a mid-run
+        # refresh would keep returning the boot-time snapshot forever.
+        class FakeIfaces(dict):  # type: ignore[type-arg]
+            reloads = 0
+
+            def reload(self) -> None:
+                self.reloads += 1
+                self["eth0"] = argparse.Namespace(ips={4: ["198.51.100.7"], 6: []})
+
+        fake = FakeIfaces()
+        monkeypatch.setattr(conf, "ifaces", fake)
+        assert "198.51.100.7" in local_addresses()
+        assert fake.reloads == 1
+
+    def test_empty_refresh_keeps_the_known_addresses(self) -> None:
+        # A transient enumeration failure must never blank the set and flip every
+        # own flow to transit.
+        proc = local_processor("203.0.113.10")
+        proc.refresh_local_ips(frozenset())
+        assert proc.local_ips == frozenset({"203.0.113.10"})
+
+    def test_refresh_does_not_drop_in_flight_state(self) -> None:
+        proc = local_processor("203.0.113.10")
+        proc.names.observe("93.184.216.34", "keep.example.com")
+        proc.process(make_syn("203.0.113.10", "93.184.216.34", 40000, 443))
+        proc.refresh_local_ips(frozenset({"203.0.113.10"}))
+        assert proc.names.lookup("93.184.216.34") == "keep.example.com"
+        assert proc.process(make_syn("203.0.113.10", "93.184.216.34", 40000, 443)) == []
+
+    async def test_refresh_loop_feeds_current_addresses_to_the_processor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        proc = local_processor("203.0.113.10")
+        session = Session(Path("unused"), proc, NullWriter(), ReplayCapture(Path("x")))
+        monkeypatch.setattr(netmon, "local_addresses", lambda: frozenset({"198.51.100.7"}))
+        task = asyncio.create_task(refresh_local_ips_loop(session, interval=0.01))
+        try:
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if "198.51.100.7" in proc.local_ips:
+                    break
+        finally:
+            task.cancel()
+        assert "198.51.100.7" in proc.local_ips
 
 
 RFC_DCID = bytes.fromhex("8394c8f03e515708")
