@@ -2513,6 +2513,71 @@ class TestDnsTcpReassembler:
         assert len(bodies) == 1
         assert bodies[0] == framed[2:]
 
+    def test_long_lived_stream_does_not_go_blind_past_cap(self) -> None:
+        # A persistent DoT connection multiplexes a device's whole lookup stream; the
+        # sliding window must keep emitting once cumulative bytes pass per_flow_cap,
+        # not fall permanently silent.
+        r = DnsTcpReassembler(per_flow_cap=1024)
+        key = ("8.8.8.8", 53, "192.168.1.50", 40000)
+        msg = self._prefixed("q.example.com")
+        emitted = 0
+        seq = 0
+        for _ in range(50):  # ~5 KB total, well past the 1 KB cap
+            emitted += len(r.add(key, seq, msg))
+            seq += len(msg)
+        assert emitted == 50  # every message surfaced; the stream never went blind
+
+    def test_sliding_window_frees_emitted_bytes(self) -> None:
+        # With a cap large enough that blindness is not the gate, a long fully-emitted
+        # stream must still shrink back to ~nothing — the compaction, not the cap, is
+        # what frees the buffer.
+        r = DnsTcpReassembler(per_flow_cap=100_000)
+        key = ("8.8.8.8", 53, "192.168.1.50", 40000)
+        msg = self._prefixed("q.example.com")
+        seq = 0
+        for _ in range(200):  # ~20 KB, all emitted, none of it should be retained
+            r.add(key, seq, msg)
+            seq += len(msg)
+        assert r._total < 2 * len(msg)  # only the (empty) tail is held, not cumulative
+
+    def test_partial_trailing_message_retained_after_earlier_emit(self) -> None:
+        # Compacting away a completed message must not disturb the in-flight partial
+        # message that follows it.
+        r = DnsTcpReassembler(per_flow_cap=4096)
+        key = ("8.8.8.8", 53, "192.168.1.50", 40000)
+        m1 = self._prefixed("first.example.com")
+        m2 = self._prefixed("second.example.com")
+        seq = 0
+        assert len(r.add(key, seq, m1)) == 1  # first message emits and is compacted
+        seq += len(m1)
+        assert r.add(key, seq, m2[:20]) == []  # partial second message: retained
+        bodies = r.add(key, seq + 20, m2[20:])  # completes across the compaction
+        assert len(bodies) == 1
+        assert bodies[0] == m2[2:]
+
+    def test_overlapping_out_of_order_segment_does_not_corrupt_window(self) -> None:
+        # A stale/overlapping segment straddling a completing message's end must not
+        # collide into the compacted buffer and block the next message — the classic
+        # TCP-segment-reordering evasion, on-topic for a leak monitor.
+        r = DnsTcpReassembler(per_flow_cap=8192)
+        key = ("8.8.8.8", 53, "192.168.1.50", 40000)
+        m1 = self._prefixed("first.example.com")
+        m2 = self._prefixed("second.example.com")
+        split = len(m1) - 8
+        assert r.add(key, 0, m1[:split]) == []  # first part of m1
+        r.add(key, len(m1) - 3, b"\xbb" * 10)  # junk straddling m1's end, out of order
+        bodies = r.add(key, split, m1[split:])  # bridge the gap -> m1 completes whole
+        assert len(bodies) == 1
+        assert bodies[0] == m1[2:]  # the real m1 body, not junk
+        b2 = r.add(key, len(m1), m2)  # the next message must still be accepted
+        assert len(b2) == 1
+        assert b2[0] == m2[2:]
+
+    def test_default_cap_holds_a_max_size_message(self) -> None:
+        # The largest length-prefixed DNS/TCP message is 2 + 65535 bytes; the default
+        # per-flow cap must hold one, or that message alone would stall the window.
+        assert DnsTcpReassembler().per_flow_cap >= 2 + 0xFFFF
+
     def test_non_dns_stream_is_not_tracked(self) -> None:
         r = DnsTcpReassembler()
         key = ("192.168.1.50", 51000, "93.184.216.34", 443)

@@ -56,6 +56,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **DNS-over-TCP no longer goes blind on a long-lived connection.** The
+  DNS-over-TCP reassembler capped a stream by its *cumulative* bytes and never freed
+  a message once parsed, so a persistent connection — an Android "Private DNS" (DoT)
+  device multiplexes its entire lookup stream over one connection — stopped
+  surfacing every query and answer after the first ~64 KB. The reassembler is now a
+  sliding window: each whole message is dropped once yielded and the buffer advances,
+  so the per-flow cap bounds only the in-flight partial message. One connection can
+  carry unbounded lookups without falling silent; the cap is sized to hold any single
+  maximum-length message; reordered or overlapping segments compact without corrupting
+  the buffer; and reassembly is now linear rather than quadratic in the stream length.
+
 - **The always-on recorder survives a full disk.** Writing the JSONL record and the
   exit summary was unguarded, so an `ENOSPC` on the disk the recorder itself fills
   with history propagated out of the capture loop and crashed the run — which, under

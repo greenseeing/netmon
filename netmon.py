@@ -1144,13 +1144,12 @@ class TcpReassembler:
 
 
 class _DnsStream:
-    __slots__ = ("base", "chunks", "emitted", "size")
+    __slots__ = ("base", "chunks", "size")
 
     def __init__(self, base: int) -> None:
-        self.base = base
+        self.base = base  # TCP sequence of the first byte still buffered
         self.chunks: dict[int, bytes] = {}
         self.size = 0
-        self.emitted = 0  # bytes of the contiguous prefix already yielded
 
 
 class DnsTcpReassembler:
@@ -1158,9 +1157,15 @@ class DnsTcpReassembler:
     # a sibling of TcpReassembler for the other direction of the wire: big
     # answers (AXFR/IXFR, large DNSSEC/TXT RRsets) span segments and would
     # otherwise be parsed only if they fit one. A stream is claimed only when its
-    # first bytes frame a plausible DNS message, and it is byte-capped like the
-    # other reassemblers so a stalled or hostile stream cannot grow unbounded.
-    def __init__(self, per_flow_cap: int = 65536, total_cap: int = 4_000_000) -> None:
+    # first bytes frame a plausible DNS message. The buffer is a sliding window:
+    # each whole message is dropped once yielded, so per_flow_cap bounds only the
+    # in-flight (partial) message — a long-lived DoT connection multiplexing a
+    # device's whole lookup stream cannot exhaust the cap and fall silent.
+    # per_flow_cap must exceed the largest single length-prefixed DNS/TCP message
+    # (2-byte length + 65535-byte body = 65537), or that message would stall the
+    # window at the cap and never complete; 128 KiB holds one such message plus
+    # out-of-order slack while still bounding a stalled or hostile stream.
+    def __init__(self, per_flow_cap: int = 131072, total_cap: int = 4_000_000) -> None:
         self.per_flow_cap = per_flow_cap
         self.total_cap = total_cap
         self.cleared = 0
@@ -1188,10 +1193,13 @@ class DnsTcpReassembler:
                 self._flows.clear()
                 self._total = 0
                 return []
-        return self._complete_messages(stream)
-
-    def _complete_messages(self, stream: _DnsStream) -> list[bytes]:
         assembled = _reassemble(stream.chunks)
+        messages, consumed = self._complete_messages(assembled)
+        if consumed:
+            self._compact(stream, consumed, assembled)
+        return messages
+
+    def _complete_messages(self, assembled: bytes) -> tuple[list[bytes], int]:
         messages: list[bytes] = []
         pos = 0
         while pos + 2 <= len(assembled):
@@ -1199,11 +1207,31 @@ class DnsTcpReassembler:
             end = pos + 2 + length
             if end > len(assembled):
                 break  # message not yet whole
-            if end > stream.emitted:  # only newly-completed messages
-                messages.append(assembled[pos + 2 : end])
+            messages.append(assembled[pos + 2 : end])
             pos = end
-        stream.emitted = max(stream.emitted, pos)
-        return messages
+        return messages, pos
+
+    def _compact(self, stream: _DnsStream, consumed: int, assembled: bytes) -> None:
+        # Slide the window past the bytes already yielded as whole messages. `assembled`
+        # is the canonical, gap-free prefix, so its unconsumed remainder is the whole
+        # truth for that region — carried as one chunk at offset 0. Only genuine
+        # segments *beyond* the first gap survive, re-keyed to the advanced base; every
+        # chunk inside the prefix (a duplicate or an overlapping out-of-order segment)
+        # is dropped rather than blended in, so it cannot collide onto offset 0 and
+        # overwrite the real tail.
+        boundary = len(assembled)
+        retained: dict[int, bytes] = {}
+        tail = assembled[consumed:]
+        if tail:
+            retained[0] = tail
+        for off, chunk in stream.chunks.items():
+            if off >= boundary:
+                retained[off - consumed] = chunk
+        new_size = sum(len(c) for c in retained.values())
+        self._total -= stream.size - new_size
+        stream.chunks = retained
+        stream.size = new_size
+        stream.base += consumed
 
     def drop(self, key: FlowKey) -> None:
         stream = self._flows.pop(key, None)
