@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`netmon query` display filter** — a read-only subcommand that reads a recorded
+  run directory's JSONL and filters it by `--kind`, `--host` (a substring of the
+  event's SNI / qname / hostname, via the same one-authority projection the live feed
+  uses), and `--scope`, printing the matching records as a single chronological stream
+  merged across the per-kind files. Filters compose with AND semantics; an empty filter
+  prints everything. It replaces the hand-rolled `jq` recipes for the common lookups
+  and never re-captures. A missing or non-run directory fails with a clear message, and
+  a truncated or hand-edited JSONL line is skipped rather than crashing the query.
 - **`--pcap` raw evidence sink** — an opt-in flag that also saves every captured
   packet to `capture.pcap` in the run directory, so a leak-audit finding can be
   re-opened later in tshark/Wireshark for the signals netmon deliberately does not

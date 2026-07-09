@@ -41,6 +41,7 @@ from scapy.packet import Packet
 from scapy.utils import rdpcap, wrpcap
 
 from netmon import (
+    EVENT_ADAPTER,
     KIND_STYLE,
     KIND_TO_FILE,
     QUIC_V1,
@@ -3346,6 +3347,175 @@ class TestCliDispatch:
     def test_run_parser_rejects_unknown_flag(self) -> None:
         with pytest.raises(SystemExit):
             _run_parser().parse_args(["--definitely-not-a-flag"])
+
+
+def write_query_fixture(run_dir: Path) -> None:
+    # A recorded run with a mix of kinds and deliberately-scrambled write order, so a
+    # query that returns chronological output proves it sorts rather than echoes files.
+    w = JsonlWriter(run_dir)
+    w.write(FlowEvent(
+        ts="2025-07-02T10:00:04.000+00:00", proto="tcp", direction="inbound",
+        scope="local", birth="observed", local_ip="192.168.1.50", local_port=50000,
+        remote_ip="192.168.1.1", remote_port=445, service="microsoft-ds", hostname=None,
+    ))
+    w.write(DnsQueryEvent(
+        ts="2025-07-02T10:00:01.000+00:00", src="192.168.1.50", dst="8.8.8.8",
+        transport="udp", qname="alpha.example", qtype="A",
+    ))
+    w.write(TlsSniEvent(
+        ts="2025-07-02T10:00:02.000+00:00", src="192.168.1.50", dst="93.184.216.34",
+        dport=443, sni="beta.example",
+    ))
+    w.write(FlowEvent(
+        ts="2025-07-02T10:00:03.000+00:00", proto="tcp", direction="outbound",
+        scope="internet", birth="observed", local_ip="192.168.1.50", local_port=51000,
+        remote_ip="93.184.216.34", remote_port=443, service="https", hostname="beta.example",
+    ))
+    w.close()
+
+
+def query_lines(capsys: pytest.CaptureFixture[str], *argv: str) -> list[dict[str, object]]:
+    with pytest.raises(SystemExit) as exc:
+        main(["query", *argv])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out.strip()
+    return [json.loads(line) for line in out.splitlines()] if out else []
+
+
+class TestNetmonQuery:
+    def test_empty_filter_prints_all_events_chronologically(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run))
+        assert [r["ts"] for r in rows] == [
+            "2025-07-02T10:00:01.000+00:00",
+            "2025-07-02T10:00:02.000+00:00",
+            "2025-07-02T10:00:03.000+00:00",
+            "2025-07-02T10:00:04.000+00:00",
+        ]
+
+    def test_kind_filter_selects_one_kind(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--kind", "tls_sni")
+        assert [r["kind"] for r in rows] == ["tls_sni"]
+        assert rows[0]["sni"] == "beta.example"
+
+    def test_host_substring_matches_sni_qname_and_hostname(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--host", "example")
+        # alpha.example (qname), beta.example (sni), beta.example (flow hostname);
+        # the local flow's host is 192.168.1.1, which does not match.
+        assert {r["kind"] for r in rows} == {"dns_query", "tls_sni", "flow"}
+        assert len(rows) == 3
+
+    def test_scope_filter_selects_matching_flows(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--scope", "internet")
+        assert [r["kind"] for r in rows] == ["flow"]
+        assert rows[0]["scope"] == "internet"
+
+    def test_filters_compose_with_and_semantics(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--kind", "flow", "--host", "beta")
+        assert len(rows) == 1
+        assert rows[0]["hostname"] == "beta.example"
+        assert rows[0]["scope"] == "internet"
+
+    def test_hostname_less_flow_round_trips(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The writer drops None fields (exclude_none), so a flow with no resolved
+        # hostname records without the key. query must still read it back, not silently
+        # drop it for failing to re-validate a "required" field.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--scope", "local")
+        assert len(rows) == 1
+        assert rows[0]["remote_ip"] == "192.168.1.1"
+        assert "hostname" not in rows[0]  # stayed absent, did not resurrect as null
+
+    def test_sort_uses_instant_not_lexical_across_offsets(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # An always-on run spanning a DST fall-back records two offsets. The later
+        # instant has the smaller wall-clock string, so a lexical sort inverts them;
+        # query must order by the parsed instant.
+        def flow_at(ts: str, remote_ip: str) -> FlowEvent:
+            return FlowEvent(
+                ts=ts, proto="tcp", direction="outbound", scope="internet",
+                birth="observed", local_ip="192.168.1.50", local_port=51000,
+                remote_ip=remote_ip, remote_port=443, service="https",
+            )
+
+        run = tmp_path / "run-x"
+        w = JsonlWriter(run)
+        w.write(flow_at("2025-11-02T01:15:00.000-08:00", "1.1.1.1"))
+        w.write(flow_at("2025-11-02T01:30:00.000-07:00", "2.2.2.2"))
+        w.close()
+        rows = query_lines(capsys, str(run))
+        assert [r["ts"] for r in rows] == [
+            "2025-11-02T01:30:00.000-07:00",  # 08:30Z — the earlier instant, sorted first
+            "2025-11-02T01:15:00.000-08:00",  # 09:15Z — later, despite the smaller string
+        ]
+
+    def test_zero_event_run_is_recognized_not_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A completed run that captured nothing still has summary.json; querying it is a
+        # valid empty result, not a "not a run directory" error.
+        run = tmp_path / "run-x"
+        run.mkdir()
+        (run / "summary.json").write_text("{}", encoding="utf-8")
+        assert query_lines(capsys, str(run)) == []
+
+    def test_event_adapter_covers_every_recorded_kind(self) -> None:
+        # Guard against drift: a kind added to KIND_TO_FILE but not the parse union would
+        # make query silently drop every record of that kind (validate_json raises, and
+        # the read loop swallows it). Mirrors the KIND_STYLE coverage assertion.
+        mapping = EVENT_ADAPTER.json_schema()["discriminator"]["mapping"]
+        assert set(mapping) == set(KIND_TO_FILE)
+
+    def test_missing_run_dir_fails_cleanly(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            main(["query", str(tmp_path / "does-not-exist")])
+        assert exc.value.code == 1
+        assert "run direct" in capsys.readouterr().err.lower()
+
+    def test_directory_without_jsonl_fails_cleanly(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        empty = tmp_path / "not-a-run"
+        empty.mkdir()
+        with pytest.raises(SystemExit) as exc:
+            main(["query", str(empty)])
+        assert exc.value.code == 1
+        assert capsys.readouterr().err  # a clear message, not a silent empty result
+
+    def test_malformed_line_is_skipped_not_fatal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        with (run / "dns.jsonl").open("a", encoding="utf-8") as f:
+            f.write("{ this is not valid json\n")
+        rows = query_lines(capsys, str(run))  # must not raise
+        assert len(rows) == 4  # the four good events survive; the junk line is dropped
 
 
 class TestRunPersistence:

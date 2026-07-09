@@ -40,6 +40,7 @@ netmon run --log        # ...and persist the JSONL record to logs/run-<stamp>/
 netmon run --headless   # classic per-event stdout logs instead of the dashboard
 netmon update           # pull latest + re-sync deps; restart the recorder if running
 netmon service status   # background recorder: start|stop|status|enable|disable|logs
+netmon query <run-dir>  # filter a recorded run's JSONL by kind/host/scope (read-only)
 ```
 
 Live capture needs `CAP_NET_RAW`: with `--setcap` it just runs; otherwise the launcher re-execs under `sudo` (one prompt). Capture flags carry over — `-i wlan0`, `--bpf 'not port 22'`, `-q`, `-r <pcap>` (replay, no privilege), `--keep-query`, `--pcap`. Stop with Ctrl-C.
@@ -82,6 +83,14 @@ What your ISP sees even with HTTPS: everything in `dns.jsonl` (unless you use en
 jq -r '.sni' logs/run-*/tls.jsonl | sort | uniq -c | sort -rn   # sites visited via SNI
 jq -r 'select(.kind=="dns_query") | .qname' logs/run-*/dns.jsonl | sort -u
 jq -r 'select(.scope=="internet") | .hostname // .remote_ip' logs/run-*/flows.jsonl | sort | uniq -c | sort -rn
+```
+
+Or skip the `jq` plumbing with the built-in display filter — `netmon query` reads a run directory's JSONL and applies a filter by `--kind`, `--host` (a substring of the SNI / qname / hostname), and `--scope`, printing the matching records as one chronological stream across the per-kind files. It is read-only over what was already recorded — never a new capture:
+
+```sh
+netmon query logs/run-20250702-100000                              # every event, in order
+netmon query logs/run-20250702-100000 --kind tls_sni --host example.com  # one site's TLS handshakes
+netmon query logs/run-20250702-100000 --scope internet             # only flows that left the LAN
 ```
 
 Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).

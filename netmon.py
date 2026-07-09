@@ -18,18 +18,18 @@ import subprocess
 import sys
 import time
 from collections import Counter, OrderedDict
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, TextIO, cast
+from typing import Annotated, Any, BinaryIO, Literal, NamedTuple, Protocol, TextIO, cast
 
 import structlog
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 from scapy.config import conf
 from scapy.interfaces import get_working_ifaces
 from scapy.layers.dns import (
@@ -248,9 +248,11 @@ class HttpEvent(Event):
     dst: str
     dport: int
     method: str
-    host: str | None
+    # None-typed fields default to None so a record the writer emits with
+    # exclude_none=True (dropping the absent key) round-trips back through query.
+    host: str | None = None
     path: str
-    user_agent: str | None
+    user_agent: str | None = None
     tag: str | None = None
 
 
@@ -270,7 +272,7 @@ class FlowEvent(Event):
     remote_ip: str
     remote_port: int
     service: str
-    hostname: str | None
+    hostname: str | None = None  # absent (exclude_none) when unresolved; round-trips via query
     note: str | None = None
 
 
@@ -307,6 +309,18 @@ class NbnsEvent(Event):
     src: str
     dst: str
     qname: str
+
+
+# Parse a recorded JSONL line back into its concrete Event subclass, keyed on the
+# `kind` discriminator every event carries. `netmon query` reads records this way so
+# it can reuse event_host()'s one authority for "the identifying name of an event"
+# instead of re-deriving per-kind host logic against raw dicts.
+_AnyEvent = Annotated[
+    DnsQueryEvent | DnsAnswerEvent | DnsEcsEvent | DnsResponseEvent | DnsHttpsEvent
+    | TlsSniEvent | HttpEvent | FlowEvent | ArpEvent | Icmp6RaEvent | LlmnrEvent | NbnsEvent,
+    Field(discriminator="kind"),
+]
+EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(_AnyEvent)
 
 
 KIND_TO_FILE = {
@@ -2530,6 +2544,83 @@ def cmd_service(argv: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
 
+def _query_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="netmon query",
+        description="filter a recorded run's JSONL by kind/host/scope (read-only; no capture)",
+    )
+    p.add_argument("run_dir", help="a logs/run-* directory to read")
+    p.add_argument("--kind", choices=sorted(KIND_TO_FILE), help="only this event kind")
+    p.add_argument("--host", help="substring match on the event's host / SNI / qname")
+    p.add_argument("--scope", help="only flows in this scope (e.g. internet, local)")
+    return p
+
+
+def _load_run_events(run_dir: Path, kind: str | None) -> Iterator[Event]:
+    # Read only the file(s) the requested kind lives in — all of them when unfiltered —
+    # skipping any a partial run never wrote. A line that will not parse (a truncated
+    # tail, a hand-edited file) is skipped, not fatal: a query is a read-only view and
+    # must never crash on the record it is inspecting.
+    names = {KIND_TO_FILE[kind]} if kind else set(KIND_TO_FILE.values())
+    for name in sorted(names):
+        path = run_dir / name
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    yield EVENT_ADAPTER.validate_json(line)
+                except ValueError:
+                    continue
+
+
+def _event_time(ev: Event) -> datetime:
+    # Sort on the parsed instant, not the raw string: two ISO timestamps with different
+    # UTC offsets (an always-on run that spans a DST change) misorder under a lexical
+    # sort. A naive stamp is read as local; a hand-edited unparseable ts sorts to the
+    # epoch rather than crashing the read-only view.
+    try:
+        dt = datetime.fromisoformat(ev.ts)
+    except ValueError:
+        return datetime.fromtimestamp(0, tz=UTC)
+    return dt if dt.tzinfo is not None else dt.astimezone()
+
+
+def _event_matches(ev: Event, kind: str | None, host: str | None, scope: str | None) -> bool:
+    # AND semantics: an unset filter is a pass. `scope` reads the FlowEvent-only field,
+    # so scoping a non-flow kind excludes it (only flows carry a scope).
+    if kind is not None and ev.kind != kind:
+        return False
+    if host is not None and host.lower() not in event_host(ev).lower():
+        return False
+    return scope is None or getattr(ev, "scope", None) == scope
+
+
+def cmd_query(argv: list[str]) -> int:
+    args = _query_parser().parse_args(argv)
+    run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        print(f"netmon query: no such run directory: {run_dir}", file=sys.stderr)
+        return 1
+    # A completed run always leaves summary.json even if it captured nothing, so a
+    # zero-event run is recognised (prints nothing) rather than mistaken for a bad path.
+    run_files = set(KIND_TO_FILE.values()) | {"summary.json"}
+    if not any((run_dir / name).exists() for name in run_files):
+        print(f"netmon query: not a netmon run directory: {run_dir}", file=sys.stderr)
+        return 1
+    events = [
+        ev
+        for ev in _load_run_events(run_dir, args.kind)
+        if _event_matches(ev, args.kind, args.host, args.scope)
+    ]
+    events.sort(key=_event_time)  # one timeline across per-kind files
+    for ev in events:
+        print(ev.model_dump_json(exclude_none=True))
+    return 0
+
+
 def _parse_run_args(argv: list[str]) -> argparse.Namespace:
     args = _run_parser().parse_args(argv)
     args.tui = not args.headless  # `run` shows the dashboard unless --headless
@@ -2542,6 +2633,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(cmd_update(argv[1:]))
     if argv and argv[0] == "service":
         sys.exit(cmd_service(argv[1:]))
+    if argv and argv[0] == "query":
+        sys.exit(cmd_query(argv[1:]))
     if argv and argv[0] == "run":
         args = _parse_run_args(argv[1:])
     else:
