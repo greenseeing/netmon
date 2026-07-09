@@ -56,7 +56,7 @@ from scapy.layers.inet6 import (
 from scapy.layers.l2 import ARP
 from scapy.layers.llmnr import LLMNRQuery
 from scapy.layers.netbios import NBNSQueryRequest
-from scapy.packet import Packet
+from scapy.packet import Packet, Padding, Raw
 from scapy.sendrecv import AsyncSniffer
 from scapy.utils import PcapReader, PcapWriter
 
@@ -1607,6 +1607,34 @@ _IPV6_EXT_HDRS = (
 )
 
 
+def _innermost_net(net: Any) -> Any:
+    # IPIP / 6in4 / 4in6: scapy nests the tunnelled header as the payload while
+    # getlayer(TCP/UDP) already returns the innermost ports — descend so the flow's
+    # endpoints are the real peers, not the tunnel's. Walks through v6 extension
+    # headers and stops at any other encapsulation (GRE, ESP): there the outer flow
+    # IS the honest record — the inner is out of decode scope. A fragmented layer
+    # at ANY depth also stops the descent: a first-fragment dissects fully but
+    # cannot vouch for a complete inner packet, and stopping there attributes both
+    # fragments of the same tunnelled datagram to the same (fragmented) layer.
+    while not _is_ip_fragment(net):
+        nxt = net.payload
+        while isinstance(nxt, _IPV6_EXT_HDRS):
+            nxt = nxt.payload
+        if not isinstance(nxt, (IP, IPv6)):
+            break
+        net = nxt
+    return net
+
+
+def _last_decoded_layer(pkt: Packet) -> str:
+    # Name a frame by the deepest layer scapy decoded (skipping raw padding), so a
+    # non-IP frame is accounted as what it was (LLC/STP/EAPOL/...), never a blank.
+    layer = pkt.lastlayer()
+    while isinstance(layer, (Raw, Padding)) and layer.underlayer is not None:
+        layer = layer.underlayer
+    return type(layer).__name__
+
+
 def _is_ip_fragment(net: Any) -> bool:
     # A fragmented datagram cannot be decoded whole: the first fragment carries a
     # truncated L4 payload and later fragments carry no L4 header at all. Reassembly
@@ -1711,13 +1739,17 @@ class PacketProcessor:
         if net is None:
             if pkt.haslayer(ARP):
                 return self._tally(self._arp_events(ts, pkt[ARP]), "no_disclosure")
-            self.coverage.mark("non_ip")
+            self.coverage.mark(f"non_ip:{_last_decoded_layer(pkt)}")
             return []
         # A fragment's payload is truncated (first) or absent (later), so its L4
         # content cannot be dissected — but a first fragment still carries the L4
         # header, so the flow disclosure it bears is recorded below; only the
         # unreadable payload is skipped, and a fragment that yields no event lands
         # under the ip_fragment fate rather than no_disclosure/unhandled.
+        # A whole header may be a tunnel (IPIP, 6in4, 4in6): the flow's real
+        # endpoints are the innermost header's, and the descent stops at the first
+        # fragmented layer — which is then the one this packet is accounted to.
+        net = _innermost_net(net)
         fragmented = _is_ip_fragment(net)
         events: list[Event] = []
         cert_san = False

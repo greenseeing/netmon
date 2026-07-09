@@ -40,7 +40,7 @@ from scapy.layers.inet6 import (
     IPv6,
     IPv6ExtHdrFragment,
 )
-from scapy.layers.l2 import ARP, Ether
+from scapy.layers.l2 import ARP, CookedLinux, Ether
 from scapy.layers.llmnr import LLMNRQuery
 from scapy.layers.netbios import NBNSHeader, NBNSQueryRequest
 from scapy.packet import Packet
@@ -820,6 +820,105 @@ class TestTls12CertificateSan:
         proc.process(tcp_segment(hello[:800], flags="A", seq=BASE_SEQ))
         assert not proc.certs._pending
         assert not proc.certs._flows
+
+
+class TestTunnelAndNonEthernet:
+    def test_raw_ip_frame_from_a_tun_link_yields_a_flow(self) -> None:
+        # A tun/wireguard/ppp capture has no Ethernet header — the frame IS the IP
+        # packet. It must decode like any other, not fall into a non_ip fate.
+        proc = local_processor("192.168.1.50")
+        pkt = IP(src="192.168.1.50", dst="93.184.216.34") / TCP(
+            sport=51000, dport=443, flags="S"
+        )
+        pkt.time = PKT_TIME
+        flow = single_flow(proc.process(pkt))
+        assert flow.direction == "outbound"
+        assert flow.remote_ip == "93.184.216.34"
+
+    def test_raw_ipv6_frame_yields_a_flow(self) -> None:
+        proc = local_processor("2606:4700::10")
+        pkt = IPv6(src="2606:4700::10", dst="2606:4700::1") / TCP(
+            sport=51000, dport=443, flags="S"
+        )
+        pkt.time = PKT_TIME
+        flow = single_flow(proc.process(pkt))
+        assert flow.remote_ip == "2606:4700::1"
+
+    def test_cooked_linux_frame_decodes_the_ip_inside(self) -> None:
+        # A pcap captured with -i any wraps frames in Linux cooked (SLL) headers.
+        proc = local_processor("192.168.1.50")
+        pkt = CookedLinux(proto=0x0800) / IP(src="192.168.1.50", dst="93.184.216.34") / TCP(
+            sport=51000, dport=443, flags="S"
+        )
+        pkt.time = PKT_TIME
+        flow = single_flow(proc.process(pkt))
+        assert flow.remote_ip == "93.184.216.34"
+
+    def test_6in4_flow_reflects_the_inner_endpoints(self) -> None:
+        # getlayer(IP) returns the tunnel's outer header while getlayer(TCP) returns
+        # the inner ports; the flow must name the real peer, not the tunnel server.
+        proc = local_processor("192.168.1.50", "2001:470:1f0b::2")
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="203.0.113.1")
+            / IPv6(src="2001:470:1f0b::2", dst="2606:4700::1")
+            / TCP(sport=51000, dport=443, flags="S")
+        )
+        pkt.time = PKT_TIME
+        flow = single_flow(proc.process(pkt))
+        assert flow.remote_ip == "2606:4700::1"
+        assert flow.local_ip == "2001:470:1f0b::2"
+        assert flow.direction == "outbound"
+
+    def test_ipip_flow_reflects_the_inner_endpoints(self) -> None:
+        proc = local_processor("192.168.1.50", "10.200.0.2")
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="203.0.113.1")
+            / IP(src="10.200.0.2", dst="93.184.216.34")
+            / TCP(sport=51000, dport=443, flags="S")
+        )
+        pkt.time = PKT_TIME
+        flow = single_flow(proc.process(pkt))
+        assert flow.remote_ip == "93.184.216.34"
+        assert flow.local_ip == "10.200.0.2"
+
+    def test_fragmented_middle_tunnel_stops_the_descent(self) -> None:
+        # A first-fragment of a nested tunnel datagram dissects fully but cannot
+        # vouch for its inner packet; both its fragments must attribute to the
+        # fragmented layer's endpoints, never to a possibly-truncated deeper one.
+        proc = local_processor("192.168.1.50")
+        first = (
+            Ether()
+            / IP(src="192.168.1.50", dst="203.0.113.1", proto=4)
+            / IP(src="10.200.0.2", dst="93.184.216.34", proto=4, flags="MF")
+            / IP(src="172.16.0.9", dst="8.8.8.8")
+            / TCP(sport=51000, dport=443, flags="S")
+        )
+        first.time = PKT_TIME
+        events = proc.process(first)
+        flows = [e for e in events if isinstance(e, FlowEvent)]
+        assert all(f.remote_ip != "8.8.8.8" for f in flows)  # never the unvouched inner
+        later = (
+            Ether()
+            / IP(src="192.168.1.50", dst="203.0.113.1", proto=4)
+            / IP(src="10.200.0.2", dst="93.184.216.34", proto=4, frag=100)
+            / (b"\x00" * 32)
+        )
+        later.time = PKT_TIME
+        proc.process(later)
+        assert proc.summary()["coverage"]["fate"]["ip_fragment"] >= 1
+
+    def test_fragmented_outer_tunnel_is_accounted_as_a_fragment(self) -> None:
+        # A fragmented outer header cannot vouch for a complete inner one: never
+        # descend into what may be a truncated inner packet.
+        proc = local_processor("192.168.1.50")
+        pkt = Ether() / IP(
+            src="192.168.1.50", dst="203.0.113.1", proto=41, flags="MF"
+        ) / (b"\x60" + b"\x00" * 39)
+        pkt.time = PKT_TIME
+        proc.process(pkt)
+        assert proc.summary()["coverage"]["fate"]["ip_fragment"] == 1
 
 
 class TestRefreshLocalAddresses:
@@ -2613,12 +2712,12 @@ class TestCoverageLedger:
         assert cov["packets"] == 3
         assert sum(cov["fate"].values()) == 3
 
-    def test_non_ip_frame_marked_non_ip(self) -> None:
+    def test_non_ip_frame_fate_names_its_deepest_decoded_layer(self) -> None:
         proc = local_processor("192.168.1.50")
         pkt = Ether(type=0x9999) / b"\x00\x01\x02\x03"  # not IP, not ARP
         pkt.time = PKT_TIME
         assert proc.process(pkt) == []
-        assert proc.summary()["coverage"]["fate"]["non_ip"] == 1
+        assert proc.summary()["coverage"]["fate"]["non_ip:Ether"] == 1
 
     def test_icmp_marked_unhandled_by_protocol(self) -> None:
         proc = local_processor("192.168.1.50")

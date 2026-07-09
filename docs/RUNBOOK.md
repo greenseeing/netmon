@@ -196,6 +196,7 @@ find /var/log/netmon -maxdepth 1 -name 'run-*' -mtime +30 -exec rm -r {} +
 | `userspace_dropped` > 0 in stats | Consumer can't keep up (very busy link). Narrow with `--bpf` or `-i`, and use `-q`. |
 | `kernel_dropped` > 0 in stats | The kernel shed packets before netmon read them — the run under-reports by at least that many packets; treat the record as incomplete. Same remedies: `--bpf`, `-i`, `-q`. |
 | Flows show `direction: "transit"` | Neither endpoint is a local IP — broadcast/multicast from other LAN devices, or you're capturing a mirrored/bridged port. Normal. |
+| `non_ip:<layer>` fates in the coverage summary | Frames that decoded to no IP header, named by their deepest decoded layer (`non_ip:Ether` = unknown ethertype, `non_ip:Raw` = an unmapped link type in a replayed pcap). Raw-IP links (`tun*`/`wg*`/`ppp*`) and cooked captures decode normally; IP-in-IP/6in4/4in6 flows report the inner endpoints, GRE/ESP stay on the outer flow. |
 | Flow has no `hostname` | The DNS lookup happened before this run started, or the app used DoH. Correlate `remote_ip` manually. |
 | DNS queries only show `dst: 127.0.0.53` | systemd-resolved stub on loopback — those are your apps' real queries. If no matching upstream `udp/53` appears on a physical interface, the upstream leg is inside a VPN tunnel (e.g. Tailscale MagicDNS): your ISP does not see that DNS. |
 | Nothing in `http.jsonl` | Expected — nearly everything is HTTPS now. It only catches plaintext HTTP. |

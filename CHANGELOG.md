@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tunnel and non-Ethernet honest accounting** — raw-IP links (`tun*`/`wg*`/
+  `ppp*`/`sit*`) and Linux cooked captures decode from their IP header like any
+  Ethernet frame. Directly-encapsulated tunnels (IP-in-IP, 6in4, 4in6) report the
+  flow's *inner* endpoints — the real peer, not the tunnel server — with the
+  descent stopping at any fragmented layer, which cannot vouch for a complete
+  inner packet (both fragments of one tunnelled datagram attribute to the same
+  layer). GRE/ESP stay on the outer flow. Frames that decode to no IP at all are
+  tallied under a named `non_ip:<layer>` coverage fate (e.g. `non_ip:Ether`,
+  `non_ip:Raw`) instead of one opaque bucket.
 - **Mid-run local-address refresh** — the host's own-address set is re-enumerated
   every 60 s during a live capture (headless and `--tui` alike), so an address
   assigned mid-run — an RFC 4941 IPv6 privacy-address rotation, a DHCP renewal —
