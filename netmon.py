@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol, TextIO, cast
+from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, TextIO, cast
 
 import structlog
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -57,7 +57,7 @@ from scapy.layers.llmnr import LLMNRQuery
 from scapy.layers.netbios import NBNSQueryRequest
 from scapy.packet import Packet
 from scapy.sendrecv import AsyncSniffer
-from scapy.utils import PcapReader
+from scapy.utils import PcapReader, PcapWriter
 
 log = structlog.get_logger()
 
@@ -1872,12 +1872,19 @@ class PacketProcessor:
         }
 
 
-def open_private_new(path: Path) -> TextIO:
+def _open_private_fd(path: Path) -> int:
     # O_EXCL | O_NOFOLLOW: never adopt or follow a pre-staged file/symlink at
     # this path. netmon runs as root against a predictably-named run dir, so
     # following a symlink here would be a root arbitrary-write (CWE-59).
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    return os.fdopen(fd, "w", encoding="utf-8")
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+
+
+def open_private_new(path: Path) -> TextIO:
+    return os.fdopen(_open_private_fd(path), "w", encoding="utf-8")
+
+
+def open_private_new_bytes(path: Path) -> BinaryIO:
+    return os.fdopen(_open_private_fd(path), "wb")
 
 
 def _reraise_symlink_refusal(exc: OSError) -> None:
@@ -1886,6 +1893,14 @@ def _reraise_symlink_refusal(exc: OSError) -> None:
     # it re-raises here while ENOSPC and its kin fall through to be counted.
     if exc.errno in (errno.EEXIST, errno.ELOOP):
         raise exc
+
+
+def _log_write_failure(event: str, exc: Exception, **fields: str) -> None:
+    # The --tui --log path redirects structlog onto a file inside the run dir — the
+    # same disk these sinks use — so logging a write failure can itself hit ENOSPC.
+    # The failure report must never re-crash the run it exists to keep up.
+    with contextlib.suppress(OSError):
+        log.error(event, error=str(exc), **fields)
 
 
 class Writer(Protocol):
@@ -1915,14 +1930,7 @@ class JsonlWriter:
             # emptiness rather than crash-looping under systemd before it begins.
             _reraise_symlink_refusal(exc)
             self._degraded = True
-            self._log_suppressed("run_dir_create_failed", exc)
-
-    def _log_suppressed(self, event: str, exc: OSError) -> None:
-        # The --tui --log path redirects structlog onto a file inside the run dir —
-        # the same disk this writer uses — so logging a write failure can itself hit
-        # ENOSPC. The failure report must never re-crash the run it exists to keep up.
-        with contextlib.suppress(OSError):
-            log.error(event, error=str(exc), out_dir=str(self.out_dir))
+            _log_write_failure("run_dir_create_failed", exc, out_dir=str(self.out_dir))
 
     def write(self, event: Event) -> None:
         # A full disk (the always-on recorder's own failure mode: it fills the disk
@@ -1946,7 +1954,7 @@ class JsonlWriter:
             _reraise_symlink_refusal(exc)
             self._degraded = True
             self.write_failures += 1
-            self._log_suppressed("jsonl_write_failed", exc)
+            _log_write_failure("jsonl_write_failed", exc, out_dir=str(self.out_dir))
 
     def write_summary(self, summary: dict[str, Any]) -> None:
         try:
@@ -1954,7 +1962,7 @@ class JsonlWriter:
                 f.write(json.dumps(summary, indent=2))
         except OSError as exc:
             _reraise_symlink_refusal(exc)
-            self._log_suppressed("summary_write_failed", exc)
+            _log_write_failure("summary_write_failed", exc, out_dir=str(self.out_dir))
 
     def close(self) -> None:
         for f in self._files.values():
@@ -1970,6 +1978,55 @@ class NullWriter:
     def write(self, event: Event) -> None: ...
     def write_summary(self, summary: dict[str, Any]) -> None: ...
     def close(self) -> None: ...
+
+
+class PcapSink:
+    # Opt-in raw-packet evidence file (`--pcap`): preserves the wire bytes the derived
+    # JSONL cannot — cert timing, JA3/JA4, exact packet sizes — so a finding can be
+    # re-opened in tshark/Wireshark for the signals netmon deliberately does not
+    # compute. Same owner-only (0600), symlink-refusing (CWE-59), degrade-not-crash
+    # discipline as JsonlWriter; pairs with slice-08 rotation to stay bounded.
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.write_failures = 0
+        self._degraded = False
+        self._writer: PcapWriter | None = None
+        try:
+            # Linktype is inferred from the first packet's link layer, so a mixed or
+            # non-Ethernet capture is written faithfully.
+            self._writer = PcapWriter(open_private_new_bytes(path))
+        except OSError as exc:
+            _reraise_symlink_refusal(exc)
+            self._degraded = True
+            _log_write_failure("pcap_create_failed", exc, path=str(path))
+
+    def write(self, pkt: Packet) -> None:
+        if self._degraded or self._writer is None:
+            self.write_failures += 1
+            return
+        try:
+            self._writer.write(pkt)
+        except OSError as exc:
+            # A full disk degrades the evidence file, not the run: on the first OSError
+            # we stop and count every dropped packet so `persistence.pcap_dropped` marks
+            # the capture as incomplete rather than silently truncated. Degrade is
+            # one-way — retrying under sustained ENOSPC only churns exceptions.
+            self._degraded = True
+            self.write_failures += 1
+            _log_write_failure("pcap_write_failed", exc, path=str(self.path))
+        except Exception as exc:
+            # A packet scapy cannot serialize (a link type it never registered — Raw
+            # frames from tun/tunnel captures or an exotic -r pcap raise KeyError before
+            # any bytes are written) must not crash the capture loop. Skip it and count
+            # the drop, keeping the sink open for the well-formed packets around it —
+            # the same malformed-packet discipline as PacketProcessor.process.
+            self.write_failures += 1
+            _log_write_failure("pcap_write_skipped", exc, path=str(self.path))
+
+    def close(self) -> None:
+        if self._writer is not None:
+            with contextlib.suppress(OSError):
+                self._writer.close()  # a buffered final flush can itself hit ENOSPC
 
 
 # Python's socket module exposes neither constant (verified against
@@ -2196,21 +2253,26 @@ class Session:
     processor: PacketProcessor
     writer: Writer
     capture: Capture
+    pcap_sink: PcapSink | None = None
 
 
 def persist_enabled(args: argparse.Namespace) -> bool:
-    # Single source of truth for "does this run write its DNS/TLS/HTTP record to disk".
-    # Privacy-relevant, so both the JSONL writer and the TUI diagnostic log read it here
-    # rather than each re-deciding. Absent `log` means a programmatic caller (the tests)
-    # that wants files; the CLI sets it — `run` -> False (ephemeral), `run --log`/legacy -> True.
-    return getattr(args, "log", True)
+    # Single source of truth for "does this run write to the run dir". Privacy-relevant,
+    # so the JSONL writer, the TUI diagnostic log, and the pcap sink read it here rather
+    # than each re-deciding. Absent `log` means a programmatic caller (the tests) that
+    # wants files; the CLI sets it — `run` -> False (ephemeral), `run --log`/legacy -> True.
+    # `--pcap` writes raw evidence to disk, so it persists the run regardless of `--log`.
+    return getattr(args, "log", True) or bool(getattr(args, "pcap", False))
 
 
 def build_session(args: argparse.Namespace) -> Session:
     os.umask(0o077)
     out_dir = Path(args.output) / datetime.now().strftime("run-%Y%m%d-%H%M%S")
     processor = PacketProcessor(local_addresses(), redact_query=not args.keep_query)
+    # persist_enabled() is True whenever --pcap is set, so the writer creates the run
+    # dir before the pcap sink opens capture.pcap inside it.
     writer: Writer = JsonlWriter(out_dir) if persist_enabled(args) else NullWriter()
+    pcap_sink = PcapSink(out_dir / "capture.pcap") if getattr(args, "pcap", False) else None
     capture: Capture
     if args.read:
         capture = ReplayCapture(Path(args.read))
@@ -2218,12 +2280,15 @@ def build_session(args: argparse.Namespace) -> Session:
         # scapy's iface=None means conf.iface (default route only), not all interfaces
         ifaces = [args.iface] if args.iface else [i.name for i in get_working_ifaces()]
         capture = LiveCapture(ifaces, args.bpf)
-    return Session(out_dir, processor, writer, capture)
+    return Session(out_dir, processor, writer, capture, pcap_sink)
 
 
 def announce_start(args: argparse.Namespace, session: Session) -> None:
+    evidence = str(session.pcap_sink.path) if session.pcap_sink is not None else None
     if args.read:
-        log.info("replay_started", pcap=args.read, output=str(session.out_dir))
+        log.info(
+            "replay_started", pcap=args.read, output=str(session.out_dir), evidence=evidence
+        )
     elif isinstance(session.capture, LiveCapture):
         log.info(
             "capture_started",
@@ -2231,6 +2296,7 @@ def announce_start(args: argparse.Namespace, session: Session) -> None:
             bpf=args.bpf,
             output=str(session.out_dir),
             local_ips=sorted(session.processor.local_ips),
+            evidence=evidence,
         )
 
 
@@ -2264,6 +2330,8 @@ async def consume(session: Session, on_event: Callable[[Event], None]) -> None:
     n = 0
     async with aclosing(session.capture.packets()) as packets:
         async for pkt in packets:
+            if session.pcap_sink is not None:
+                session.pcap_sink.write(pkt)  # every captured packet, as raw evidence
             for event in session.processor.process(pkt):
                 session.writer.write(event)
                 on_event(event)
@@ -2286,8 +2354,14 @@ def finalize(session: Session) -> dict[str, Any]:
     # disk, a read-only remount, a quota) and is incomplete — surfaced so a truncated
     # log is never mistaken for a quiet one. The precise cause is in the error log.
     summary["persistence"] = {"events_dropped": session.writer.write_failures}
+    if session.pcap_sink is not None:
+        # A non-zero pcap_dropped means the raw evidence file is incomplete (same
+        # full-disk fate as events_dropped) — surfaced so it is never mistaken for whole.
+        summary["persistence"]["pcap_dropped"] = session.pcap_sink.write_failures
     session.writer.write_summary(summary)
     session.writer.close()
+    if session.pcap_sink is not None:
+        session.pcap_sink.close()
     return summary
 
 
@@ -2342,6 +2416,12 @@ def _add_capture_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("-o", "--output", default="logs", help="output directory (default: logs)")
     p.add_argument("-q", "--quiet", action="store_true", help="no per-event stdout logging")
+    p.add_argument(
+        "--pcap",
+        action="store_true",
+        help="also save raw packets to capture.pcap for later tshark/Wireshark "
+        "analysis (persists the run dir; off by default)",
+    )
     p.add_argument(
         "--keep-query",
         action="store_true",

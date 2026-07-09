@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--pcap` raw evidence sink** — an opt-in flag that also saves every captured
+  packet to `capture.pcap` in the run directory, so a leak-audit finding can be
+  re-opened later in tshark/Wireshark for the signals netmon deliberately does not
+  compute (JA3/JA4 fingerprints, certificate timing, exact packet sizes). The JSONL
+  record is derived and lossy; the pcap preserves the wire bytes. It honours the same
+  owner-only (`0600`), symlink-refusing (`O_EXCL|O_NOFOLLOW`, CWE-59) discipline as the
+  JSONL writer, and degrades rather than crashing — a full disk or a packet scapy
+  cannot serialize (Raw frames from a tun/tunnel capture or an exotic `-r` pcap) is
+  counted as `persistence.pcap_dropped` in `summary.json`, never a traceback. Off by
+  default; because it writes raw bytes to disk it persists the run. `netmon -r
+  <in.pcap> --pcap` round-trips a capture faithfully. Pairs with output rotation to
+  keep an always-on recorder's pcap bounded.
+
 - **`netmon` command with subcommands** — a console entry point (`pip`/`uv`
   installable) replaces the long `sudo $(command -v uv) run netmon.py` form.
   `netmon run` opens the live TUI; `netmon run --log` also persists the record;

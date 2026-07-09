@@ -42,9 +42,13 @@ netmon update           # pull latest + re-sync deps; restart the recorder if ru
 netmon service status   # background recorder: start|stop|status|enable|disable|logs
 ```
 
-Live capture needs `CAP_NET_RAW`: with `--setcap` it just runs; otherwise the launcher re-execs under `sudo` (one prompt). Capture flags carry over — `-i wlan0`, `--bpf 'not port 22'`, `-q`, `-r <pcap>` (replay, no privilege), `--keep-query`. Stop with Ctrl-C.
+Live capture needs `CAP_NET_RAW`: with `--setcap` it just runs; otherwise the launcher re-execs under `sudo` (one prompt). Capture flags carry over — `-i wlan0`, `--bpf 'not port 22'`, `-q`, `-r <pcap>` (replay, no privilege), `--keep-query`, `--pcap`. Stop with Ctrl-C.
 
-`netmon run` is **ephemeral by design**: it shows traffic live and writes nothing. Your DNS/TLS/HTTP history — the whole point of this tool — only lands on disk when you ask, via `--log` or the recorder.
+`netmon run` is **ephemeral by design**: it shows traffic live and writes nothing. Your DNS/TLS/HTTP history — the whole point of this tool — only lands on disk when you ask, via `--log`, `--pcap` (which persists the run so the raw evidence has a home — see below), or the recorder.
+
+### Preserving raw evidence (`--pcap`)
+
+The JSONL record is *derived* and lossy: it keeps the SNI/qname/host netmon parsed, not the bytes on the wire. For a leak audit you often want the raw packets too, so a finding can be re-examined later in tshark/Wireshark for the signals netmon deliberately does **not** compute — JA3/JA4 client fingerprints, certificate timing, exact packet sizes. `--pcap` writes every captured packet to `capture.pcap` in the run directory alongside the JSONL, owner-only (`0600`) like the rest of the record. It is off by default and persists the run (a raw-evidence file implies writing to disk). It round-trips a replay too — `netmon -r old.pcap --pcap` re-writes the input faithfully. An incomplete write (full disk) degrades rather than crashing and is reported as `persistence.pcap_dropped` in `summary.json`; pair it with the recorder's rotation to keep an always-on capture bounded.
 
 ### Background recorder
 

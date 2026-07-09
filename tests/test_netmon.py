@@ -38,7 +38,7 @@ from scapy.layers.l2 import ARP, Ether
 from scapy.layers.llmnr import LLMNRQuery
 from scapy.layers.netbios import NBNSHeader, NBNSQueryRequest
 from scapy.packet import Packet
-from scapy.utils import wrpcap
+from scapy.utils import rdpcap, wrpcap
 
 from netmon import (
     KIND_STYLE,
@@ -65,7 +65,9 @@ from netmon import (
     LruSet,
     NameLedger,
     NbnsEvent,
+    NullWriter,
     PacketProcessor,
+    PcapSink,
     QuicReassembler,
     RateBucketer,
     ReplayCapture,
@@ -1921,6 +1923,151 @@ class TestDiskFullResilience:
         ev = DnsQueryEvent(ts="t", src="a", dst="b", transport="udp", qname="x", qtype="A")
         writer.write(ev)  # stores the handle, then the write fails -> degraded
         writer.close()  # a buffered final flush also hits ENOSPC; must not raise
+
+
+class TestPcapEvidenceSink:
+    # `--pcap` preserves the raw wire bytes JSONL cannot (cert timing, JA3/JA4) so a
+    # finding can be re-opened in tshark/Wireshark. Same owner-only, symlink-refusing,
+    # degrade-not-crash discipline as JsonlWriter.
+    def test_written_pcap_is_owner_only(self, tmp_path: Path) -> None:
+        sink = PcapSink(tmp_path / "capture.pcap")
+        sink.write(make_syn("192.168.1.50", "93.184.216.34", 51000, 443))
+        sink.close()
+        mode = (tmp_path / "capture.pcap").stat().st_mode
+        assert mode & 0o077 == 0, oct(mode)
+        assert sink.write_failures == 0
+
+    def test_write_failure_degrades_without_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new_bytes", lambda _p: _FullDiskFile())
+        sink = PcapSink(tmp_path / "capture.pcap")
+        pkt = make_syn("192.168.1.50", "93.184.216.34", 51000, 443)
+        sink.write(pkt)  # must not raise despite ENOSPC
+        sink.write(pkt)
+        sink.close()  # must not raise
+        assert sink.write_failures == 2
+
+    def test_close_does_not_raise_on_full_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new_bytes", lambda _p: _FullDiskClosingFile())
+        sink = PcapSink(tmp_path / "capture.pcap")
+        sink.write(make_syn("192.168.1.50", "93.184.216.34", 51000, 443))
+        sink.close()  # a buffered final flush also hits ENOSPC; must not raise
+
+    def test_unserializable_packet_is_skipped_not_crashed(self, tmp_path: Path) -> None:
+        # A packet scapy cannot map to a link type (a Raw frame from a tun/tunnel
+        # capture or an exotic -r pcap) raises KeyError deep in PcapWriter, not OSError.
+        # It must be dropped and counted, never crash the run — and must not blind the
+        # sink to the well-formed packets around it. Mirrors process()'s parse guard.
+        from scapy.packet import Raw
+
+        sink = PcapSink(tmp_path / "capture.pcap")
+        good = make_syn("192.168.1.50", "93.184.216.34", 51000, 443)
+        sink.write(good)
+        sink.write(Raw(b"\x00\x01\x02\x03"))  # must not raise
+        sink.write(good)
+        sink.close()
+        assert sink.write_failures == 1  # only the Raw packet dropped
+        assert len(rdpcap(str(tmp_path / "capture.pcap"))) == 2  # both good packets kept
+
+    def test_create_failure_degrades_not_crashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A disk already full when the sink opens: degrade to a no-op that counts
+        # drops, matching the JSONL writer, rather than crash the run at startup.
+        import netmon
+
+        def boom(_p: Path) -> object:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(netmon, "open_private_new_bytes", boom)
+        sink = PcapSink(tmp_path / "capture.pcap")  # must not raise
+        sink.write(make_syn("192.168.1.50", "93.184.216.34", 51000, 443))
+        assert sink.write_failures == 1
+
+    def test_refuses_symlinked_target_without_touching_it(self, tmp_path: Path) -> None:
+        # CWE-59: never follow a pre-staged symlink at the pcap path (root arbitrary
+        # write). The security refusal must propagate, not be swallowed as a drop.
+        victim = tmp_path / "victim.bin"
+        victim.write_bytes(b"keep")
+        link = tmp_path / "capture.pcap"
+        link.symlink_to(victim)
+        with pytest.raises(FileExistsError):
+            PcapSink(link)
+        assert victim.read_bytes() == b"keep"
+
+    def test_pcap_flag_defaults_off_in_both_parsers(self) -> None:
+        assert _legacy_parser().parse_args([]).pcap is False
+        assert _run_parser().parse_args([]).pcap is False
+        assert _legacy_parser().parse_args(["--pcap"]).pcap is True
+        assert _run_parser().parse_args(["--pcap"]).pcap is True
+
+    async def test_no_pcap_flag_writes_no_capture_file(self, tmp_path: Path) -> None:
+        pcap = tmp_path / "in.pcap"
+        write_replay_pcap(pcap)
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False,
+        )
+        await run(args)  # no `pcap` attr => default off
+        run_dir = next((tmp_path / "logs").glob("run-*"))
+        assert not (run_dir / "capture.pcap").exists()
+
+    async def test_pcap_flag_writes_capture_file(self, tmp_path: Path) -> None:
+        pcap = tmp_path / "in.pcap"
+        write_replay_pcap(pcap)
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False, pcap=True,
+        )
+        await run(args)
+        out = next((tmp_path / "logs").glob("run-*/capture.pcap"))
+        assert out.stat().st_mode & 0o077 == 0
+
+    async def test_replay_pcap_round_trips_without_corrupting_packets(
+        self, tmp_path: Path
+    ) -> None:
+        # `netmon -r <in.pcap> --pcap` reads then re-writes; every packet must survive
+        # byte-for-byte so a preserved capture is faithful evidence.
+        src = tmp_path / "in.pcap"
+        write_replay_pcap(src)
+        args = argparse.Namespace(
+            read=str(src), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False, pcap=True,
+        )
+        await run(args)
+        out = next((tmp_path / "logs").glob("run-*/capture.pcap"))
+        original = rdpcap(str(src))
+        roundtripped = rdpcap(str(out))
+        assert len(roundtripped) == len(original)
+        assert [bytes(p) for p in roundtripped] == [bytes(p) for p in original]
+
+    async def test_summary_reports_pcap_drops(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A pcap that could not be fully written is surfaced in the summary the same
+        # way a truncated JSONL record is — an honest gap, not a silent one.
+        import netmon
+
+        pcap = tmp_path / "in.pcap"
+        write_replay_pcap(pcap)
+        monkeypatch.setattr(netmon, "open_private_new_bytes", lambda _p: _FullDiskFile())
+        proc = local_processor("192.168.1.50")
+        session = Session(
+            tmp_path / "run", proc, NullWriter(), ReplayCapture(pcap),
+            PcapSink(tmp_path / "run" / "capture.pcap"),
+        )
+        async for pkt in session.capture.packets():
+            if session.pcap_sink is not None:
+                session.pcap_sink.write(pkt)
+        summary = finalize(session)
+        assert summary["persistence"]["pcap_dropped"] >= 1
 
 
 class TestCoverageLedger:
