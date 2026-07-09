@@ -77,6 +77,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **TcpReassembler tolerates reordered and overlapping segments.** The client→server
+  reassembler (TLS ClientHello / HTTP request head) previously dropped a ClientHello
+  whose *second* segment was captured before its opening one, and could truncate the
+  stream when an overlapping retransmit was repacketized at a different boundary —
+  both losing the SNI. Segments seen before the opening ClientHello/HTTP segment are
+  now buffered (byte-bounded, LRU-evicted so the server→client firehose cannot exhaust
+  memory) and absorbed once that segment anchors the stream, and overlaps resolve
+  first-data-wins so a repacketized retransmit merges cleanly. The verified opening
+  segment always wins its own bytes, so buffered data cannot pre-empt it.
 - **A missing `-r` pcap fails cleanly instead of crashing.** Pointing `netmon -r`
   at a nonexistent file crashed the pcap reader mid-run with a Python traceback,
   after already creating an empty run directory. The path is now validated up front:

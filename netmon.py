@@ -813,12 +813,34 @@ def _skip_ack(data: bytes, pos: int, ecn: bool) -> int:
 
 def _reassemble(chunks: dict[int, bytes]) -> bytes:
     # Concatenate offset-keyed fragments contiguously from zero; stops at the
-    # first gap, so an incomplete stream yields only its complete prefix.
+    # first gap, so an incomplete stream yields only its complete prefix. Fragments
+    # are keyed at exact offsets and matched exactly — an overlapping segment at an
+    # off-boundary offset is skipped, which the DnsTcpReassembler's sliding window
+    # relies on to drop straddling junk rather than blend it into the yielded tail.
     out = bytearray()
     pos = 0
     while pos in chunks:
         out += chunks[pos]
         pos += len(chunks[pos])
+    return bytes(out)
+
+
+def _reassemble_merged(chunks: dict[int, bytes]) -> bytes:
+    # Overlap-tolerant variant for the one-shot TCP client stream (ClientHello / HTTP
+    # request head): walk fragments in offset order, building the contiguous prefix and
+    # stopping at the first gap. Overlaps resolve first-data-wins — a fragment starting
+    # within the bytes already assembled contributes only the tail that extends them —
+    # so a retransmit repacketized at a different boundary merges cleanly instead of
+    # truncating the stream early (the classic segment-overlap evasion). Unlike
+    # _reassemble this must not feed a sliding window: it blends overlaps, so the caller
+    # parses the whole result once and drops the stream.
+    out = bytearray()
+    for off in sorted(chunks):
+        if off > len(out):
+            break  # a genuine gap: the rest is not yet contiguous
+        seg = chunks[off]
+        if off + len(seg) > len(out):
+            out += seg[len(out) - off :]
     return bytes(out)
 
 
@@ -1136,37 +1158,82 @@ class TcpReassembler:
     # of capture order or retransmission. Only flows that open with a
     # ClientHello record or an HTTP method are tracked, which bounds memory on
     # links dominated by encrypted application data.
-    def __init__(self, per_flow_cap: int = 65536, total_cap: int = 4_000_000) -> None:
+    def __init__(
+        self, per_flow_cap: int = 65536, total_cap: int = 4_000_000, pending_cap: int = 262144
+    ) -> None:
         self.per_flow_cap = per_flow_cap
         self.total_cap = total_cap
+        self.pending_cap = pending_cap
         self.cleared = 0
         self._flows: dict[FlowKey, _Stream] = {}
         self._total = 0
+        # Segments seen before their flow's opening ClientHello/HTTP segment: a capture
+        # that reorders the first two segments would otherwise drop the pre-anchor bytes
+        # and lose the SNI. Held by absolute seq until the opening segment anchors the
+        # stream and absorbs them. Byte-bounded with LRU eviction so the firehose of
+        # non-opening segments (every server->client packet) cannot exhaust memory.
+        self._pending: OrderedDict[FlowKey, dict[int, bytes]] = OrderedDict()
+        self._pending_total = 0
 
     def add(self, key: FlowKey, seq: int, payload: bytes) -> bytes:
         stream = self._flows.get(key)
         if stream is None:
             if not _client_stream_start(payload):
+                self._hold_pending(key, seq, payload)
                 return b""
             stream = _Stream(seq)
             self._flows[key] = stream
+            # Store the verified opening segment's bytes before absorbing pending: the
+            # anchor is authoritative, so unverified buffered data can only fill the
+            # gaps it leaves, never pre-empt offset 0 (a segment-overlap evasion).
+            self._store(stream, seq, payload)
+            self._absorb_pending(key, stream)
+        else:
+            self._store(stream, seq, payload)
+        if self._total > self.total_cap:
+            self.cleared += len(self._flows)
+            self._flows.clear()
+            self._total = 0
+            return b""
+        return _reassemble_merged(stream.chunks)
+
+    def _store(self, stream: _Stream, seq: int, payload: bytes) -> None:
         offset = seq - stream.base
         if offset >= 0 and offset not in stream.chunks and stream.size < self.per_flow_cap:
             chunk = payload[: self.per_flow_cap - stream.size]
             stream.chunks[offset] = chunk
             stream.size += len(chunk)
             self._total += len(chunk)
-            if self._total > self.total_cap:
-                self.cleared += len(self._flows)
-                self._flows.clear()
-                self._total = 0
-                return b""
-        return _reassemble(stream.chunks)
+
+    def _hold_pending(self, key: FlowKey, seq: int, payload: bytes) -> None:
+        buf = self._pending.get(key)
+        if buf is None:
+            buf = self._pending[key] = {}
+        self._pending.move_to_end(key)
+        if seq not in buf:
+            buf[seq] = payload
+            self._pending_total += len(payload)
+        while self._pending_total > self.pending_cap and self._pending:
+            _, old = self._pending.popitem(last=False)  # evict least-recently-seen flow
+            self._pending_total -= sum(len(v) for v in old.values())
+
+    def _absorb_pending(self, key: FlowKey, stream: _Stream) -> None:
+        buf = self._pending.pop(key, None)
+        if buf is None:
+            return
+        self._pending_total -= sum(len(v) for v in buf.values())
+        # Absorb in offset order so the earliest (SNI-bearing prefix) bytes win the
+        # per-flow cap over a later-offset segment that arrived first.
+        for pending_seq in sorted(buf):
+            self._store(stream, pending_seq, buf[pending_seq])
 
     def drop(self, key: FlowKey) -> None:
         stream = self._flows.pop(key, None)
         if stream is not None:
             self._total -= stream.size
+        buf = self._pending.pop(key, None)
+        if buf is not None:
+            self._pending_total -= sum(len(v) for v in buf.values())
 
 
 class _DnsStream:

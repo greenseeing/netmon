@@ -415,6 +415,91 @@ class TestTcpReassembler:
         assert r._total == 0
 
 
+class TestTcpReassemblerOverlapAndReorder:
+    KEY = ("192.168.1.50", 51000, "93.184.216.34", 443)
+
+    def test_second_segment_before_first_still_yields_sni(self) -> None:
+        # Capture reordering delivers the ClientHello's tail before its opening
+        # segment; the opening segment must retroactively absorb the buffered tail.
+        proc = local_processor("192.168.1.50")
+        hello = pq_client_hello(b"preorder.example.com")
+        first, second = hello[:800], hello[800:]
+        early = proc.process(tcp_segment(second, flags="A", seq=BASE_SEQ + 800))
+        done = proc.process(tcp_segment(first, flags="PA", seq=BASE_SEQ))
+        assert [e for e in early if isinstance(e, TlsSniEvent)] == []
+        sni = [e for e in done if isinstance(e, TlsSniEvent)]
+        assert len(sni) == 1
+        assert sni[0].sni == "preorder.example.com"
+
+    def test_overlapping_repacketized_retransmit_assembles_whole(self) -> None:
+        # A retransmit repacketized at a different boundary overlaps the buffered
+        # prefix. First-data-wins on the overlap; the extending tail is appended, so
+        # the assembled bytes are whole and uncorrupted.
+        r = TcpReassembler()
+        hello = pq_client_hello(b"overlap.example.com")
+        r.add(self.KEY, BASE_SEQ, hello[:800])
+        r.add(self.KEY, BASE_SEQ + 600, hello[600:1400])  # overlaps [600:800], extends
+        out = r.add(self.KEY, BASE_SEQ + 1400, hello[1400:])
+        assert out == hello
+        parsed = parse_client_hello(out)
+        assert parsed is not None
+        assert parsed.sni == "overlap.example.com"
+
+    def test_reassemble_stops_at_a_genuine_gap(self) -> None:
+        # Overlap tolerance must not paper over a real hole: a missing middle segment
+        # still yields only the contiguous prefix, never the disjoint tail.
+        r = TcpReassembler()
+        hello = pq_client_hello(b"gap.example.com")
+        r.add(self.KEY, BASE_SEQ, hello[:700])
+        out = r.add(self.KEY, BASE_SEQ + 1400, hello[1400:])  # skips [700:1400]
+        assert out == hello[:700]
+        assert parse_client_hello(out) is None
+
+    def test_pending_pool_is_byte_bounded_under_a_flood(self) -> None:
+        # Every non-opening segment is buffered pending its anchor; a flood of them
+        # (the server->client firehose, or a hostile stream) must stay under the cap.
+        r = TcpReassembler(pending_cap=4096)
+        for i in range(1000):
+            key = ("10.0.0.1", 1024 + i, "93.184.216.34", 443)
+            r.add(key, 0, b"\x17\x03\x03 not a client hello" + bytes([i % 256]) * 200)
+        assert r._pending_total <= 4096
+
+    def test_fin_drops_pending_so_late_anchor_finds_nothing(self) -> None:
+        # A RST/FIN before the anchor arrives discards the buffered pre-anchor bytes,
+        # matching the anchored-stream drop discipline.
+        r = TcpReassembler()
+        hello = pq_client_hello(b"resetme.example.com")
+        first, second = hello[:800], hello[800:]
+        r.add(self.KEY, BASE_SEQ + 800, second)  # buffered pending
+        r.drop(self.KEY)  # connection reset
+        out = r.add(self.KEY, BASE_SEQ, first)  # anchor arrives after the drop
+        assert out == first  # only the anchor's own bytes; the tail was discarded
+        assert parse_client_hello(out) is None
+
+    def test_anchor_bytes_win_over_pending_garbage_at_same_seq(self) -> None:
+        # A segment carrying non-opening bytes buffered at the sequence the real
+        # ClientHello will use must not pre-empt the verified opening segment. The
+        # anchor's own bytes are authoritative; pending only fills the gaps it leaves.
+        r = TcpReassembler()
+        hello = pq_client_hello(b"authentic.example.com")
+        first, second = hello[:800], hello[800:]
+        r.add(self.KEY, BASE_SEQ, b"\x17\x03\x03" + b"\xcc" * 797)  # garbage at anchor seq
+        r.add(self.KEY, BASE_SEQ + 800, second)  # real tail, buffered pending
+        out = r.add(self.KEY, BASE_SEQ, first)  # real opening anchors last
+        assert out == hello
+        parsed = parse_client_hello(out)
+        assert parsed is not None
+        assert parsed.sni == "authentic.example.com"
+
+    def test_serverhello_still_never_enters_flows(self) -> None:
+        # The pending pool must not promote a server->client ServerHello into a tracked
+        # (anchored) stream — it is only ever held unanchored, never parsed as a client.
+        r = TcpReassembler()
+        server_key = ("93.184.216.34", 443, "192.168.1.50", 51000)
+        assert r.add(server_key, 0, b"\x16\x03\x03\x00\x00\x02" + b"\x00" * 4000) == b""
+        assert server_key not in r._flows
+
+
 RFC_DCID = bytes.fromhex("8394c8f03e515708")
 
 # RFC 9001 Appendix A.2 — the sample protected client Initial packet, verbatim.
