@@ -359,7 +359,7 @@ KIND_STYLE: dict[str, str] = {
 # come back (←). Flows carry their own direction; link-scope frames get a dot.
 _CLIENT_KINDS = frozenset({"dns_query", "tls_sni", "http", "dns_ecs", "llmnr", "nbns"})
 _SERVER_KINDS = frozenset({"dns_answer", "dns_response", "dns_https"})
-_FLOW_GLYPH = {"outbound": "→", "inbound": "←", "transit": "↔"}
+_FLOW_GLYPH = {"outbound": "→", "inbound": "←", "transit": "↔", "local": "·"}
 
 
 # Dispatch on event.kind (the stable string discriminator), never on class identity.
@@ -1068,13 +1068,25 @@ def local_addresses() -> frozenset[str]:
     return frozenset(ips)
 
 
+_CGNAT4 = ipaddress.ip_network("100.64.0.0/10")
+
+
 def remote_scope(addr: str) -> str:
+    # The reachability class of an address, finer than internet/lan so the feed can
+    # tell carrier-NAT and link-local apart from a real private LAN. `_endpoint_is_local`
+    # reads this to decide flow direction; the summary credits only `internet`.
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return "lan"
     if ip.is_multicast:
         return "multicast"
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_link_local:
+        return "linklocal"
+    if ip.version == 4 and ip in _CGNAT4:
+        return "cgnat"  # RFC 6598 carrier-grade NAT: neither your LAN nor the internet
     return "internet" if ip.is_global else "lan"
 
 
@@ -1735,10 +1747,29 @@ class PacketProcessor:
             return []
         return [NbnsEvent(ts=ts, src=net.src, dst=net.dst, qname=qname)]
 
+    def _endpoint_is_local(self, ip: str) -> bool:
+        # Local = an address on this host OR one that is structurally on-link
+        # (private/link-local/loopback). The own-IP half keeps a globally-addressed
+        # host (public IP, un-NAT'd IPv6) classifying its own egress as outbound; the
+        # address-class half lets a mirror/SPAN deployment classify LAN peers it does
+        # not own. Carrier NAT and the internet are deliberately not local.
+        return ip in self.local_ips or remote_scope(ip) in ("loopback", "linklocal", "lan")
+
     def _flow_event(
         self, ts: str, net: Any, proto: str, sport: int, dport: int, birth: Birth
     ) -> list[Event]:
-        if net.src in self.local_ips:
+        src_local = self._endpoint_is_local(net.src)
+        # A multicast destination is link-scoped, so a flow to it stays on the LAN.
+        dst_local = self._endpoint_is_local(net.dst) or remote_scope(net.dst) == "multicast"
+        if src_local and dst_local:
+            direction, local_ip, local_port, remote_ip, remote_port = (
+                "local",
+                net.src,
+                sport,
+                net.dst,
+                dport,
+            )
+        elif src_local:
             direction, local_ip, local_port, remote_ip, remote_port = (
                 "outbound",
                 net.src,
@@ -1746,7 +1777,7 @@ class PacketProcessor:
                 net.dst,
                 dport,
             )
-        elif net.dst in self.local_ips:
+        elif dst_local:
             direction, local_ip, local_port, remote_ip, remote_port = (
                 "inbound",
                 net.dst,
@@ -1762,10 +1793,11 @@ class PacketProcessor:
                 net.dst,
                 dport,
             )
-        # Transit flows have no local end to normalize against, so dedup on the
-        # sorted endpoint pair — otherwise the two directions of one connection
-        # hash to different keys and emit twice.
-        if direction == "transit":
+        # 'local' and 'transit' flows have no single local end to normalize against, so
+        # they dedup on the sorted endpoint pair — otherwise the two legs of one
+        # connection (incl. a loopback host talking to itself) hash to different keys
+        # and emit twice.
+        if direction in ("local", "transit"):
             (ip_a, port_a), (ip_b, port_b) = sorted(((net.src, sport), (net.dst, dport)))
             key: FlowTuple = (proto, ip_a, port_a, ip_b, port_b)
         else:
@@ -1774,7 +1806,10 @@ class PacketProcessor:
             return []
         hostname = self.names.lookup(remote_ip)
         scope = remote_scope(remote_ip)
-        if scope == "internet":
+        # A 'local' flow's remote end is a LAN/loopback address — or, for a self-connect
+        # on a globally-routable own IP, this host itself — so it must never be credited
+        # as a top internet host, even when its scope resolves to "internet".
+        if scope == "internet" and direction != "local":
             self.remote_hosts.add(hostname or remote_ip)
         service = SERVICE_BY_PORT.get(
             (proto, remote_port), SERVICE_BY_PORT.get((proto, local_port), f"{proto}/{remote_port}")

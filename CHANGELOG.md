@@ -56,6 +56,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Flow direction and scope read the address class, not just this host's IPs.** A
+  connection was `outbound`/`inbound` only when one end was a configured local IP,
+  otherwise `transit` — so a loopback or LAN-to-LAN connection was emitted **twice**
+  (both legs looked outbound), a multicast frame a peer sent was mislabelled
+  `transit`, and loopback, link-local and carrier-grade NAT (`100.64/10`) addresses
+  were all flattened into `lan`. Direction now anchors on address class
+  (private/link-local/loopback, or one of this host's own IPs): private→internet is
+  `outbound`, internet→private is `inbound`, both-local (loopback, LAN↔LAN, LAN
+  multicast) is a new `local` direction that deduplicates a connection's two legs
+  into one event, and internet↔internet stays `transit`. `scope` gains `cgnat`,
+  `linklocal` and `loopback`, so carrier NAT and link-local no longer masquerade as
+  your LAN. This also fixes a mirror/SPAN deployment, which now classifies LAN peers
+  it does not own.
+
 - **A reused IP is named for the site you most recently visited.** The IP→hostname
   ledger kept the first name an address was ever seen with, so a shared or CDN edge
   that later served a different site mislabeled every subsequent flow with the stale

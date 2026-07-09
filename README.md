@@ -9,7 +9,7 @@ Passive network monitor for auditing what your device leaks to the ISP and which
 | `dns.jsonl` | Every DNS query (name, type, resolver), every answer (A/AAAA/CNAME/… with TTL), and every HTTPS/SVCB (type 65/64) record with its SvcParams: `alpn`, `port`, `ipv4hint`, `ipv6hint`, and an `ech` flag |
 | `tls.jsonl` | SNI from the ClientHello of every HTTPS connection — TCP TLS and decrypted QUIC Initials (`transport`), the cleartext `alpn` list, with `ech: true` marking a cover name (see Limitations) |
 | `http.jsonl` | Plaintext HTTP requests: method, path, Host, User-Agent; known captive-portal probes carry `tag: "captive-portal"` |
-| `flows.jsonl` | Every new connection: protocol, direction, local/remote IP+port, service guess, hostname (reverse-mapped from observed DNS answers), scope (`internet`, `lan`, or `multicast`), and a `note` on disclosive services (NTP, STARTTLS mail) |
+| `flows.jsonl` | Every new connection: protocol, direction (`outbound`/`inbound` across the LAN edge, `local` for LAN-internal or loopback, `transit` for mirrored upstream traffic), local/remote IP+port, service guess, hostname (reverse-mapped from observed DNS answers), scope (`internet`, `cgnat`, `lan`, `linklocal`, `loopback`, or `multicast`), and a `note` on disclosive services (NTP, STARTTLS mail) |
 | `summary.json` | Written on exit: top DNS names, top SNI hostnames, top internet hosts, event counts |
 
 All events carry ISO 8601 timestamps in the host's local timezone (with an explicit UTC offset) at millisecond precision. Runs that persist — `netmon run --log`, the background recorder, or the legacy `python netmon.py` form — write to `<output>/run-<stamp>/`.

@@ -940,9 +940,11 @@ class TestFlowDedup:
     def test_transit_connection_deduped_across_directions(self) -> None:
         # No local end to normalize against: the forward and reverse legs of one
         # transit connection must still dedup to a single flow.
+        # Two internet hosts (neither local by address class): a mirrored upstream
+        # connection whose forward and reverse legs must dedup to one 'transit' flow.
         proc = PacketProcessor(local_ips=frozenset())
-        fwd = Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=1111, dport=443, flags="S")
-        rev = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=443, dport=1111, flags="SA")
+        fwd = Ether() / IP(src="8.8.8.8", dst="1.1.1.1") / TCP(sport=1111, dport=443, flags="S")
+        rev = Ether() / IP(src="1.1.1.1", dst="8.8.8.8") / TCP(sport=443, dport=1111, flags="SA")
         fwd.time = PKT_TIME
         rev.time = PKT_TIME
         flows = [e for e in (*proc.process(fwd), *proc.process(rev)) if isinstance(e, FlowEvent)]
@@ -1202,6 +1204,74 @@ class TestFlowScope:
     ) -> None:
         assert remote_scope("ff12::8384") == "multicast"
 
+    def test_scope_distinguishes_cgnat_loopback_linklocal(self) -> None:
+        assert remote_scope("100.64.1.1") == "cgnat"  # carrier NAT, was mislabelled 'lan'
+        assert remote_scope("127.0.0.1") == "loopback"
+        assert remote_scope("169.254.4.4") == "linklocal"
+        assert remote_scope("fe80::1") == "linklocal"
+        assert remote_scope("10.0.0.1") == "lan"  # RFC1918 stays 'lan'
+
+
+class TestAddressClassFlow:
+    # Direction anchors on address class (private/link-local/loopback = local) OR this
+    # host's own IPs, so a mirror/SPAN deployment classifies LAN<->internet correctly
+    # and LAN-internal traffic is 'local', not double-emitted or mislabelled 'transit'.
+    def test_both_local_loopback_dedups_to_one_local_flow(self) -> None:
+        proc = local_processor("127.0.0.1")
+        req = Ether() / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(
+            sport=54321, dport=5000, flags="S"
+        )
+        rep = Ether() / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(
+            sport=5000, dport=54321, flags="SA"
+        )
+        req.time = PKT_TIME
+        rep.time = PKT_TIME
+        fr = [e for e in proc.process(req) if isinstance(e, FlowEvent)]
+        fp = [e for e in proc.process(rep) if isinstance(e, FlowEvent)]
+        assert len(fr) == 1  # was two 'outbound' events for one connection
+        assert fr[0].direction == "local"
+        assert fr[0].scope == "loopback"
+        assert fp == []  # the reply leg dedups to the same flow
+
+    def test_lan_to_lan_is_local(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flow = single_flow(proc.process(make_syn("192.168.1.10", "192.168.1.20", 40000, 445)))
+        assert flow.direction == "local"
+        assert flow.scope == "lan"
+
+    def test_received_multicast_is_local_not_transit(self) -> None:
+        proc = local_processor("192.168.1.50")
+        pkt = Ether() / IP(src="192.168.1.9", dst="224.0.0.251") / UDP(sport=5353, dport=5353)
+        pkt.time = PKT_TIME
+        flow = single_flow([e for e in proc.process(pkt) if isinstance(e, FlowEvent)])
+        assert flow.direction == "local"
+        assert flow.scope == "multicast"
+
+    def test_private_peer_egress_to_internet_is_outbound(self) -> None:
+        # A LAN host that is not us, egressing to the internet (mirror view): outbound.
+        proc = local_processor("192.168.1.50")
+        flow = single_flow(proc.process(make_syn("192.168.1.77", "8.8.8.8", 40000, 443)))
+        assert flow.direction == "outbound"
+        assert flow.remote_ip == "8.8.8.8"
+        assert flow.scope == "internet"
+
+    def test_self_connect_on_global_ip_not_counted_as_internet_host(self) -> None:
+        # A host with a globally-routable own IP connecting to itself is 'local'; it
+        # must not credit the host's own address as a top internet host.
+        proc = local_processor("1.2.3.4")
+        proc.process(make_syn("1.2.3.4", "1.2.3.4", 51000, 443))
+        summary = proc.summary()
+        assert summary["top_internet_hosts"] == {}
+        assert summary["unique_internet_hosts"] == 0
+
+    def test_own_global_ip_egress_still_outbound(self) -> None:
+        # A globally-addressed host (public IP / un-NAT'd IPv6) whose own address is
+        # global (both ends global) would be 'transit' by address class alone; the
+        # local_ips anchor must still make its own egress 'outbound'.
+        proc = local_processor("1.2.3.4")
+        flow = single_flow(proc.process(make_syn("1.2.3.4", "8.8.8.8", 51000, 443)))
+        assert flow.direction == "outbound"
+
 
 class TestServiceGuess:
     def test_tcp_443_is_https(self) -> None:
@@ -1253,13 +1323,13 @@ class TestTcpFlagCombinations:
 class TestIpv6:
     def test_ipv6_syn_produces_flow_event(self) -> None:
         processor = local_processor("2001:db8::1")
-        pkt = IPv6(src="2001:db8::1", dst="2001:db8::2") / TCP(
+        pkt = IPv6(src="2001:db8::1", dst="2606:4700:4700::1111") / TCP(
             sport=51000, dport=443, flags="S"
         )
         pkt.time = PKT_TIME
         flow = single_flow(processor.process(pkt))
         assert flow.local_ip == "2001:db8::1"
-        assert flow.remote_ip == "2001:db8::2"
+        assert flow.remote_ip == "2606:4700:4700::1111"
         assert flow.direction == "outbound"
         assert flow.ts == EXPECTED_ISO
 
@@ -2889,6 +2959,7 @@ class TestEventDirection:
         assert event_direction(flow("outbound")) == "→"
         assert event_direction(flow("inbound")) == "←"
         assert event_direction(flow("transit")) == "↔"
+        assert event_direction(flow("local")) == "·"
 
     def test_arp_is_link_local_glyph(self) -> None:
         arp = ArpEvent(
