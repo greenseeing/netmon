@@ -822,6 +822,154 @@ class TestTls12CertificateSan:
         assert not proc.certs._flows
 
 
+def _flow_events(proc: PacketProcessor, n: int, base_port: int = 40000) -> list[Event]:
+    events: list[Event] = []
+    for i in range(n):
+        events += proc.process(make_syn("192.168.1.50", "93.184.216.34", base_port + i, 443))
+    return events
+
+
+class TestOutputRotation:
+    def test_size_cap_rolls_output_to_numbered_files(self, tmp_path: Path) -> None:
+        writer = JsonlWriter(tmp_path / "run", rotate_bytes=500, rotate_keep=10)
+        for ev in _flow_events(local_processor("192.168.1.50"), 20):
+            writer.write(ev)
+        writer.close()
+        names = sorted(p.name for p in (tmp_path / "run").glob("flows*.jsonl"))
+        assert "flows.00001.jsonl" in names  # rolled archive
+        assert "flows.jsonl" in names  # the active file keeps its canonical name
+
+    def test_ring_never_exceeds_the_keep_bound(self, tmp_path: Path) -> None:
+        writer = JsonlWriter(tmp_path / "run", rotate_bytes=300, rotate_keep=2)
+        for ev in _flow_events(local_processor("192.168.1.50"), 60):
+            writer.write(ev)
+        writer.close()
+        archives = list((tmp_path / "run").glob("flows.[0-9]*.jsonl"))
+        assert 0 < len(archives) <= 2
+        assert not (tmp_path / "run" / "flows.00001.jsonl").exists()  # oldest deleted
+
+    def test_rotated_files_keep_owner_only_mode(self, tmp_path: Path) -> None:
+        writer = JsonlWriter(tmp_path / "run", rotate_bytes=300, rotate_keep=5)
+        for ev in _flow_events(local_processor("192.168.1.50"), 20):
+            writer.write(ev)
+        writer.close()
+        for path in (tmp_path / "run").glob("flows*.jsonl"):
+            assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_rotation_failure_degrades_without_faking_drops(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A failed roll is housekeeping, not data loss: the event that triggered it
+        # was already written and must not be counted as dropped. Every event is
+        # either on disk or in write_failures — the ledger stays exact.
+        writer = JsonlWriter(tmp_path / "run", rotate_bytes=300, rotate_keep=5)
+        events = _flow_events(local_processor("192.168.1.50"), 20)
+
+        def refuse(self: Path, target: Path) -> Path:
+            raise OSError(errno.EROFS, "read-only file system")
+
+        monkeypatch.setattr(Path, "rename", refuse)
+        for ev in events:
+            writer.write(ev)  # must not raise
+        writer.close()
+        assert writer.write_failures > 0
+        written = sum(1 for _ in (tmp_path / "run" / "flows.jsonl").open())
+        assert written + writer.write_failures == len(events)
+
+    def test_pcap_rotation_reopen_still_refuses_a_symlink_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The post-roll reopen carries the same CWE-59 discipline as every other
+        # create: a pre-staged file/symlink at the canonical name must crash-stop,
+        # never silently degrade into "disk full".
+        import netmon
+
+        run = tmp_path / "run"
+        run.mkdir()
+        sink = PcapSink(run / "capture.pcap", rotate_bytes=100, rotate_keep=2)
+
+        def planted(path: Path) -> Any:
+            raise OSError(errno.EEXIST, "pre-staged file")
+
+        monkeypatch.setattr(netmon, "open_private_new_bytes", planted)
+        with pytest.raises(OSError):
+            for i in range(10):
+                sink.write(make_syn("192.168.1.50", "93.184.216.34", 40000 + i, 443))
+
+    def test_prune_orders_archives_numerically_past_the_pad_width(
+        self, tmp_path: Path
+    ) -> None:
+        # Lexical ordering would sort 100000 before 99999 and prune the newest
+        # archives; the ring must order by sequence number.
+        writer = JsonlWriter(tmp_path / "run", rotate_bytes=300, rotate_keep=2)
+        writer._rolled["flows.jsonl"] = 99998
+        for ev in _flow_events(local_processor("192.168.1.50"), 60):
+            writer.write(ev)
+        writer.close()
+        names = sorted(p.name for p in (tmp_path / "run").glob("flows.[0-9]*.jsonl"))
+        assert len(names) <= 2
+        assert all(int(n.split(".")[1]) >= 100000 for n in names)  # newest survive
+
+    def test_rotate_flags_are_clamped_to_sane_values(self, tmp_path: Path) -> None:
+        from netmon import build_session
+
+        args = _legacy_parser().parse_args(
+            ["-o", str(tmp_path), "--rotate-mb", "-5", "--rotate-keep", "0"]
+        )
+        session = build_session(args)
+        assert isinstance(session.writer, JsonlWriter)
+        assert session.writer.rotate_bytes == 0  # negative = off, never roll-every-write
+        assert session.writer.rotate_keep >= 1  # never delete-on-create
+        session.writer.close()
+
+    def test_rotation_off_by_default_keeps_single_files(self, tmp_path: Path) -> None:
+        writer = JsonlWriter(tmp_path / "run")
+        for ev in _flow_events(local_processor("192.168.1.50"), 40):
+            writer.write(ev)
+        writer.close()
+        assert [p.name for p in (tmp_path / "run").glob("flows*.jsonl")] == ["flows.jsonl"]
+
+    def test_query_reads_rotated_archives_as_one_timeline(self, tmp_path: Path) -> None:
+        writer = JsonlWriter(tmp_path / "run", rotate_bytes=500, rotate_keep=10)
+        events = _flow_events(local_processor("192.168.1.50"), 20)
+        for ev in events:
+            writer.write(ev)
+        writer.close()
+        from netmon import _load_run_events
+
+        read = list(_load_run_events(tmp_path / "run", None))
+        assert len(read) == len(events)  # nothing lost across the roll
+
+    def test_pcap_sink_rolls_and_bounds_the_ring(self, tmp_path: Path) -> None:
+        run = tmp_path / "run"
+        run.mkdir()
+        sink = PcapSink(run / "capture.pcap", rotate_bytes=2_000, rotate_keep=2)
+        for i in range(60):
+            pkt = make_syn("192.168.1.50", "93.184.216.34", 40000 + i, 443)
+            sink.write(pkt)
+        sink.close()
+        archives = sorted(run.glob("capture.[0-9]*.pcap"))
+        assert 0 < len(archives) <= 2
+        assert (run / "capture.pcap").exists()
+        for archive in archives:
+            assert len(rdpcap(str(archive))) > 0  # every rolled file is a valid pcap
+
+    def test_rotate_flags_reach_the_writer_and_sink(self, tmp_path: Path) -> None:
+        from netmon import build_session
+
+        args = _legacy_parser().parse_args(
+            ["-o", str(tmp_path), "--pcap", "--rotate-mb", "5", "--rotate-keep", "3"]
+        )
+        session = build_session(args)
+        assert isinstance(session.writer, JsonlWriter)
+        assert session.writer.rotate_bytes == 5_000_000
+        assert session.writer.rotate_keep == 3
+        assert session.pcap_sink is not None
+        assert session.pcap_sink.rotate_bytes == 5_000_000
+        session.writer.close()
+        session.pcap_sink.close()
+
+
 class TestTunnelAndNonEthernet:
     def test_raw_ip_frame_from_a_tun_link_yields_a_flow(self) -> None:
         # A tun/wireguard/ppp capture has no Ethernet header — the frame IS the IP

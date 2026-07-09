@@ -142,7 +142,7 @@ After=network.target
 
 [Service]
 User=$SVC_USER
-ExecStart=$NETMON_DIR/.venv/bin/netmon run --headless --log -q -o $LOG_DIR
+ExecStart=$NETMON_DIR/.venv/bin/netmon run --headless --log -q -o $LOG_DIR --rotate-mb 256 --rotate-keep 4
 Restart=on-failure
 # Passive capture needs exactly one capability; grant it to this service only.
 AmbientCapabilities=CAP_NET_RAW

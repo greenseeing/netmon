@@ -154,7 +154,7 @@ After=network.target
 
 [Service]
 User=netmon
-ExecStart=/opt/netmon/.venv/bin/netmon run --headless --log -q -o /var/log/netmon
+ExecStart=/opt/netmon/.venv/bin/netmon run --headless --log -q -o /var/log/netmon --rotate-mb 256 --rotate-keep 4
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=yes
@@ -177,7 +177,15 @@ netmon service logs                     # structlog JSON: capture_started, stats
 ```
 
 `--headless --log` is required: the recorder must persist (`--log`) and must not try
-to open a TUI without a tty (`--headless`). `AmbientCapabilities` makes setcap (section 3B) unnecessary for the service — it runs unprivileged with exactly one capability. Each restart opens a new run directory, which doubles as log rotation. Prune old runs:
+to open a TUI without a tty (`--headless`). `AmbientCapabilities` makes setcap (section 3B) unnecessary for the service — it runs unprivileged with exactly one capability.
+
+`--rotate-mb N` bounds a single run's files in-flight, dumpcap-style: each JSONL
+(and the `--pcap` evidence file) rolls to a numbered archive at N MB — the active
+file keeps its canonical name — and only the newest `--rotate-keep` archives
+survive, oldest deleted. `netmon query` reads active + archives as one timeline.
+Off by default (`--rotate-mb 0`); the unit above bounds a healthy long-lived
+recorder to roughly `(keep+1) × N MB` per output file. A restart still opens a
+fresh run directory; prune old runs:
 
 ```sh
 find /var/log/netmon -maxdepth 1 -name 'run-*' -mtime +30 -exec rm -r {} +

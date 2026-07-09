@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **In-run output rotation (`--rotate-mb`, `--rotate-keep`)** — dumpcap-style size
+  caps for the recorder: each JSONL file (and the `--pcap` evidence file) rolls to
+  a numbered archive at the cap, the active file keeps its canonical name, and
+  only the newest `--rotate-keep` archives survive (numeric ordering, oldest
+  deleted). `netmon query` reads active + archives as one timeline. Rotation
+  honours the owner-only and symlink-refusing discipline (a pre-staged file at
+  the canonical name still crash-stops), and a failed roll degrades without
+  counting the already-written record as dropped — the persistence ledger only
+  claims loss that happened. Off by default; the systemd recorder unit ships with
+  `--rotate-mb 256 --rotate-keep 4`, replacing the RUNBOOK's restart-as-rotation
+  claim.
 - **Tunnel and non-Ethernet honest accounting** — raw-IP links (`tun*`/`wg*`/
   `ppp*`/`sit*`) and Linux cooked captures decode from their IP header like any
   Ethernet frame. Directly-encapsulated tunnels (IP-in-IP, 6in4, 4in6) report the

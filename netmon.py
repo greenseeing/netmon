@@ -2204,6 +2204,31 @@ def _reraise_symlink_refusal(exc: OSError) -> None:
         raise exc
 
 
+def _rotation_archives(directory: Path, stem: str, suffix: str) -> list[Path]:
+    # Ordered oldest-first by sequence NUMBER: a lexical sort misorders the ring
+    # once the counter outgrows its zero padding (100000 < 99999 lexically) and
+    # would prune the newest archives. Non-numeric middles are not ours — skip.
+    found = []
+    for path in directory.glob(f"{stem}.*.{suffix}"):
+        seq_text = path.name[len(stem) + 1 : -(len(suffix) + 1)]
+        if seq_text.isdigit():
+            found.append((int(seq_text), path))
+    return [path for _, path in sorted(found)]
+
+
+def _roll_archive(path: Path, seq: int, keep: int) -> None:
+    # Rename the full active file to its numbered archive and prune the ring.
+    # rename inside the 0700 run dir preserves the 0600 mode and cannot be
+    # symlink-swapped by an outsider. A failed prune only leaves the ring briefly
+    # over-bound; the next roll retries it.
+    stem, _, suffix = path.name.partition(".")
+    path.rename(path.with_name(f"{stem}.{seq:05d}.{suffix}"))
+    with contextlib.suppress(OSError):
+        archives = _rotation_archives(path.parent, stem, suffix)
+        for old in archives[: max(0, len(archives) - keep)]:
+            old.unlink()
+
+
 def _log_write_failure(event: str, exc: Exception, **fields: str) -> None:
     # The --tui --log path redirects structlog onto a file inside the run dir — the
     # same disk these sinks use — so logging a write failure can itself hit ENOSPC.
@@ -2221,9 +2246,17 @@ class Writer(Protocol):
 
 class JsonlWriter:
     # The run directory is the user's browsing history — keep it owner-only.
-    def __init__(self, out_dir: Path) -> None:
+    # rotate_bytes > 0 rolls each output file dumpcap-style at that size: the
+    # active file always keeps its canonical name (tail -f and `netmon query`
+    # read it live), the full file moves to a numbered archive, and archives
+    # beyond rotate_keep are deleted oldest-first.
+    def __init__(self, out_dir: Path, rotate_bytes: int = 0, rotate_keep: int = 10) -> None:
         self.out_dir = out_dir
+        self.rotate_bytes = rotate_bytes
+        self.rotate_keep = rotate_keep
         self._files: dict[str, TextIO] = {}
+        self._written: dict[str, int] = {}
+        self._rolled: dict[str, int] = {}
         self.write_failures = 0
         self._degraded = False
         try:
@@ -2257,13 +2290,39 @@ class JsonlWriter:
             if f is None:
                 f = open_private_new(self.out_dir / name)
                 self._files[name] = f
-            f.write(event.model_dump_json(exclude_none=True) + "\n")
+            line = event.model_dump_json(exclude_none=True) + "\n"
+            f.write(line)
             f.flush()
         except OSError as exc:
             _reraise_symlink_refusal(exc)
             self._degraded = True
             self.write_failures += 1
             _log_write_failure("jsonl_write_failed", exc, out_dir=str(self.out_dir))
+            return
+        if self.rotate_bytes:
+            self._written[name] = self._written.get(name, 0) + len(line.encode())
+            if self._written[name] >= self.rotate_bytes:
+                self._rotate(name)
+
+    def _rotate(self, name: str) -> None:
+        # Housekeeping, separate from the write: the event that triggered the roll
+        # is already on disk, so a failure here must never count it as dropped —
+        # the ledger only claims loss that happened. It still degrades: the active
+        # file was closed, and the O_EXCL reopen would mistake our own leftover for
+        # a symlink attack.
+        f = self._files.pop(name, None)
+        if f is not None:
+            with contextlib.suppress(OSError):
+                f.close()
+        self._written[name] = 0
+        seq = self._rolled.get(name, 0) + 1
+        try:
+            _roll_archive(self.out_dir / name, seq, self.rotate_keep)
+        except OSError as exc:
+            self._degraded = True
+            _log_write_failure("jsonl_rotate_failed", exc, out_dir=str(self.out_dir))
+            return
+        self._rolled[name] = seq
 
     def write_summary(self, summary: dict[str, Any]) -> None:
         try:
@@ -2295,8 +2354,12 @@ class PcapSink:
     # re-opened in tshark/Wireshark for the signals netmon deliberately does not
     # compute. Same owner-only (0600), symlink-refusing (CWE-59), degrade-not-crash
     # discipline as JsonlWriter; pairs with slice-08 rotation to stay bounded.
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, rotate_bytes: int = 0, rotate_keep: int = 10) -> None:
         self.path = path
+        self.rotate_bytes = rotate_bytes
+        self.rotate_keep = rotate_keep
+        self._written = 0
+        self._rolled = 0
         self.write_failures = 0
         self._degraded = False
         self._writer: PcapWriter | None = None
@@ -2323,6 +2386,7 @@ class PcapSink:
             self._degraded = True
             self.write_failures += 1
             _log_write_failure("pcap_write_failed", exc, path=str(self.path))
+            return
         except Exception as exc:
             # A packet scapy cannot serialize (a link type it never registered — Raw
             # frames from tun/tunnel captures or an exotic -r pcap raise KeyError before
@@ -2331,6 +2395,34 @@ class PcapSink:
             # the same malformed-packet discipline as PacketProcessor.process.
             self.write_failures += 1
             _log_write_failure("pcap_write_skipped", exc, path=str(self.path))
+            return
+        if self.rotate_bytes:
+            # wirelen is set on sniffed/replayed packets; the fallback serialize
+            # only runs for hand-built ones. The cap is approximate (per-record
+            # header overhead uncounted) — rotation needs a bound, not a byte.
+            self._written += 16 + (getattr(pkt, "wirelen", None) or len(bytes(pkt)))
+            if self._written >= self.rotate_bytes:
+                self._rotate()
+
+    def _rotate(self) -> None:
+        # Same ring discipline as JsonlWriter._rotate, and the same honesty rule:
+        # the packet that triggered the roll is already written, so a housekeeping
+        # failure degrades without counting it as dropped. The reopen keeps the
+        # O_EXCL|O_NOFOLLOW discipline — a pre-staged file/symlink at the canonical
+        # name must crash-stop (CWE-59), never masquerade as a full disk.
+        if self._writer is not None:
+            with contextlib.suppress(OSError):
+                self._writer.close()
+        self._written = 0
+        try:
+            _roll_archive(self.path, self._rolled + 1, self.rotate_keep)
+            self._rolled += 1
+            self._writer = PcapWriter(open_private_new_bytes(self.path))
+        except OSError as exc:
+            _reraise_symlink_refusal(exc)
+            self._degraded = True
+            self._writer = None
+            _log_write_failure("pcap_rotate_failed", exc, path=str(self.path))
 
     def close(self) -> None:
         if self._writer is not None:
@@ -2578,10 +2670,22 @@ def build_session(args: argparse.Namespace) -> Session:
     os.umask(0o077)
     out_dir = Path(args.output) / datetime.now().strftime("run-%Y%m%d-%H%M%S")
     processor = PacketProcessor(local_addresses(), redact_query=not args.keep_query)
+    # Clamp, never trust: a negative cap would roll on every write and a zero keep
+    # would delete each archive the moment it is created.
+    rotate_bytes = max(0, int(getattr(args, "rotate_mb", 0) or 0)) * 1_000_000
+    rotate_keep = max(1, int(getattr(args, "rotate_keep", 10) or 10))
     # persist_enabled() is True whenever --pcap is set, so the writer creates the run
     # dir before the pcap sink opens capture.pcap inside it.
-    writer: Writer = JsonlWriter(out_dir) if persist_enabled(args) else NullWriter()
-    pcap_sink = PcapSink(out_dir / "capture.pcap") if getattr(args, "pcap", False) else None
+    writer: Writer = (
+        JsonlWriter(out_dir, rotate_bytes=rotate_bytes, rotate_keep=rotate_keep)
+        if persist_enabled(args)
+        else NullWriter()
+    )
+    pcap_sink = (
+        PcapSink(out_dir / "capture.pcap", rotate_bytes=rotate_bytes, rotate_keep=rotate_keep)
+        if getattr(args, "pcap", False)
+        else None
+    )
     capture: Capture
     if args.read:
         capture = ReplayCapture(Path(args.read))
@@ -2746,6 +2850,18 @@ def _add_capture_flags(p: argparse.ArgumentParser) -> None:
         help="replay packets from a pcap file instead of capturing live",
     )
     p.add_argument("-o", "--output", default="logs", help="output directory (default: logs)")
+    p.add_argument(
+        "--rotate-mb",
+        type=int,
+        default=0,
+        help="roll each output file (JSONL and --pcap) at this many MB (0 = never)",
+    )
+    p.add_argument(
+        "--rotate-keep",
+        type=int,
+        default=10,
+        help="rolled archives kept per output file, oldest deleted (default: 10)",
+    )
     p.add_argument("-q", "--quiet", action="store_true", help="no per-event stdout logging")
     p.add_argument(
         "--pcap",
@@ -2880,17 +2996,22 @@ def _load_run_events(run_dir: Path, kind: str | None) -> Iterator[Event]:
     # must never crash on the record it is inspecting.
     names = {KIND_TO_FILE[kind]} if kind else set(KIND_TO_FILE.values())
     for name in sorted(names):
-        path = run_dir / name
-        if not path.exists():
-            continue
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    yield EVENT_ADAPTER.validate_json(line)
-                except ValueError:
-                    continue
+        # Rotation (--rotate-mb) rolls a kind's overflow into numbered archives
+        # beside the active file; the query reads them all as one record. Reads
+        # follow symlinks — a query runs unprivileged on the reader's own run dir,
+        # so the write-side CWE-59 discipline does not apply here.
+        stem, _, suffix = name.partition(".")
+        for path in [*_rotation_archives(run_dir, stem, suffix), run_dir / name]:
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        yield EVENT_ADAPTER.validate_json(line)
+                    except ValueError:
+                        continue
 
 
 def _event_time(ev: Event) -> datetime:
