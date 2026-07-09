@@ -1,4 +1,5 @@
 import argparse
+import errno
 import io
 import json
 import os
@@ -68,6 +69,7 @@ from netmon import (
     QuicReassembler,
     RateBucketer,
     ReplayCapture,
+    Session,
     TcpReassembler,
     TlsSniEvent,
     _client_stream_start,
@@ -80,6 +82,7 @@ from netmon import (
     event_direction,
     event_host,
     event_to_cells,
+    finalize,
     header_protection_mask,
     iso,
     main,
@@ -1260,6 +1263,19 @@ class TestLogFilePermissions:
             writer.write_summary({"packets": 1})
         assert victim.read_text() == "keep"
 
+    def test_event_write_still_refuses_symlinked_target(self, tmp_path: Path) -> None:
+        # The disk-full degrade path must not swallow the CWE-59 symlink refusal.
+        out = tmp_path / "run-x"
+        writer = JsonlWriter(out)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep")
+        (out / "dns.jsonl").symlink_to(victim)
+        ev = DnsQueryEvent(ts="t", src="a", dst="b", transport="udp", qname="x", qtype="A")
+        with pytest.raises(FileExistsError):
+            writer.write(ev)
+        assert victim.read_text() == "keep"
+        assert writer.write_failures == 0  # a security refusal is not a disk-full drop
+
 
 class TestHttpQueryRedaction:
     def _http_pkt(self, target: bytes) -> Packet:
@@ -1645,6 +1661,133 @@ class TestRunAgainstReplay:
         assert summary["events"]["dns_query"] == 1
         assert summary["events"]["tls_sni"] == 1
         assert (run_dir / "dns.jsonl").exists()
+
+
+class _FullDiskFile:
+    # A disk with no space left: every write raises the kernel's real ENOSPC
+    # OSError. A genuine file-object contract (incl. context manager, as
+    # open_private_new returns), no mocking framework.
+    def __init__(self) -> None:
+        self.closed = False
+
+    def write(self, _s: str) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self) -> "_FullDiskFile":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+class _FullDiskClosingFile(_FullDiskFile):
+    # Same, but a delayed-writeback error also surfaces at close() (some filesystems
+    # only report a full disk when the final buffered flush lands).
+    def close(self) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+class TestDiskFullResilience:
+    # The always-on recorder fills a disk with browsing history; a full disk must
+    # degrade the record honestly, never crash the run into a systemd restart loop.
+    def test_write_failure_degrades_without_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskFile())
+        writer = JsonlWriter(tmp_path / "run")
+        ev = DnsQueryEvent(ts="t", src="a", dst="b", transport="udp", qname="x.example", qtype="A")
+        writer.write(ev)  # must not raise despite ENOSPC
+        writer.write(ev)
+        assert writer.write_failures == 2
+
+    def test_summary_write_failure_does_not_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskFile())
+        writer = JsonlWriter(tmp_path / "run")
+        writer.write_summary({"ok": True})  # must not raise
+        writer.close()  # must not raise
+
+    def test_finalize_reports_dropped_events(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskFile())
+        proc = local_processor("192.168.1.50")
+        writer = JsonlWriter(tmp_path / "run")
+        for ev in proc.process(make_syn("192.168.1.50", "93.184.216.34", 51000, 443)):
+            writer.write(ev)
+        session = Session(tmp_path / "run", proc, writer, ReplayCapture(tmp_path / "x.pcap"))
+        summary = finalize(session)  # must not raise
+        assert summary["persistence"]["events_dropped"] >= 1
+
+    async def test_run_survives_a_full_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        pcap = tmp_path / "replay.pcap"
+        write_replay_pcap(pcap)
+        monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskFile())
+        args = argparse.Namespace(
+            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
+            quiet=True, keep_query=False,
+        )
+        await run(args)  # previously crashed on ENOSPC; must now complete cleanly
+
+    def test_degrade_survives_log_redirected_to_full_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `netmon run --log` redirects the diagnostic log onto the same (full) disk,
+        # so the degrade path's own log.error must not itself re-crash the run.
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskFile())
+        # a minimal fault-injecting stand-in for the redirected diagnostic log
+        configure_logging(stream=_FullDiskFile())  # type: ignore[arg-type]
+        try:
+            writer = JsonlWriter(tmp_path / "run")
+            ev = DnsQueryEvent(ts="t", src="a", dst="b", transport="udp", qname="x", qtype="A")
+            writer.write(ev)  # must not raise though logging the failure also fails
+            assert writer.write_failures == 1
+        finally:
+            configure_logging()
+
+    def test_run_dir_creation_on_full_disk_degrades_not_crashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A disk already full at startup: mkdir raises ENOSPC. The writer degrades to
+        # a no-op instead of crash-looping before the run can report anything.
+        def boom(self: Path, *_a: object, **_k: object) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(Path, "mkdir", boom)
+        writer = JsonlWriter(tmp_path / "run")  # must not raise
+        ev = DnsQueryEvent(ts="t", src="a", dst="b", transport="udp", qname="x", qtype="A")
+        writer.write(ev)
+        assert writer.write_failures == 1
+
+    def test_close_does_not_raise_on_full_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskClosingFile())
+        writer = JsonlWriter(tmp_path / "run")
+        ev = DnsQueryEvent(ts="t", src="a", dst="b", transport="udp", qname="x", qtype="A")
+        writer.write(ev)  # stores the handle, then the write fails -> degraded
+        writer.close()  # a buffered final flush also hits ENOSPC; must not raise
 
 
 class TestCoverageLedger:

@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 import base64
+import contextlib
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -1804,7 +1806,16 @@ def open_private_new(path: Path) -> TextIO:
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
+def _reraise_symlink_refusal(exc: OSError) -> None:
+    # The O_EXCL|O_NOFOLLOW refusal of a pre-staged file/symlink (CWE-59) surfaces
+    # as EEXIST/ELOOP. It must never be swallowed by the disk-full degrade path, so
+    # it re-raises here while ENOSPC and its kin fall through to be counted.
+    if exc.errno in (errno.EEXIST, errno.ELOOP):
+        raise exc
+
+
 class Writer(Protocol):
+    write_failures: int
     def write(self, event: Event) -> None: ...
     def write_summary(self, summary: dict[str, Any]) -> None: ...
     def close(self) -> None: ...
@@ -1813,35 +1824,75 @@ class Writer(Protocol):
 class JsonlWriter:
     # The run directory is the user's browsing history — keep it owner-only.
     def __init__(self, out_dir: Path) -> None:
-        # Strict create: refuse to adopt a pre-existing (possibly symlinked or
-        # foreign-owned) path — mkdir without exist_ok raises FileExistsError.
-        out_dir.parent.mkdir(parents=True, exist_ok=True)
-        out_dir.mkdir(mode=0o700)
-        out_dir.chmod(0o700)
         self.out_dir = out_dir
         self._files: dict[str, TextIO] = {}
+        self.write_failures = 0
+        self._degraded = False
+        try:
+            # Strict create: refuse to adopt a pre-existing (possibly symlinked or
+            # foreign-owned) path — mkdir without exist_ok raises FileExistsError.
+            out_dir.parent.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(mode=0o700)
+            out_dir.chmod(0o700)
+        except OSError as exc:
+            # A pre-existing or symlinked run dir (EEXIST/ELOOP) is a deliberate
+            # refusal and must propagate; a disk already full at startup instead
+            # degrades to a no-op writer, so the run still captures and reports its
+            # emptiness rather than crash-looping under systemd before it begins.
+            _reraise_symlink_refusal(exc)
+            self._degraded = True
+            self._log_suppressed("run_dir_create_failed", exc)
+
+    def _log_suppressed(self, event: str, exc: OSError) -> None:
+        # The --tui --log path redirects structlog onto a file inside the run dir —
+        # the same disk this writer uses — so logging a write failure can itself hit
+        # ENOSPC. The failure report must never re-crash the run it exists to keep up.
+        with contextlib.suppress(OSError):
+            log.error(event, error=str(exc), out_dir=str(self.out_dir))
 
     def write(self, event: Event) -> None:
-        name = KIND_TO_FILE[event.kind]
-        f = self._files.get(name)
-        if f is None:
-            f = open_private_new(self.out_dir / name)
-            self._files[name] = f
-        f.write(event.model_dump_json(exclude_none=True) + "\n")
-        f.flush()
+        # A full disk (the always-on recorder's own failure mode: it fills the disk
+        # with history) must degrade the record, not crash the run into a systemd
+        # restart loop. On the first OSError we stop writing and count every dropped
+        # event, so `persistence.events_dropped` in the summary marks the record as
+        # incomplete — an honest gap, not a silent one. Degrade is one-way: retrying
+        # each event under sustained ENOSPC would only churn exceptions.
+        if self._degraded:
+            self.write_failures += 1
+            return
+        try:
+            name = KIND_TO_FILE[event.kind]
+            f = self._files.get(name)
+            if f is None:
+                f = open_private_new(self.out_dir / name)
+                self._files[name] = f
+            f.write(event.model_dump_json(exclude_none=True) + "\n")
+            f.flush()
+        except OSError as exc:
+            _reraise_symlink_refusal(exc)
+            self._degraded = True
+            self.write_failures += 1
+            self._log_suppressed("jsonl_write_failed", exc)
 
     def write_summary(self, summary: dict[str, Any]) -> None:
-        with open_private_new(self.out_dir / "summary.json") as f:
-            f.write(json.dumps(summary, indent=2))
+        try:
+            with open_private_new(self.out_dir / "summary.json") as f:
+                f.write(json.dumps(summary, indent=2))
+        except OSError as exc:
+            _reraise_symlink_refusal(exc)
+            self._log_suppressed("summary_write_failed", exc)
 
     def close(self) -> None:
         for f in self._files.values():
-            f.close()
+            with contextlib.suppress(OSError):
+                f.close()  # a buffered final flush can itself hit ENOSPC
 
 
 class NullWriter:
     # Ephemeral capture (`netmon run` without --log): stream to the live TUI only,
     # never touch disk — the DNS/TLS/HTTP record stays in memory and evaporates.
+    write_failures = 0
+
     def write(self, event: Event) -> None: ...
     def write_summary(self, summary: dict[str, Any]) -> None: ...
     def close(self) -> None: ...
@@ -2157,6 +2208,10 @@ def finalize(session: Session) -> dict[str, Any]:
             "unavailable" if st.kernel_delivered is None else st.kernel_delivered
         ),
     }
+    # A non-zero events_dropped means the record could not be fully written (a full
+    # disk, a read-only remount, a quota) and is incomplete — surfaced so a truncated
+    # log is never mistaken for a quiet one. The precise cause is in the error log.
+    summary["persistence"] = {"events_dropped": session.writer.write_failures}
     session.writer.write_summary(summary)
     session.writer.close()
     return summary

@@ -56,6 +56,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The always-on recorder survives a full disk.** Writing the JSONL record and the
+  exit summary was unguarded, so an `ENOSPC` on the disk the recorder itself fills
+  with history propagated out of the capture loop and crashed the run — which, under
+  the systemd unit's `Restart=on-failure`, became a crash loop. The writer now
+  degrades instead: the first write error stops persistence (a one-way latch — no
+  churn retrying a full disk), every subsequent event is counted, and the run keeps
+  capturing so the live view and coverage ledger stay up. This holds for both the
+  headless recorder and interactive `netmon run --log` (whose diagnostic log lives on
+  the same disk — the degrade path's own error logging is now failure-tolerant), and
+  a disk already full at startup degrades to a no-op writer rather than crashing
+  before the run begins. The exit summary carries `persistence.events_dropped`, so a
+  truncated record is visibly incomplete rather than a silent gap. The
+  `O_EXCL|O_NOFOLLOW` symlink refusal (CWE-59) is re-raised, never swallowed by the
+  degrade path.
+
 - **Silent packet drops no longer masquerade as "no disclosure".** The coverage
   ledger's promise is that a clean log is never a silent gap, but two classes of
   undecodable traffic slipped through it. An IP/IPv6 fragment was tallied as

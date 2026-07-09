@@ -21,3 +21,16 @@ def _utc_timezone():
         else:
             os.environ["TZ"] = saved
         time.tzset()
+
+
+@pytest.fixture(autouse=True)
+def _restore_umask():
+    # build_session sets a process-global umask(0o077); without restoring it, a test
+    # that constructs a session leaks the mask into later file-mode assertions and
+    # makes the suite order-dependent. Snapshot and restore around every test.
+    saved = os.umask(0o077)
+    os.umask(saved)
+    try:
+        yield
+    finally:
+        os.umask(saved)
