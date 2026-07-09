@@ -77,6 +77,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A TLS flow's continuation is no longer misrouted to the DNS reassembler.** The
+  client-stream router re-classified every segment independently, so once the TLS
+  reassembler owned a flow, a later segment that happened to begin like a DNS-over-TCP
+  length prefix (e.g. a multi-record ClientHello whose second record starts `0x16 0x03`)
+  was handed to the DNS reassembler instead, losing the SNI. A flow already tracked by
+  the TLS reassembler now stays on the TLS path.
 - **A multi-record TLS ClientHello now parses to its true SNI/ALPN.** A ClientHello
   over the 16384-byte TLS record limit (post-quantum key shares increasingly force
   this) is fragmented across two or more handshake records; `parse_client_hello` read

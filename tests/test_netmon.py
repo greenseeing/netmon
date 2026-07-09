@@ -76,6 +76,7 @@ from netmon import (
     TcpReassembler,
     TlsSniEvent,
     _client_stream_start,
+    _dns_tcp_start,
     _legacy_parser,
     _parse_run_args,
     _reassemble,
@@ -3223,6 +3224,22 @@ class TestDnsTcpVsTlsRouting:
         answers = [e for e in proc.process(seg2) if isinstance(e, DnsAnswerEvent)]
         assert len(answers) == 1
         assert answers[0].rtype == "TXT"
+
+    def test_tls_tracked_flow_keeps_continuation_that_looks_like_dns(self) -> None:
+        # Once the TLS reassembler owns a flow, a continuation segment that happens to
+        # begin like a DNS-over-TCP length prefix (a multi-record ClientHello whose
+        # second record starts 0x16 0x03) must stay on the TLS path, not be re-routed
+        # to the DNS reassembler and lose the SNI.
+        proc = local_processor("192.168.1.50")
+        payload = two_record_client_hello(b"boundary.example.com", alpn_extension(b"h2"))
+        first, second = payload[:16389], payload[16389:]  # split exactly at the record edge
+        assert _client_stream_start(first) and not _client_stream_start(second)
+        assert _dns_tcp_start(second)  # the collision that used to misroute it
+        proc.process(tcp_segment(first, flags="A", seq=BASE_SEQ))
+        done = proc.process(tcp_segment(second, flags="PA", seq=BASE_SEQ + len(first)))
+        sni = [e for e in done if isinstance(e, TlsSniEvent)]
+        assert len(sni) == 1
+        assert sni[0].sni == "boundary.example.com"
 
 
 TS = "2025-07-02T23:46:40.123+00:00"

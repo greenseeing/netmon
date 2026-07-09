@@ -1244,6 +1244,9 @@ class TcpReassembler:
         self._pending: OrderedDict[FlowKey, dict[int, bytes]] = OrderedDict()
         self._pending_total = 0
 
+    def tracks(self, key: FlowKey) -> bool:
+        return key in self._flows
+
     def add(self, key: FlowKey, seq: int, payload: bytes) -> bytes:
         stream = self._flows.get(key)
         if stream is None:
@@ -1650,7 +1653,9 @@ class PacketProcessor:
                 # Length-prefixed DNS on a client- or server-side stream reassembles
                 # separately; everything else feeds the TLS/HTTP reassembler.
                 if self.dns_tcp.tracks(key) or (
-                    not _client_stream_start(payload) and _dns_tcp_start(payload)
+                    not self.reassembler.tracks(key)
+                    and not _client_stream_start(payload)
+                    and _dns_tcp_start(payload)
                 ):
                     for body in self.dns_tcp.add(key, int(tcp.seq), payload):
                         dns = parse_dns_message(body)
