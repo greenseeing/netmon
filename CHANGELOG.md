@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Operator-path test coverage** — the trust-critical CLI and capture paths a
+  regression could silently break now have focused tests: `LiveCapture`'s
+  enqueue path and `userspace_dropped` counter under queue overflow (with the
+  stop-drain race pinned), every `netmon update` refusal/error/restart branch
+  and `netmon service` branch (subprocess/systemctl faked at the boundary), the
+  capture-privilege check, the `--tui` non-tty guard, `build_session`'s live
+  branch, `stats_loop`, and `announce_start`.
 - **systemd sandbox hardening** — the recorder unit (install.sh and RUNBOOK, kept
   in sync) adds the modern defence-in-depth set for a long-lived raw-socket
   process storing browsing history: `RestrictAddressFamilies` (AF_PACKET capture,
@@ -126,6 +133,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Shutdown no longer silently loses the last packets.** A packet handed over by
+  the sniffer thread while shutdown blocked in `join()` scheduled its enqueue too
+  late for the post-stop drain and was lost without being counted. The capture
+  loop now gives the event loop one turn after the sniffer stops, so raced-in
+  packets are drained (found by the new stop-drain test).
 - **A TLS flow's continuation is no longer misrouted to the DNS reassembler.** The
   client-stream router re-classified every segment independently, so once the TLS
   reassembler owned a flow, a later segment that happened to begin like a DNS-over-TCP

@@ -2518,6 +2518,11 @@ class LiveCapture:
                 except TimeoutError:
                     continue
             sniffer.stop(join=True)
+            # A packet handed over while join() blocked the loop thread scheduled
+            # its enqueue via call_soon_threadsafe but could not run it; give the
+            # loop one turn so those land, or they are lost after the drain —
+            # silently, since an uncontended put_nowait counts no drop.
+            await asyncio.sleep(0)
             while not self._queue.empty():  # packets that raced in during stop
                 yield self._queue.get_nowait()
         finally:
@@ -2717,9 +2722,9 @@ def log_event(event: Event) -> None:
     log.info(event.kind, **event.model_dump(exclude={"kind"}, exclude_none=True))
 
 
-async def stats_loop(session: Session) -> None:
+async def stats_loop(session: Session, interval: float = 30.0) -> None:
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(interval)
         st = session.capture.stats()
         log.info(
             "stats",

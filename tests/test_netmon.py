@@ -5,7 +5,10 @@ import io
 import json
 import os
 import random
+import shutil
 import struct
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +58,7 @@ from netmon import (
     RA_RDNSS_NAME,
     ArpEvent,
     BoundedCounter,
+    CaptureStats,
     DashboardModel,
     DnsAnswerEvent,
     DnsEcsEvent,
@@ -88,6 +92,11 @@ from netmon import (
     _reassemble,
     _run_parser,
     _server_stream_start,
+    announce_start,
+    build_session,
+    check_capture_privileges,
+    cmd_service,
+    cmd_update,
     configure_logging,
     derive_initial_keys,
     event_detail,
@@ -108,6 +117,7 @@ from netmon import (
     refresh_local_ips_loop,
     remote_scope,
     run,
+    stats_loop,
 )
 
 PKT_TIME = 1751500000.123
@@ -968,6 +978,349 @@ class TestOutputRotation:
         assert session.pcap_sink.rotate_bytes == 5_000_000
         session.writer.close()
         session.pcap_sink.close()
+
+
+def _completed(argv: list[str], rc: int, out: str = "", err: str = "") -> Any:
+    return subprocess.CompletedProcess(argv, rc, out, err)
+
+
+class TestLiveCaptureQueue:
+    async def test_enqueue_overflow_counts_userspace_drops_and_stop_drains(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The sniffer thread hands packets to the loop via call_soon_threadsafe;
+        # a full queue must count the drop (the stats/summary line every operator
+        # reads) and never block, and stop must still drain what was queued.
+        import netmon
+
+        sent = [make_syn("192.168.1.50", "93.184.216.34", 40000 + i, 443) for i in range(5)]
+        straggler = make_syn("192.168.1.50", "93.184.216.34", 49999, 443)
+
+        class FakeSniffer:
+            running = True
+
+            def __init__(self, opened_socket: dict[Any, str], prn: Any, store: bool) -> None:
+                self.prn = prn
+
+            def start(self) -> None:
+                for pkt in sent:
+                    self.prn(pkt)
+
+            def stop(self, join: bool = True) -> None:
+                # The real sniffer thread can hand over a last packet while the
+                # loop thread blocks in join(): its enqueue callback only lands
+                # after control returns to the event loop — the exact race the
+                # post-stop drain exists for.
+                self.running = False
+                self.prn(straggler)
+
+        class FakeSock:
+            def close(self) -> None: ...
+
+        monkeypatch.setattr(netmon, "AsyncSniffer", FakeSniffer)
+        monkeypatch.setattr(
+            netmon.conf, "L2listen", lambda iface, filter, promisc: FakeSock(), raising=False
+        )
+        cap = LiveCapture(["fake0"], None, queue_size=2)
+        received = []
+        async with asyncio.timeout(5):  # a delivery regression must fail, not hang CI
+            async for pkt in cap.packets():
+                received.append(pkt)
+                if len(received) == 2:
+                    cap.stop()
+        assert received == [*sent[:2], straggler]  # queued arrive in order; stop drains
+        assert cap.stats().userspace_dropped == 3  # the overflow is counted, not hidden
+
+
+class TestCmdUpdate:
+    def _which(self, *, systemctl: bool = True) -> Any:
+        return lambda name: (
+            None if (name == "systemctl" and not systemctl) else f"/usr/bin/{name}"
+        )
+
+    def test_refuses_when_git_or_uv_missing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        assert cmd_update([]) == 1
+        assert "needs both git and uv" in capsys.readouterr().err
+
+    def test_refuses_outside_a_git_checkout(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which())
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            assert "--is-inside-work-tree" in argv
+            return _completed(argv, 128, err="fatal: not a git repository")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 1
+        assert "not a git checkout" in capsys.readouterr().err
+
+    def test_refuses_a_dirty_working_tree(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which())
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out=" M netmon.py\n")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 1
+        assert "working tree has local changes" in capsys.readouterr().err
+
+    def test_reports_a_failed_ff_only_pull(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which())
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            if "pull" in argv:
+                return _completed(argv, 1, err="fatal: Not possible to fast-forward")
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 1
+        assert "fast-forward" in capsys.readouterr().err
+
+    def test_reports_a_failed_uv_sync(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which())
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            if argv[0] == "/usr/bin/uv":
+                return _completed(argv, 1)
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 1
+        assert "uv sync failed" in capsys.readouterr().err
+
+    def test_restarts_an_active_service_and_reports_revisions(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which())
+        revisions = iter(["aaa1111", "bbb2222"])
+        restarted: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            if "restart" in argv:
+                restarted.append(argv)
+                return _completed(argv, 0)
+            if "is-active" in argv:
+                return _completed(argv, 0)
+            if "--short" in argv:
+                return _completed(argv, 0, out=next(revisions) + "\n")
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        out = capsys.readouterr().out
+        assert restarted == [["/usr/bin/systemctl", "restart", "netmon.service"]]
+        assert "restarted netmon.service" in out
+        assert "netmon updated aaa1111 -> bbb2222" in out
+
+    def test_already_up_to_date_without_systemd(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which(systemctl=False))
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            assert "systemctl" not in argv[0]  # no restart path without systemd
+            if "--short" in argv:
+                return _completed(argv, 0, out="aaa1111\n")
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        assert "already up to date (aaa1111)" in capsys.readouterr().out
+
+
+class TestCmdService:
+    def test_unknown_action_prints_usage_and_exits_2(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert cmd_service(["frobnicate"]) == 2
+        assert "usage: netmon service" in capsys.readouterr().err
+
+    def test_no_action_prints_usage_and_exits_2(self) -> None:
+        assert cmd_service([]) == 2
+
+    def test_missing_systemd_exits_1(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        assert cmd_service(["status"]) == 1
+        assert "systemd not available" in capsys.readouterr().err
+
+    def _recording_run(self, calls: list[list[str]], rc: int) -> Any:
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            calls.append(argv)
+            return _completed(argv, rc)
+
+        return fake_run
+
+    def test_logs_follows_the_unit_journal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[list[str]] = []
+        monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(subprocess, "run", self._recording_run(calls, 0))
+        assert cmd_service(["logs"]) == 0
+        assert calls == [["/usr/bin/journalctl", "-u", "netmon.service", "-f"]]
+
+    def test_action_passes_through_and_propagates_the_exit_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[list[str]] = []
+        monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(subprocess, "run", self._recording_run(calls, 3))
+        assert cmd_service(["restart"]) == 3
+        assert calls == [["/usr/bin/systemctl", "restart", "netmon.service"]]
+
+
+class TestCliGuards:
+    def test_tui_without_a_tty_exits_2(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `netmon run` implies the TUI; with a non-tty stdin the guard must refuse
+        # before any capture/privilege work. Pinned explicitly so the test never
+        # depends on how pytest was invoked (-s would hand it the real tty).
+        monkeypatch.setattr(sys, "stdin", io.StringIO())
+        with pytest.raises(SystemExit) as exc:
+            main(["run"])
+        assert exc.value.code == 2
+        assert "interactive terminal" in capsys.readouterr().err
+
+    def test_privilege_check_exits_1_when_raw_sockets_are_denied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        def deny(*a: Any, **k: Any) -> Any:
+            raise PermissionError
+
+        monkeypatch.setattr(netmon.socket, "socket", deny)
+        with pytest.raises(SystemExit) as exc:
+            check_capture_privileges()
+        assert exc.value.code == 1
+
+    def test_privilege_check_passes_when_raw_sockets_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        class Ok:
+            def __init__(self, *a: Any, **k: Any) -> None: ...
+            def close(self) -> None: ...
+
+        monkeypatch.setattr(netmon.socket, "socket", Ok)
+        check_capture_privileges()  # must not raise
+
+
+class TestBuildSessionLive:
+    def test_live_capture_opens_all_working_ifaces(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import netmon
+
+        monkeypatch.setattr(
+            netmon,
+            "get_working_ifaces",
+            lambda: [argparse.Namespace(name="eth0"), argparse.Namespace(name="wlan0")],
+        )
+        args = _legacy_parser().parse_args(["-o", str(tmp_path)])
+        session = build_session(args)
+        assert isinstance(session.capture, LiveCapture)
+        assert session.capture.ifaces == ["eth0", "wlan0"]
+        session.writer.close()
+
+    def test_iface_flag_narrows_the_capture(self, tmp_path: Path) -> None:
+        args = _legacy_parser().parse_args(["-o", str(tmp_path), "-i", "wlan0"])
+        session = build_session(args)
+        assert isinstance(session.capture, LiveCapture)
+        assert session.capture.ifaces == ["wlan0"]
+        session.writer.close()
+
+
+class TestStatsAndAnnounce:
+    async def test_stats_loop_polls_capture_stats_on_its_cadence(self) -> None:
+        class FakeCapture:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            def stats(self) -> CaptureStats:
+                self.polls += 1
+                return CaptureStats(0, 0, None, None)
+
+            def stop(self) -> None: ...
+            def packets(self) -> Any: ...
+
+        fake = FakeCapture()
+        session = Session(Path("unused"), local_processor(), NullWriter(), fake)
+        task = asyncio.create_task(stats_loop(session, interval=0.01))
+        try:
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if fake.polls >= 2:
+                    break
+        finally:
+            task.cancel()
+        assert fake.polls >= 2
+
+    def test_announce_replay_logs_the_evidence_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Capture the structured events directly; reconfiguring structlog inside a
+        # test would bind it to pytest's transient captured stdout for good.
+        import netmon
+
+        records: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            netmon, "log", argparse.Namespace(info=lambda ev, **kw: records.append((ev, kw)))
+        )
+        args = _legacy_parser().parse_args(["-r", "x.pcap", "-o", str(tmp_path)])
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        sink = PcapSink(run_dir / "capture.pcap")
+        session = Session(
+            run_dir, local_processor(), NullWriter(), ReplayCapture(Path("x.pcap")), sink
+        )
+        announce_start(args, session)
+        sink.close()
+        assert records[0][0] == "replay_started"
+        assert str(records[0][1]["evidence"]).endswith("capture.pcap")
+
+    def test_announce_live_logs_ifaces_and_local_ips(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import netmon
+
+        records: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            netmon, "log", argparse.Namespace(info=lambda ev, **kw: records.append((ev, kw)))
+        )
+        args = _legacy_parser().parse_args(["-o", str(tmp_path)])
+        session = Session(
+            tmp_path / "run",
+            local_processor("192.168.1.50"),
+            NullWriter(),
+            LiveCapture(["eth0"], None),
+        )
+        announce_start(args, session)
+        assert records[0][0] == "capture_started"
+        assert records[0][1]["ifaces"] == ["eth0"]
+        assert records[0][1]["local_ips"] == ["192.168.1.50"]
 
 
 class TestTunnelAndNonEthernet:
