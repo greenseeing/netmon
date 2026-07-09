@@ -2331,7 +2331,7 @@ def dns_tcp_segments(msg: Packet, split_at: int, base_seq: int = 5000) -> list[P
         / msg
     )
     wire = bytes(Ether(bytes(full))[TCP].payload)
-    out = []
+    out: list[Packet] = []
     for i, (start, chunk) in enumerate([(0, wire[:split_at]), (split_at, wire[split_at:])]):
         seg = (
             Ether()
@@ -2835,7 +2835,12 @@ class TestCliDispatch:
         import netmon
 
         seen: list[list[str]] = []
-        monkeypatch.setattr(netmon, "cmd_update", lambda a: (seen.append(a), 3)[1])
+
+        def fake_update(a: list[str]) -> int:
+            seen.append(a)
+            return 3
+
+        monkeypatch.setattr(netmon, "cmd_update", fake_update)
         with pytest.raises(SystemExit) as exc:
             main(["update", "--force"])
         assert exc.value.code == 3
