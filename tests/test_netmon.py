@@ -1783,6 +1783,18 @@ class TestRunAgainstReplay:
         assert summary["events"]["tls_sni"] == 1
         assert (run_dir / "dns.jsonl").exists()
 
+    async def test_missing_pcap_exits_cleanly_without_run_dir(self, tmp_path: Path) -> None:
+        # A wrong -r path must fail with a clean exit, not crash the reader mid-run
+        # with a traceback and leave an empty run directory behind.
+        args = argparse.Namespace(
+            read=str(tmp_path / "nope.pcap"), iface=None, bpf=None,
+            output=str(tmp_path / "logs"), quiet=True, keep_query=False,
+        )
+        with pytest.raises(SystemExit) as exc:
+            await run(args)
+        assert exc.value.code == 1
+        assert not (tmp_path / "logs").exists()  # no run dir created for a bad path
+
 
 class _FullDiskFile:
     # A disk with no space left: every write raises the kernel's real ENOSPC

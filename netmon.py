@@ -2292,6 +2292,12 @@ def finalize(session: Session) -> dict[str, Any]:
 
 
 async def run(args: argparse.Namespace) -> None:
+    read = getattr(args, "read", None)
+    if read and not Path(read).is_file():
+        # A missing -r target must fail cleanly before any run dir is created, not
+        # crash the pcap reader mid-run with a traceback.
+        log.error("pcap_not_found", path=read, hint="check the -r/--read path")
+        sys.exit(1)
     session = build_session(args)
     tui = getattr(args, "tui", False)  # Namespace in tests may lack .tui — never bare-access
     if not tui:

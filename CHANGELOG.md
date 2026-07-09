@@ -56,6 +56,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A missing `-r` pcap fails cleanly instead of crashing.** Pointing `netmon -r`
+  at a nonexistent file crashed the pcap reader mid-run with a Python traceback,
+  after already creating an empty run directory. The path is now validated up front:
+  a missing capture file logs `pcap_not_found` and exits 1 without creating a run
+  directory.
+
 - **Flow direction and scope read the address class, not just this host's IPs.** A
   connection was `outbound`/`inbound` only when one end was a configured local IP,
   otherwise `transit` — so a loopback or LAN-to-LAN connection was emitted **twice**
