@@ -77,6 +77,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Reassembler eviction is per-flow LRU, not clear-all.** When the total byte cap
+  was exceeded, `TcpReassembler`, `DnsTcpReassembler`, and `QuicReassembler` wiped
+  *every* in-flight stream at once, dropping many SNIs together — and for QUIC this
+  was attacker-triggerable, since Initial keys are publicly derivable, so a flood of
+  distinct connection IDs forced periodic full wipes that discarded legitimate
+  multi-Initial (post-quantum) ClientHellos mid-reassembly. Eviction now ages out the
+  least-recently-updated streams until back under cap (the `LruSet`/`NameLedger`
+  pattern), so a burst evicts idle streams while the connection being processed
+  survives; each eviction still increments the coverage `evicted.*_streams` counter.
 - **TcpReassembler tolerates reordered and overlapping segments.** The client→server
   reassembler (TLS ClientHello / HTTP request head) previously dropped a ClientHello
   whose *second* segment was captured before its opening one, and could truncate the

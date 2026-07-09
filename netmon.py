@@ -844,6 +844,43 @@ def _reassemble_merged(chunks: dict[int, bytes]) -> bytes:
     return bytes(out)
 
 
+def _crypto_size(buf: dict[int, bytes]) -> int:
+    return sum(len(v) for v in buf.values())
+
+
+class _HasSize(Protocol):
+    size: int
+
+
+def _stream_size(stream: _HasSize) -> int:
+    return stream.size
+
+
+def _evict_oldest[K, S](
+    streams: OrderedDict[K, S],
+    total: int,
+    total_cap: int,
+    size: Callable[[S], int],
+    max_items: int | None = None,
+) -> tuple[int, int]:
+    # Evict least-recently-updated streams until back within the byte (and optional
+    # count) cap, matching the LruSet/NameLedger pattern the rest of the codebase uses:
+    # a burst of new streams ages out idle ones instead of wiping every in-flight
+    # ClientHello/CRYPTO stream at once (which dropped many SNIs together, and for QUIC
+    # was attacker-triggerable via publicly-derivable Initial keys). The most-recently-
+    # touched stream — the one being processed — is at the tail and always kept: eviction
+    # pops from the front and stops at the last entry. Returns the new total and the
+    # number evicted, which the caller folds into its `cleared` coverage counter.
+    evicted = 0
+    while len(streams) > 1 and (
+        total > total_cap or (max_items is not None and len(streams) > max_items)
+    ):
+        _, old = streams.popitem(last=False)
+        total -= size(old)
+        evicted += 1
+    return total, evicted
+
+
 class QuicReassembler:
     # Decrypt QUIC Initial packets and reassemble the CRYPTO stream (keyed by
     # the client's Destination Connection ID) until the ClientHello is whole.
@@ -854,12 +891,15 @@ class QuicReassembler:
     def __init__(
         self, max_conns: int = 2048, per_conn_cap: int = 65536, total_cap: int = 8_000_000
     ) -> None:
+        # A single stream can grow to per_conn_cap, so the total budget must hold at
+        # least one; otherwise LRU could never bring a lone oversized stream under cap.
+        assert total_cap >= per_conn_cap, "total_cap must hold at least one per-conn buffer"
         self.max_conns = max_conns
         self.per_conn_cap = per_conn_cap
         self.total_cap = total_cap
         self.cleared = 0
         self.decrypt_failures = 0
-        self._crypto: dict[bytes, dict[int, bytes]] = {}
+        self._crypto: OrderedDict[bytes, dict[int, bytes]] = OrderedDict()
         self._total = 0
 
     def add(self, datagram: bytes) -> TlsClientHello | None:
@@ -888,6 +928,7 @@ class QuicReassembler:
         if not fragments:
             return None
         buf = self._crypto.setdefault(pkt.dcid, {})
+        self._crypto.move_to_end(pkt.dcid)  # this connection is the one being processed
         conn_size = sum(len(v) for v in buf.values())
         for offset, chunk in fragments:
             if offset not in buf and conn_size < self.per_conn_cap and self._total < self.total_cap:
@@ -898,10 +939,10 @@ class QuicReassembler:
         if hello is not None:
             self._total -= sum(len(v) for v in buf.values())
             self._crypto.pop(pkt.dcid, None)
-        elif len(self._crypto) > self.max_conns or self._total > self.total_cap:
-            self.cleared += len(self._crypto)
-            self._crypto.clear()
-            self._total = 0
+        self._total, evicted = _evict_oldest(
+            self._crypto, self._total, self.total_cap, _crypto_size, self.max_conns
+        )
+        self.cleared += evicted
         return hello
 
 
@@ -1161,11 +1202,14 @@ class TcpReassembler:
     def __init__(
         self, per_flow_cap: int = 65536, total_cap: int = 4_000_000, pending_cap: int = 262144
     ) -> None:
+        # A single stream can grow to per_flow_cap, so the total budget must hold at
+        # least one; otherwise LRU could never bring a lone oversized stream under cap.
+        assert total_cap >= per_flow_cap, "total_cap must hold at least one per-flow buffer"
         self.per_flow_cap = per_flow_cap
         self.total_cap = total_cap
         self.pending_cap = pending_cap
         self.cleared = 0
-        self._flows: dict[FlowKey, _Stream] = {}
+        self._flows: OrderedDict[FlowKey, _Stream] = OrderedDict()
         self._total = 0
         # Segments seen before their flow's opening ClientHello/HTTP segment: a capture
         # that reorders the first two segments would otherwise drop the pre-anchor bytes
@@ -1190,11 +1234,11 @@ class TcpReassembler:
             self._absorb_pending(key, stream)
         else:
             self._store(stream, seq, payload)
-        if self._total > self.total_cap:
-            self.cleared += len(self._flows)
-            self._flows.clear()
-            self._total = 0
-            return b""
+        self._flows.move_to_end(key)  # this stream is the one being processed
+        self._total, evicted = _evict_oldest(
+            self._flows, self._total, self.total_cap, _stream_size
+        )
+        self.cleared += evicted
         return _reassemble_merged(stream.chunks)
 
     def _store(self, stream: _Stream, seq: int, payload: bytes) -> None:
@@ -1259,10 +1303,13 @@ class DnsTcpReassembler:
     # window at the cap and never complete; 128 KiB holds one such message plus
     # out-of-order slack while still bounding a stalled or hostile stream.
     def __init__(self, per_flow_cap: int = 131072, total_cap: int = 4_000_000) -> None:
+        # A single stream can grow to per_flow_cap, so the total budget must hold at
+        # least one; otherwise LRU could never bring a lone oversized stream under cap.
+        assert total_cap >= per_flow_cap, "total_cap must hold at least one per-flow buffer"
         self.per_flow_cap = per_flow_cap
         self.total_cap = total_cap
         self.cleared = 0
-        self._flows: dict[FlowKey, _DnsStream] = {}
+        self._flows: OrderedDict[FlowKey, _DnsStream] = OrderedDict()
         self._total = 0
 
     def tracks(self, key: FlowKey) -> bool:
@@ -1275,17 +1322,17 @@ class DnsTcpReassembler:
                 return []
             stream = _DnsStream(seq)
             self._flows[key] = stream
+        self._flows.move_to_end(key)  # this stream is the one being processed
         offset = seq - stream.base
         if offset >= 0 and offset not in stream.chunks and stream.size < self.per_flow_cap:
             chunk = payload[: self.per_flow_cap - stream.size]
             stream.chunks[offset] = chunk
             stream.size += len(chunk)
             self._total += len(chunk)
-            if self._total > self.total_cap:
-                self.cleared += len(self._flows)
-                self._flows.clear()
-                self._total = 0
-                return []
+            self._total, evicted = _evict_oldest(
+                self._flows, self._total, self.total_cap, _stream_size
+            )
+            self.cleared += evicted
         assembled = _reassemble(stream.chunks)
         messages, consumed = self._complete_messages(assembled)
         if consumed:

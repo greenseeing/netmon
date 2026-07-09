@@ -393,18 +393,35 @@ class TestTcpReassembler:
         r.add(key, 0, CH_RECORD_HEADER + b"\x00" * 50)
         assert r._flows[key].size == 10
 
-    def test_total_cap_evicts_all_buffers(self) -> None:
-        r = TcpReassembler(per_flow_cap=100, total_cap=30)
-        r.add(("a", 1, "b", 2), 0, CH_RECORD_HEADER + b"\x00" * 19)
-        r.add(("c", 3, "d", 4), 0, CH_RECORD_HEADER + b"\x00" * 19)
-        assert r._flows == {}
-        assert r._total == 0
+    def test_total_cap_evicts_oldest_keeps_newest(self) -> None:
+        # Over the byte cap evicts the least-recently-updated stream, not every one:
+        # the newest (in-progress) stream survives a burst instead of being wiped.
+        r = TcpReassembler(per_flow_cap=25, total_cap=40)
+        old, new = ("a", 1, "b", 2), ("c", 3, "d", 4)
+        r.add(old, 0, CH_RECORD_HEADER + b"\x00" * 19)  # 25 bytes
+        r.add(new, 0, CH_RECORD_HEADER + b"\x00" * 19)  # total 50 > 30 -> evict oldest
+        assert old not in r._flows
+        assert new in r._flows
+        assert r._total == r._flows[new].size
 
-    def test_total_cap_clear_counts_wiped_streams(self) -> None:
-        r = TcpReassembler(per_flow_cap=100, total_cap=30)
+    def test_eviction_counts_only_the_streams_evicted(self) -> None:
+        r = TcpReassembler(per_flow_cap=25, total_cap=40)
         r.add(("a", 1, "b", 2), 0, CH_RECORD_HEADER + b"\x00" * 19)
         r.add(("c", 3, "d", 4), 0, CH_RECORD_HEADER + b"\x00" * 19)
-        assert r.cleared == 2
+        assert r.cleared == 1  # only the oldest, not a full wipe
+
+    def test_recently_updated_stream_survives_a_burst(self) -> None:
+        # A stream refreshed just before a burst of new ones survives while an older
+        # idle stream ages out — the whole point of LRU over clear-all.
+        r = TcpReassembler(per_flow_cap=35, total_cap=60)
+        hot, idle, burst = ("h", 1, "x", 2), ("a", 1, "x", 2), ("b", 1, "x", 2)
+        r.add(hot, 0, CH_RECORD_HEADER + b"\x00" * 19)  # 25
+        r.add(idle, 0, CH_RECORD_HEADER + b"\x00" * 19)  # 25, total 50
+        r.add(hot, 25, b"\xaa" * 10)  # refresh hot -> most recent; total 60
+        r.add(burst, 0, CH_RECORD_HEADER + b"\x00" * 19)  # total 85 > 60 -> evict oldest (idle)
+        assert idle not in r._flows
+        assert hot in r._flows
+        assert burst in r._flows
 
     def test_drop_removes_buffer_and_reclaims_total(self) -> None:
         r = TcpReassembler()
@@ -631,6 +648,38 @@ class TestQuicSniExtraction:
         hello = reasm.add(second)
         assert hello is not None
         assert hello.sni == "big.example.com"
+
+    def test_flood_of_distinct_dcids_evicts_oldest_not_all(self) -> None:
+        # Initial keys are publicly derivable, so a flood of distinct DCIDs is
+        # attacker-triggerable. LRU ages out the oldest connections, keeping the newest
+        # and counting each eviction, instead of periodically wiping every in-flight one.
+        r = QuicReassembler(max_conns=3)
+        partial = crypto_frame(handshake_message(b"x.example.com", padding_extension(2000))[:100])
+        dcids = [bytes([i]) + b"\x00" * 7 for i in range(5)]
+        for dcid in dcids:
+            assert r.add(encrypt_initial(dcid, partial)) is None  # never completes
+        assert len(r._crypto) <= 3
+        assert dcids[-1] in r._crypto  # newest survives
+        assert dcids[0] not in r._crypto  # oldest evicted
+        assert r.cleared == 2  # 5 fed, 3 kept -> 2 evicted, not a full wipe
+
+    def test_flood_spares_the_recently_active_multi_initial(self) -> None:
+        # A post-quantum ClientHello spans two Initials. A concurrent flood must not
+        # discard it mid-reassembly: LRU keeps the recently-active connection alive
+        # between its parts (clear-all wiped it on any cap breach), so the second
+        # Initial still completes it.
+        r = QuicReassembler(max_conns=2)
+        msg = handshake_message(b"legit.example.com", padding_extension(2000))
+        mid = len(msg) // 2
+        legit = bytes([0xAA]) + b"\x00" * 7
+        j1, j2 = bytes([0xB1]) + b"\x00" * 7, bytes([0xB2]) + b"\x00" * 7
+        r.add(encrypt_initial(j1, crypto_frame(b"\x00" * 50)))  # older junk
+        assert r.add(encrypt_initial(legit, crypto_frame(msg[:mid], offset=0), pn=0)) is None
+        r.add(encrypt_initial(j2, crypto_frame(b"\x00" * 50)))  # breach: evicts oldest (j1)
+        assert legit in r._crypto  # the recently-active connection was spared
+        hello = r.add(encrypt_initial(legit, crypto_frame(msg[mid:], offset=mid), pn=1))
+        assert hello is not None
+        assert hello.sni == "legit.example.com"
 
     def test_coalesced_initial_isolated_by_length_field(self) -> None:
         reasm = QuicReassembler()
@@ -2950,13 +2999,18 @@ class TestDnsTcpReassembler:
         assert r.add(key, 0, b"\x16\x03\x01\x00\x05\x01 tls handshake bytes") == []
         assert not r.tracks(key)
 
-    def test_total_cap_evicts_and_counts(self) -> None:
-        r = DnsTcpReassembler(per_flow_cap=100, total_cap=40)
+    def test_total_cap_evicts_oldest_not_all(self) -> None:
+        # Over the byte cap evicts the least-recently-updated stream, not every
+        # in-flight one, so a burst ages out idle streams instead of dropping them all.
+        r = DnsTcpReassembler(per_flow_cap=25, total_cap=40)
         a = self._prefixed("a.example.com")
-        r.add(("a", 1, "b", 2), 0, a[:20])
-        r.add(("c", 3, "d", 4), 0, a[:25])
-        assert r._flows == {}
-        assert r.cleared == 2
+        old, new = ("a", 1, "b", 2), ("c", 3, "d", 4)
+        r.add(old, 0, a[:20])
+        r.add(new, 0, a[:25])  # total 45 > 40 -> evict the oldest, keep the newest
+        assert old not in r._flows
+        assert new in r._flows
+        assert r.cleared == 1
+        assert r._total == r._flows[new].size
 
     def test_process_reassembles_tcp_dns_answer_across_segments(self) -> None:
         proc = local_processor("192.168.1.50")
@@ -2989,10 +3043,10 @@ class TestDnsTcpReassembler:
 
     def test_dns_tcp_eviction_surfaces_in_coverage(self) -> None:
         proc = local_processor("192.168.1.50")
-        proc.dns_tcp = DnsTcpReassembler(per_flow_cap=100, total_cap=40)
+        proc.dns_tcp = DnsTcpReassembler(per_flow_cap=30, total_cap=40)
         proc.dns_tcp.add(("a", 1, "b", 2), 0, (b"\x00\x30" + b"\x00" * 20))
         proc.dns_tcp.add(("c", 3, "d", 4), 0, (b"\x00\x30" + b"\x00" * 25))
-        assert proc.summary()["coverage"]["evicted"]["dns_tcp_streams"] == 2
+        assert proc.summary()["coverage"]["evicted"]["dns_tcp_streams"] == 1
 
 
 class TestDnsNonStandardPorts:
