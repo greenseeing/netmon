@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Annotated, Any, BinaryIO, Literal, NamedTuple, Protocol, TextIO, cast
 
 import structlog
+from cryptography import x509
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import BaseModel, Field, TypeAdapter
@@ -640,21 +641,29 @@ def parse_handshake_client_hello(msg: bytes) -> TlsClientHello | None:
     return TlsClientHello(sni=sni, ech=ech, alpn=alpn)
 
 
-def _reassemble_handshake_records(payload: bytes) -> bytes:
-    # Concatenate the payloads of consecutive TLS handshake (0x16) records into one
-    # handshake byte stream, stripping each 5-byte record header. A ClientHello over
-    # the 16384-byte record limit (post-quantum key shares increasingly force this) is
-    # fragmented across records; reading past the first record's payload would otherwise
-    # dissect the next record's 5-byte header as handshake body and shift every SNI/ALPN
-    # offset. Stops at the first non-handshake record or one that has not fully arrived.
-    out = bytearray()
+def _handshake_record_spans(payload: bytes) -> Iterator[tuple[int, int]]:
+    # Yield each consecutive complete TLS handshake (0x16) record as its body's
+    # (start, end) offsets — the one authoritative record walk. Stops at the first
+    # non-handshake record or one whose declared length has not fully arrived.
     pos = 0
     while pos + 5 <= len(payload) and payload[pos] == 0x16:
         end = pos + 5 + int.from_bytes(payload[pos + 3 : pos + 5])
         if end > len(payload):
-            break  # this record's declared length has not fully arrived yet
-        out += payload[pos + 5 : end]
+            return
+        yield pos + 5, end
         pos = end
+
+
+def _reassemble_handshake_records(payload: bytes) -> bytes:
+    # Concatenate the payloads of consecutive TLS handshake records into one
+    # handshake byte stream, stripping each 5-byte record header. A ClientHello over
+    # the 16384-byte record limit (post-quantum key shares increasingly force this) is
+    # fragmented across records; reading past the first record's payload would otherwise
+    # dissect the next record's 5-byte header as handshake body and shift every SNI/ALPN
+    # offset.
+    out = bytearray()
+    for start, end in _handshake_record_spans(payload):
+        out += payload[start:end]
     return bytes(out)
 
 
@@ -666,6 +675,54 @@ def parse_client_hello(payload: bytes) -> TlsClientHello | None:
     # records (common with post-quantum key shares) is dissected as one message.
     # parse_handshake_client_hello waits for the whole handshake before parsing.
     return parse_handshake_client_hello(_reassemble_handshake_records(payload))
+
+
+TLS_HANDSHAKE_CERTIFICATE = 0x0B
+
+
+def _cleartext_handshake_over(payload: bytes) -> bool:
+    # True once a record of a different content type follows the handshake records:
+    # the cipher spec is changing (or already changed), so no further cleartext
+    # handshake bytes can arrive on this stream.
+    pos = 0
+    for _, end in _handshake_record_spans(payload):
+        pos = end
+    return pos < len(payload) and payload[pos] != 0x16
+
+
+def _leaf_san_dns_names(body: bytes) -> list[str]:
+    # Certificate message body (RFC 5246 §7.4.2): a 3-byte chain length, then each
+    # certificate as 3-byte length + DER. Only the leaf (first) names this server.
+    try:
+        leaf_len = int.from_bytes(body[3:6])
+        der = body[6 : 6 + leaf_len]
+        if len(der) < leaf_len:
+            return []
+        cert = x509.load_der_x509_certificate(der)
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        return san.value.get_values_for_type(x509.DNSName)
+    except Exception:
+        # Untrusted DER off the wire: a malformed or SAN-less certificate discloses
+        # nothing, and must never take down the capture loop.
+        return []
+
+
+def extract_certificate_sans(payload: bytes) -> list[str] | None:
+    # Walk the server's cleartext handshake flight for the TLS 1.2 Certificate
+    # message and return the leaf's SAN DNS names. None means the flight is still
+    # arriving — keep buffering. A list (possibly empty) is terminal: the caller can
+    # stop buffering, because either the certificate was read or none can follow —
+    # TLS 1.3 encrypts it, and a resumed TLS 1.2 handshake never sends one.
+    hs = _reassemble_handshake_records(payload)
+    pos = 0
+    while pos + 4 <= len(hs):
+        mlen = int.from_bytes(hs[pos + 1 : pos + 4])
+        if pos + 4 + mlen > len(hs):
+            break  # this handshake message has not fully arrived
+        if hs[pos] == TLS_HANDSHAKE_CERTIFICATE:
+            return _leaf_san_dns_names(hs[pos + 4 : pos + 4 + mlen])
+        pos += 4 + mlen
+    return [] if _cleartext_handshake_over(payload) else None
 
 
 QUIC_V1 = 0x00000001
@@ -1209,6 +1266,17 @@ def _client_stream_start(payload: bytes) -> bool:
     )
 
 
+def _server_stream_start(payload: bytes) -> bool:
+    # The mirror gate for the server->client direction: a TLS handshake record whose
+    # first handshake message is a ServerHello (type 0x02) opens the flight that
+    # carries the TLS 1.2 Certificate in cleartext.
+    return (
+        payload[:1] == b"\x16"
+        and payload[1:2] == b"\x03"
+        and (len(payload) < 6 or payload[5] == 0x02)
+    )
+
+
 class _Stream:
     __slots__ = ("base", "chunks", "size")
 
@@ -1219,13 +1287,18 @@ class _Stream:
 
 
 class TcpReassembler:
-    # Reassemble a client->server TCP stream by sequence number so a ClientHello
-    # or HTTP request head split across segments parses once whole, regardless
-    # of capture order or retransmission. Only flows that open with a
-    # ClientHello record or an HTTP method are tracked, which bounds memory on
-    # links dominated by encrypted application data.
+    # Reassemble one direction of a TCP stream by sequence number so a message
+    # split across segments parses once whole, regardless of capture order or
+    # retransmission. Only flows whose opening bytes pass the `start` anchor gate
+    # (client direction: ClientHello record or HTTP method; server direction:
+    # ServerHello record) are tracked, which bounds memory on links dominated by
+    # encrypted application data.
     def __init__(
-        self, per_flow_cap: int = 65536, total_cap: int = 4_000_000, pending_cap: int = 262144
+        self,
+        per_flow_cap: int = 65536,
+        total_cap: int = 4_000_000,
+        pending_cap: int = 262144,
+        start: Callable[[bytes], bool] = _client_stream_start,
     ) -> None:
         # A single stream can grow to per_flow_cap, so the total budget must hold at
         # least one; otherwise LRU could never bring a lone oversized stream under cap.
@@ -1233,6 +1306,7 @@ class TcpReassembler:
         self.per_flow_cap = per_flow_cap
         self.total_cap = total_cap
         self.pending_cap = pending_cap
+        self.start = start
         self.cleared = 0
         self._flows: OrderedDict[FlowKey, _Stream] = OrderedDict()
         self._total = 0
@@ -1250,7 +1324,7 @@ class TcpReassembler:
     def add(self, key: FlowKey, seq: int, payload: bytes) -> bytes:
         stream = self._flows.get(key)
         if stream is None:
-            if not _client_stream_start(payload):
+            if not self.start(payload):
                 self._hold_pending(key, seq, payload)
                 return b""
             stream = _Stream(seq)
@@ -1574,6 +1648,7 @@ class PacketProcessor:
         self.redact_query = redact_query
         self.local_ips = local_ips
         self.reassembler = TcpReassembler()
+        self.certs = TcpReassembler(start=_server_stream_start)
         self.dns_tcp = DnsTcpReassembler()
         self.quic = QuicReassembler()
         self.names = NameLedger(name_cap)
@@ -1638,6 +1713,7 @@ class PacketProcessor:
         # under the ip_fragment fate rather than no_disclosure/unhandled.
         fragmented = _is_ip_fragment(net)
         events: list[Event] = []
+        cert_san = False
         tcp = pkt.getlayer(TCP)
         udp = pkt.getlayer(UDP)
         is_ra = pkt.haslayer(ICMPv6ND_RA)
@@ -1651,10 +1727,13 @@ class PacketProcessor:
             payload = bytes(tcp.payload)
             if payload and not fragmented:
                 # Length-prefixed DNS on a client- or server-side stream reassembles
-                # separately; everything else feeds the TLS/HTTP reassembler.
+                # separately; everything else feeds the TLS/HTTP reassemblers —
+                # client direction first, then the server's certificate flight.
                 if self.dns_tcp.tracks(key) or (
                     not self.reassembler.tracks(key)
+                    and not self.certs.tracks(key)
                     and not _client_stream_start(payload)
+                    and not _server_stream_start(payload)
                     and _dns_tcp_start(payload)
                 ):
                     for body in self.dns_tcp.add(key, int(tcp.seq), payload):
@@ -1686,8 +1765,27 @@ class PacketProcessor:
                                 tag=_http_tag(host),
                             )
                         )
+                    elif not self.reassembler.tracks(key):
+                        # Not the client's opening flight: try the server->client
+                        # direction, where a TLS 1.2 certificate names this server
+                        # even when no SNI was ever captured. A key mid-ClientHello
+                        # is skipped — it can never be the server's flight, and
+                        # buffering it again would let bulk client traffic evict
+                        # genuinely pending server segments.
+                        flight = self.certs.add(key, int(tcp.seq), payload)
+                        sans = extract_certificate_sans(flight) if flight else None
+                        if sans is not None:
+                            self.certs.drop(key)
+                            if sans:
+                                # One name per server IP, wildcards last: a concrete
+                                # SAN paints the sharper picture. Fills gaps only —
+                                # never overwrites a DNS/SNI-learned name.
+                                concrete = [s for s in sans if not s.startswith("*.")]
+                                self.names.observe_if_absent(net.src, (concrete or sans)[0])
+                                cert_san = True
             if flags.F or flags.R:
                 self.reassembler.drop(key)
+                self.certs.drop(key)
                 self.dns_tcp.drop(key)
             birth: Birth = "observed" if (flags.S and not flags.A) else "pre-existing"
             events.extend(self._flow_event(ts, net, "tcp", tcp.sport, tcp.dport, birth))
@@ -1719,6 +1817,10 @@ class PacketProcessor:
             empty_fate = "ip_fragment"
         elif tcp is None and udp is None and not is_ra:
             empty_fate = f"unhandled:{_ip_proto_name(net)}"
+        elif cert_san:
+            # A certificate that named its server disclosed something even though no
+            # event was emitted — never bookkeep it as no_disclosure.
+            empty_fate = "cert_san"
         else:
             empty_fate = "no_disclosure"
         return self._tally(events, empty_fate)
@@ -2019,6 +2121,7 @@ class PacketProcessor:
                 "sni_names": self.sni_names.flushed,
                 "internet_hosts": self.remote_hosts.flushed,
                 "tcp_streams": self.reassembler.cleared,
+                "cert_streams": self.certs.cleared,
                 "dns_tcp_streams": self.dns_tcp.cleared,
                 "quic_streams": self.quic.cleared,
             },

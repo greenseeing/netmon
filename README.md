@@ -101,14 +101,14 @@ Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 - Encrypted DNS (DoH/DoT/DoQ) *does* hide the query name from your ISP; it shows up here only as flows to the resolver.
 - Encrypted Client Hello (ECH) hides the SNI by design: the cleartext ClientHello then carries a public *cover* name, not the site you visited. netmon flags these with `"ech": true` in `tls.jsonl` — such a line means the real hostname was hidden from your ISP (a leak *prevented*), and the `sni` value is only the cover name. If the ECH handshake fails, the browser retries without it and the real SNI goes out in cleartext, which netmon still records.
 - Segmented parsing: SNI and HTTP requests are reassembled across TCP segments (post-quantum ClientHellos routinely span several), so a request split mid-header is still parsed once whole. The one gap is a connection whose *opening* segment was never captured — if netmon starts mid-stream, that flow is not reassembled and its SNI/HTTP is skipped (the flow itself is still logged).
+- TLS 1.2 server certificates: on the still-common TLS 1.2 path the server's certificate crosses the wire in cleartext, and netmon reads the leaf's SAN names to name a destination it would otherwise miss (no SNI captured, or a stream joined mid-flight). A certificate name only fills gaps — it never overrides a name learned from DNS or SNI. TLS 1.3 encrypts the certificate, so nothing is recovered there. Scope decision: [docs/adr/0001-reopen-cert-san-scope.md](docs/adr/0001-reopen-cert-san-scope.md).
 
 ## What this tool does NOT show you
 
 Even at zero of qname/SNI/remote-IP (ECH + encrypted DNS + VPN), an on-path ISP still has signal netmon cannot capture — the honest bound on "what the ISP sees":
 
 - **Traffic analysis** — packet sizes, timing, direction, and per-flow byte volumes. These alone fingerprint individual websites (and often individual pages) behind TLS, ECH, and a VPN, because the shape of a page load is distinctive. netmon logs *that* a flow happened, not its size/timing profile.
-- **TLS client fingerprint (JA3/JA4)** — the ordering of cipher suites, extensions, and supported groups in the ClientHello identifies the client software and version. netmon reads SNI and ALPN from that hello but does not compute the fingerprint.
-- **TLS 1.2 server certificate** — on the still-common TLS 1.2 path the server's certificate (with its SANs) crosses the wire in cleartext during the handshake; TLS 1.3 encrypts it. netmon does not parse server certificates.
+- **TLS client fingerprint (JA3/JA4)** — the ordering of cipher suites, extensions, and supported groups in the ClientHello identifies the client software and version. netmon reads SNI and ALPN from that hello but does not compute the fingerprint ([docs/adr/0001-reopen-cert-san-scope.md](docs/adr/0001-reopen-cert-san-scope.md)).
 - **IPv6 address leakage** — a SLAAC EUI-64 address embeds the NIC MAC, and a stable IPv6 identifies the device across networks even as the SNI is hidden. netmon records the addresses but does not flag this derivation.
 
 Only Tor-class tooling (onion routing plus traffic padding) meaningfully addresses the traffic-analysis/correlation channel; a VPN or ECH relocates the observer, it does not remove the shape of your traffic.

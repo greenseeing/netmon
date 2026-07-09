@@ -6,12 +6,17 @@ import os
 import random
 import struct
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import structlog
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.x509.oid import NameOID
 from scapy.config import conf
 from scapy.layers.dns import (
     DNS,
@@ -81,12 +86,14 @@ from netmon import (
     _parse_run_args,
     _reassemble,
     _run_parser,
+    _server_stream_start,
     configure_logging,
     derive_initial_keys,
     event_detail,
     event_direction,
     event_host,
     event_to_cells,
+    extract_certificate_sans,
     finalize,
     header_protection_mask,
     iso,
@@ -587,6 +594,229 @@ class TestTcpReassemblerOverlapAndReorder:
         server_key = ("93.184.216.34", 443, "192.168.1.50", 51000)
         assert r.add(server_key, 0, b"\x16\x03\x03\x00\x00\x02" + b"\x00" * 4000) == b""
         assert server_key not in r._flows
+
+
+SERVER_IP = "93.184.216.34"
+SERVER_KEY = (SERVER_IP, 443, "192.168.1.50", 51000)
+
+
+def server_segment(data: bytes, flags: str = "A", seq: int = BASE_SEQ) -> Packet:
+    pkt = (
+        Ether()
+        / IP(src=SERVER_IP, dst="192.168.1.50")
+        / TCP(sport=443, dport=51000, flags=flags, seq=seq)
+        / data
+    )
+    pkt.time = PKT_TIME
+    return pkt
+
+
+def tls_record(body: bytes, rtype: int = 0x16) -> bytes:
+    return bytes([rtype, 0x03, 0x03]) + len(body).to_bytes(2, "big") + body
+
+
+def server_hello_message() -> bytes:
+    # TLS 1.2 ServerHello: version, random, empty session id, one suite, null
+    # compression, empty extensions.
+    body = b"\x03\x03" + b"\x00" * 32 + b"\x00" + b"\x00\x2f" + b"\x00" + b"\x00\x00"
+    return b"\x02" + len(body).to_bytes(3, "big") + body
+
+
+def certificate_message(*ders: bytes) -> bytes:
+    # RFC 5246 §7.4.2: 3-byte chain length, then each certificate as 3-byte length + DER.
+    chain = b"".join(len(d).to_bytes(3, "big") + d for d in ders)
+    body = len(chain).to_bytes(3, "big") + chain
+    return b"\x0b" + len(body).to_bytes(3, "big") + body
+
+
+def self_signed_der(*sans: str) -> bytes:
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "netmon-test")])
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime(2036, 1, 1, tzinfo=UTC))
+    )
+    if sans:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]), critical=False
+        )
+    return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.DER)
+
+
+def server_certificate_flight(*sans: str) -> bytes:
+    return tls_record(server_hello_message()) + tls_record(
+        certificate_message(self_signed_der(*sans))
+    )
+
+
+class TestServerStreamStart:
+    def test_serverhello_record_is_a_server_start(self) -> None:
+        assert _server_stream_start(b"\x16\x03\x03\x00\x2e\x02")
+
+    def test_clienthello_record_is_not(self) -> None:
+        assert not _server_stream_start(CH_RECORD_HEADER)
+
+    def test_ambiguous_short_prefix_is_permissive(self) -> None:
+        assert _server_stream_start(b"\x16\x03")
+
+    def test_application_data_is_not(self) -> None:
+        assert not _server_stream_start(b"\x17\x03\x03\x00\x10")
+
+
+class TestExtractCertificateSans:
+    def test_complete_flight_returns_the_leaf_dns_names(self) -> None:
+        flight = server_certificate_flight("a.example.com", "b.example.com")
+        assert extract_certificate_sans(flight) == ["a.example.com", "b.example.com"]
+
+    def test_incomplete_flight_returns_none_to_keep_waiting(self) -> None:
+        flight = server_certificate_flight("wait.example.com")
+        assert extract_certificate_sans(flight[:60]) is None
+
+    def test_cipher_change_before_a_certificate_is_terminal(self) -> None:
+        # TLS 1.3 (and resumed TLS 1.2) never sends a cleartext Certificate: once a
+        # non-handshake record follows the hello, stop waiting.
+        flight = tls_record(server_hello_message()) + tls_record(b"\x01", rtype=0x14)
+        assert extract_certificate_sans(flight) == []
+
+    def test_malformed_der_is_terminal_and_yields_nothing(self) -> None:
+        junk = certificate_message(b"\x30\x82\xff\xff" + b"\xcc" * 40)
+        flight = tls_record(server_hello_message()) + tls_record(junk)
+        assert extract_certificate_sans(flight) == []
+
+    def test_certificate_without_san_extension_yields_nothing(self) -> None:
+        assert extract_certificate_sans(server_certificate_flight()) == []
+
+
+class TestTls12CertificateSan:
+    def test_server_certificate_san_seeds_the_name_ledger(self) -> None:
+        proc = local_processor("192.168.1.50")
+        proc.process(server_segment(server_certificate_flight("cert.example.com"), flags="PA"))
+        assert proc.names.lookup(SERVER_IP) == "cert.example.com"
+
+    def test_recovered_name_names_a_later_flow_to_that_ip(self) -> None:
+        proc = local_processor("192.168.1.50")
+        proc.process(server_segment(server_certificate_flight("cert.example.com"), flags="PA"))
+        events = proc.process(make_syn("192.168.1.50", SERVER_IP, 52000, 443))
+        flows = [e for e in events if isinstance(e, FlowEvent)]
+        assert len(flows) == 1
+        assert flows[0].hostname == "cert.example.com"
+
+    def test_certificate_split_across_segments_parses_after_the_last(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight("split.example.com")
+        first, second = flight[:120], flight[120:]
+        proc.process(server_segment(first, seq=BASE_SEQ))
+        assert proc.names.lookup(SERVER_IP) is None
+        proc.process(server_segment(second, flags="PA", seq=BASE_SEQ + len(first)))
+        assert proc.names.lookup(SERVER_IP) == "split.example.com"
+
+    def test_reordered_server_segments_still_yield_the_san(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight("reorder.example.com")
+        # Split inside the ServerHello's zeroed random so the tail's first bytes are
+        # deterministically unclaimable by any anchor gate (client, server, or DNS).
+        first, second = flight[:20], flight[20:]
+        proc.process(server_segment(second, seq=BASE_SEQ + len(first)))
+        proc.process(server_segment(first, flags="PA", seq=BASE_SEQ))
+        assert proc.names.lookup(SERVER_IP) == "reorder.example.com"
+
+    def test_cert_san_never_clobbers_a_dns_or_sni_name(self) -> None:
+        proc = local_processor("192.168.1.50")
+        proc.names.observe(SERVER_IP, "real.example.com")
+        proc.process(server_segment(server_certificate_flight("cert.example.com"), flags="PA"))
+        assert proc.names.lookup(SERVER_IP) == "real.example.com"
+
+    def test_wildcard_san_defers_to_a_concrete_name(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight("*.cdn.example.com", "concrete.example.com")
+        proc.process(server_segment(flight, flags="PA"))
+        assert proc.names.lookup(SERVER_IP) == "concrete.example.com"
+
+    def test_all_wildcard_sans_still_seed_the_first(self) -> None:
+        proc = local_processor("192.168.1.50")
+        proc.process(server_segment(server_certificate_flight("*.only.example.com"), flags="PA"))
+        assert proc.names.lookup(SERVER_IP) == "*.only.example.com"
+
+    def test_truncated_certificate_yields_nothing_and_does_not_crash(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight("cut.example.com")
+        proc.process(server_segment(flight[:120], flags="PA"))
+        proc.process(server_segment(b"", flags="FA", seq=BASE_SEQ + 120))
+        assert proc.names.lookup(SERVER_IP) is None
+        assert proc.coverage.fate["parse_error"] == 0
+
+    def test_malformed_der_stops_tracking_and_yields_nothing(self) -> None:
+        proc = local_processor("192.168.1.50")
+        junk = certificate_message(b"\x30\x82\xff\xff" + b"\xcc" * 40)
+        flight = tls_record(server_hello_message()) + tls_record(junk)
+        proc.process(server_segment(flight, flags="PA"))
+        assert proc.names.lookup(SERVER_IP) is None
+        assert not proc.certs.tracks(SERVER_KEY)
+        assert proc.coverage.fate["parse_error"] == 0
+
+    def test_tls13_stream_stops_buffering_after_cipher_change(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = tls_record(server_hello_message()) + tls_record(b"\x01", rtype=0x14)
+        proc.process(server_segment(flight, flags="PA"))
+        assert proc.names.lookup(SERVER_IP) is None
+        assert not proc.certs.tracks(SERVER_KEY)
+
+    def test_fin_drops_the_server_stream(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight("late.example.com")
+        proc.process(server_segment(flight[:120], seq=BASE_SEQ))
+        proc.process(server_segment(b"", flags="FA", seq=BASE_SEQ + 120))
+        proc.process(server_segment(flight[120:], flags="PA", seq=BASE_SEQ + 120))
+        assert proc.names.lookup(SERVER_IP) is None
+
+    def test_client_direction_still_parses_sni_untouched(self) -> None:
+        # The server-direction reassembler must not disturb the client path: the same
+        # flow's ClientHello still yields its SNI event.
+        proc = local_processor("192.168.1.50")
+        events = proc.process(
+            tcp_segment(build_client_hello(extensions=sni_extension(b"client.example.com")))
+        )
+        sni = [e for e in events if isinstance(e, TlsSniEvent)]
+        assert len(sni) == 1
+        assert sni[0].sni == "client.example.com"
+
+    def test_cert_stream_evictions_surface_in_coverage(self) -> None:
+        proc = local_processor("192.168.1.50")
+        assert proc.summary()["coverage"]["evicted"]["cert_streams"] == 0
+
+    def test_packet_completing_a_certificate_gets_a_cert_san_fate(self) -> None:
+        # The segment whose certificate discloses a name must not be bookkept as
+        # no_disclosure — the fate ledger stays honest about what the packet yielded.
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight("fate.example.com")
+        first, second = flight[:120], flight[120:]
+        proc.process(server_segment(first, seq=BASE_SEQ))
+        proc.process(server_segment(second, flags="PA", seq=BASE_SEQ + len(first)))
+        assert proc.coverage.fate["cert_san"] == 1
+        assert proc.names.lookup(SERVER_IP) == "fate.example.com"
+
+    def test_san_less_certificate_still_counts_as_no_disclosure(self) -> None:
+        proc = local_processor("192.168.1.50")
+        flight = server_certificate_flight()
+        first, second = flight[:120], flight[120:]
+        proc.process(server_segment(first, seq=BASE_SEQ))
+        proc.process(server_segment(second, flags="PA", seq=BASE_SEQ + len(first)))
+        assert proc.coverage.fate["cert_san"] == 0
+
+    def test_client_stream_in_progress_stays_out_of_the_cert_pending_pool(self) -> None:
+        # A key anchored as the client's ClientHello can never be the server's
+        # certificate flight; buffering it again would let bulk client traffic evict
+        # genuinely pending server segments.
+        proc = local_processor("192.168.1.50")
+        hello = pq_client_hello(b"guard.example.com")
+        proc.process(tcp_segment(hello[:800], flags="A", seq=BASE_SEQ))
+        assert not proc.certs._pending
+        assert not proc.certs._flows
 
 
 RFC_DCID = bytes.fromhex("8394c8f03e515708")

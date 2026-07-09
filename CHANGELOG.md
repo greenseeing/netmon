@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **TLS 1.2 server-certificate SAN naming** — on the still-common TLS 1.2 path the
+  server's certificate crosses the wire in cleartext, and netmon now reassembles the
+  server→client handshake flight, reads the leaf certificate's SubjectAltName DNS
+  names, and seeds the IP→name ledger with one name per server (a concrete SAN wins
+  over a wildcard). A destination is thereby named even when no SNI was ever
+  captured — a client that omitted it, or a stream netmon joined mid-flight. A
+  certificate name only fills gaps: it never overwrites a name learned from DNS or
+  SNI. TLS 1.3 (and resumed TLS 1.2) never sends a cleartext certificate, so those
+  streams stop buffering at the cipher change; malformed or truncated certificates
+  yield nothing and cannot crash the capture. Packets whose certificate named a
+  server are tallied under a new `cert_san` coverage fate, and cert-stream evictions
+  surface as `cert_streams`. Scope decision (cert-SAN only, still no JA3/JA4):
+  `docs/adr/0001-reopen-cert-san-scope.md`.
 - **`netmon query` display filter** — a read-only subcommand that reads a recorded
   run directory's JSONL and filters it by `--kind`, `--host` (a substring of the
   event's SNI / qname / hostname, via the same one-authority projection the live feed
