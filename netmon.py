@@ -603,8 +603,12 @@ def parse_handshake_client_hello(msg: bytes) -> TlsClientHello | None:
     # CRYPTO streams (which carry handshake messages with no record layer).
     if len(msg) < 40 or msg[0] != 0x01:
         return None
-    if len(msg) < 4 + int.from_bytes(msg[1:4]):
+    body_end = 4 + int.from_bytes(msg[1:4])
+    if len(msg) < body_end:
         return None  # handshake message not yet complete
+    # Clip to this handshake message's own declared length so a lying extension/SNI
+    # length field cannot read past it into a concatenated following record's bytes.
+    msg = msg[:body_end]
     try:
         pos = 4 + 2 + 32  # handshake header + client_version + random
         pos += 1 + msg[pos]  # session_id
@@ -636,15 +640,32 @@ def parse_handshake_client_hello(msg: bytes) -> TlsClientHello | None:
     return TlsClientHello(sni=sni, ech=ech, alpn=alpn)
 
 
+def _reassemble_handshake_records(payload: bytes) -> bytes:
+    # Concatenate the payloads of consecutive TLS handshake (0x16) records into one
+    # handshake byte stream, stripping each 5-byte record header. A ClientHello over
+    # the 16384-byte record limit (post-quantum key shares increasingly force this) is
+    # fragmented across records; reading past the first record's payload would otherwise
+    # dissect the next record's 5-byte header as handshake body and shift every SNI/ALPN
+    # offset. Stops at the first non-handshake record or one that has not fully arrived.
+    out = bytearray()
+    pos = 0
+    while pos + 5 <= len(payload) and payload[pos] == 0x16:
+        end = pos + 5 + int.from_bytes(payload[pos + 3 : pos + 5])
+        if end > len(payload):
+            break  # this record's declared length has not fully arrived yet
+        out += payload[pos + 5 : end]
+        pos = end
+    return bytes(out)
+
+
 def parse_client_hello(payload: bytes) -> TlsClientHello | None:
     # TLS record type 22 (handshake) wrapping a ClientHello (handshake type 1).
     if len(payload) < 44 or payload[0] != 0x16 or payload[5] != 0x01:
         return None
-    # Wait for the whole record: a ClientHello split across TCP segments (now
-    # common with post-quantum key shares) arrives incomplete.
-    if len(payload) < 5 + int.from_bytes(payload[3:5]):
-        return None
-    return parse_handshake_client_hello(payload[5:])
+    # Reassemble consecutive handshake records first, so a ClientHello fragmented across
+    # records (common with post-quantum key shares) is dissected as one message.
+    # parse_handshake_client_hello waits for the whole handshake before parsing.
+    return parse_handshake_client_hello(_reassemble_handshake_records(payload))
 
 
 QUIC_V1 = 0x00000001

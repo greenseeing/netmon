@@ -77,6 +77,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A multi-record TLS ClientHello now parses to its true SNI/ALPN.** A ClientHello
+  over the 16384-byte TLS record limit (post-quantum key shares increasingly force
+  this) is fragmented across two or more handshake records; `parse_client_hello` read
+  only the first record and dissected the next record's 5-byte header as handshake body,
+  shifting every SNI/ALPN offset into garbage. Consecutive handshake records are now
+  reassembled into one message before dissecting. The handshake message is also clipped
+  to its own declared length first, so a lying extension/SNI length field can no longer
+  read past it into a following record's bytes.
 - **A zero-length QUIC CRYPTO frame can no longer hang the reassembler.** Such a frame
   is legal on the wire and, since QUIC Initial keys are publicly derivable, attacker-
   craftable. It made `_crypto_fragments` emit an empty chunk, which spun the stream

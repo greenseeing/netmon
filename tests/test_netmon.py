@@ -92,6 +92,7 @@ from netmon import (
     main,
     packet_nonce,
     parse_client_hello,
+    parse_handshake_client_hello,
     parse_http_request,
     question_list,
     remote_scope,
@@ -296,6 +297,75 @@ def pq_client_hello(name: bytes) -> bytes:
     hello = build_client_hello(extensions=padding_extension(2000) + sni_extension(name))
     assert len(hello) > 1500
     return hello
+
+
+def two_record_client_hello(name: bytes, alpn: bytes = b"") -> bytes:
+    # A ClientHello whose handshake message exceeds one 16384-byte TLS record (as
+    # post-quantum key shares increasingly force), fragmented across two handshake
+    # records, each with its own 5-byte record header.
+    exts = padding_extension(17000) + sni_extension(name) + alpn
+    handshake = build_client_hello(extensions=exts)[5:]  # strip the single-record header
+    assert len(handshake) > 16384
+    first, second = handshake[:16384], handshake[16384:]
+
+    def record(body: bytes) -> bytes:
+        return b"\x16\x03\x03" + len(body).to_bytes(2, "big") + body
+
+    return record(first) + record(second)
+
+
+class TestMultiRecordClientHello:
+    def test_two_record_clienthello_parses_sni_and_alpn(self) -> None:
+        payload = two_record_client_hello(b"multi.example.com", alpn_extension(b"h2"))
+        hello = parse_client_hello(payload)
+        assert hello is not None
+        assert hello.sni == "multi.example.com"
+        assert hello.alpn == ["h2"]
+
+    def test_single_record_clienthello_unaffected(self) -> None:
+        payload = build_client_hello(extensions=sni_extension(b"one.example.com"))
+        hello = parse_client_hello(payload)
+        assert hello is not None
+        assert hello.sni == "one.example.com"
+
+    def test_lying_sni_length_cannot_read_past_the_handshake(self) -> None:
+        # A ClientHello whose server_name length field over-declares must not spill the
+        # bytes of a following (now header-stripped) record into the parsed SNI.
+        name = b"safe.example.com"
+        entry = b"\x00" + struct.pack(">H", len(name) + 64) + name  # lying name_len
+        snl = struct.pack(">H", len(entry)) + entry
+        ext = struct.pack(">H", 0) + struct.pack(">H", len(snl)) + snl
+        handshake = build_client_hello(extensions=ext)[5:]  # honest handshake length field
+        trailing = b"evil.attacker.example/" * 8  # a following record's stripped payload
+        parsed = parse_handshake_client_hello(handshake + trailing)
+        sni = parsed.sni if parsed else None
+        assert sni is None or "attacker" not in sni
+
+    def test_non_handshake_record_after_hello_not_concatenated(self) -> None:
+        # A 0x17 application-data record following the ClientHello must not be folded
+        # into the handshake message; the SNI still parses from the handshake alone.
+        hello = build_client_hello(extensions=sni_extension(b"clean.example.com"))
+        app_data = b"\x17\x03\x03\x00\x08" + b"\xff" * 8
+        parsed = parse_client_hello(hello + app_data)
+        assert parsed is not None
+        assert parsed.sni == "clean.example.com"
+
+    def test_incomplete_second_record_waits(self) -> None:
+        # The second record's declared length has not fully arrived: no partial parse.
+        full = two_record_client_hello(b"partial.example.com")
+        assert parse_client_hello(full[:-50]) is None
+
+    def test_two_record_hello_across_tcp_segments_yields_sni(self) -> None:
+        # TCP segments a stream at MSS boundaries, not record boundaries, so the second
+        # segment starts mid-record. Reassembling segments then records yields the SNI.
+        proc = local_processor("192.168.1.50")
+        payload = two_record_client_hello(b"e2e.example.com", alpn_extension(b"h2"))
+        first, second = payload[:8000], payload[8000:]
+        proc.process(tcp_segment(first, flags="A", seq=BASE_SEQ))
+        done = proc.process(tcp_segment(second, flags="PA", seq=BASE_SEQ + len(first)))
+        sni = [e for e in done if isinstance(e, TlsSniEvent)]
+        assert len(sni) == 1
+        assert sni[0].sni == "e2e.example.com"
 
 
 class TestSplitClientHelloReassembly:
