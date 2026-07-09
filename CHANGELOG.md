@@ -56,6 +56,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Silent packet drops no longer masquerade as "no disclosure".** The coverage
+  ledger's promise is that a clean log is never a silent gap, but two classes of
+  undecodable traffic slipped through it. An IP/IPv6 fragment was tallied as
+  `no_disclosure` (or `unhandled:<proto>`), and a datagram that looked like DNS by
+  shape yet failed to fully parse was lost the same way, so the summary could read
+  clean while a real DNS answer had vanished. A fragment's L4 payload can't be
+  reassembled (that stays a documented out-of-scope gap), but a first fragment still
+  carries the connection's L4 header, so its flow — who contacted whom — is now
+  recorded as before; only the unreadable payload is skipped. A fragment that yields
+  no event (a later, header-less fragment, or a repeat of an already-seen flow) lands
+  under a distinct `ip_fragment` fate, and a plausible-but-unparseable DNS message is
+  counted in the coverage summary's `parse_failed.dns`, beside the existing QUIC and
+  packet counters.
+
 - **Non-DNS traffic on ports 53/5353 reported as bogus `dns_query`.** scapy binds
   a DNS layer to UDP 53 and 5353 by port number alone, so any non-DNS datagram
   squatting there (BitTorrent DHT, QUIC, scans, spoofed packets) was force-decoded

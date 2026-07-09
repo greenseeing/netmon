@@ -45,6 +45,10 @@ from scapy.layers.inet6 import (
     ICMPv6NDOptPrefixInfo,
     ICMPv6NDOptRDNSS,
     IPv6,
+    IPv6ExtHdrDestOpt,
+    IPv6ExtHdrFragment,
+    IPv6ExtHdrHopByHop,
+    IPv6ExtHdrRouting,
 )
 from scapy.layers.l2 import ARP
 from scapy.layers.llmnr import LLMNRQuery
@@ -1000,16 +1004,25 @@ _DNS_MAX_QD = 20
 _DNS_MAX_RR = 500
 
 
+def _looks_like_dns(payload: bytes) -> bool:
+    # The cheap shape gate: a 12-byte header whose four section counts sit within
+    # sane bounds. Necessary but not sufficient for DNS — a datagram that passes
+    # this yet fails the full parse is DNS we could not decode, not mere noise,
+    # and the caller counts it as such instead of losing it silently.
+    if len(payload) < 12:
+        return False
+    qd, an, ns, ar = struct.unpack_from(">HHHH", payload, 4)
+    return qd <= _DNS_MAX_QD and max(an, ns, ar) <= _DNS_MAX_RR
+
+
 def parse_dns_message(payload: bytes) -> DNS | None:
     # Recognise DNS by shape, not port: scapy's DNS() never raises and will
     # round-trip arbitrary bytes, so validate the header counts against the
     # records actually decoded. A payload whose four section counts each match
     # its parsed record list is DNS; anything else (HTTP, QUIC, noise) is not.
-    if len(payload) < 12:
+    if not _looks_like_dns(payload):
         return None
     qd, an, ns, ar = struct.unpack_from(">HHHH", payload, 4)
-    if qd > _DNS_MAX_QD or max(an, ns, ar) > _DNS_MAX_RR:
-        return None
     try:
         dns = DNS(payload)
     except Exception:
@@ -1296,6 +1309,32 @@ def _ip_proto_name(net: Any) -> str:
     return _IP_PROTO_NAMES.get(proto, f"ip_proto_{proto}")
 
 
+_IPV6_EXT_HDRS = (
+    IPv6ExtHdrHopByHop,
+    IPv6ExtHdrRouting,
+    IPv6ExtHdrDestOpt,
+    IPv6ExtHdrFragment,
+)
+
+
+def _is_ip_fragment(net: Any) -> bool:
+    # A fragmented datagram cannot be decoded whole: the first fragment carries a
+    # truncated L4 payload and later fragments carry no L4 header at all. Reassembly
+    # itself stays a documented out-of-scope gap; the caller skips payload dissection
+    # on a fragment and still records the flow, so the disclosure the fragment does
+    # carry (endpoints) survives while its unreadable content is not mis-parsed.
+    if isinstance(net, IP):
+        return bool(net.flags.MF) or net.frag != 0
+    # Walk only the outer header's own extension-header chain: a fragment header
+    # quoted inside an ICMPv6 error's original packet must not flag the error itself.
+    layer = net.payload
+    while isinstance(layer, _IPV6_EXT_HDRS):
+        if isinstance(layer, IPv6ExtHdrFragment):
+            return True
+        layer = layer.payload
+    return False
+
+
 class Coverage:
     # The one ledger of packet fate. Every packet the processor sees is tallied
     # under exactly one fate — became an event, deliberately skipped, an IP
@@ -1338,6 +1377,7 @@ class PacketProcessor:
         self.remote_hosts = BoundedCounter(counter_cap)
         self.event_counts: Counter[str] = Counter()
         self.coverage = Coverage()
+        self.dns_parse_failures = 0
         self._lo_recent: dict[int, float] = {}
 
     def _is_loopback_duplicate(self, pkt: Packet, t: float) -> bool:
@@ -1382,6 +1422,12 @@ class PacketProcessor:
                 return self._tally(self._arp_events(ts, pkt[ARP]), "no_disclosure")
             self.coverage.mark("non_ip")
             return []
+        # A fragment's payload is truncated (first) or absent (later), so its L4
+        # content cannot be dissected — but a first fragment still carries the L4
+        # header, so the flow disclosure it bears is recorded below; only the
+        # unreadable payload is skipped, and a fragment that yields no event lands
+        # under the ip_fragment fate rather than no_disclosure/unhandled.
+        fragmented = _is_ip_fragment(net)
         events: list[Event] = []
         tcp = pkt.getlayer(TCP)
         udp = pkt.getlayer(UDP)
@@ -1394,7 +1440,7 @@ class PacketProcessor:
             flags = tcp.flags
             key: FlowKey = (net.src, tcp.sport, net.dst, tcp.dport)
             payload = bytes(tcp.payload)
-            if payload:
+            if payload and not fragmented:
                 # Length-prefixed DNS on a client- or server-side stream reassembles
                 # separately; everything else feeds the TLS/HTTP reassembler.
                 if self.dns_tcp.tracks(key) or (
@@ -1404,6 +1450,8 @@ class PacketProcessor:
                         dns = parse_dns_message(body)
                         if dns is not None:
                             events.extend(self._dns_events(ts, net, dns, "tcp"))
+                        elif _looks_like_dns(body):
+                            self.dns_parse_failures += 1
                 else:
                     stream = self.reassembler.add(key, int(tcp.seq), payload)
                     hello = parse_client_hello(stream) if stream else None
@@ -1433,27 +1481,32 @@ class PacketProcessor:
             birth: Birth = "observed" if (flags.S and not flags.A) else "pre-existing"
             events.extend(self._flow_event(ts, net, "tcp", tcp.sport, tcp.dport, birth))
         elif udp is not None:
-            datagram = bytes(udp.payload)
-            if pkt.haslayer(LLMNRQuery):
-                events.extend(self._llmnr_events(ts, net, pkt[LLMNRQuery]))
-            elif pkt.haslayer(NBNSQueryRequest):
-                events.extend(self._nbns_events(ts, net, pkt[NBNSQueryRequest]))
-            else:
-                # Recognise DNS by shape on every port, never by scapy's port
-                # binding alone: 53/5353 attract non-DNS noise (BitTorrent DHT,
-                # QUIC, scans) that scapy will force-decode into a bogus DNS layer.
-                # Shape validation is the single gate; it also covers local
-                # forwarders / dnscrypt-proxy on custom ports.
-                dns = parse_dns_message(datagram)
-                if dns is not None:
-                    events.extend(self._dns_events(ts, net, dns, "udp"))
-                elif _is_quic_long_header(datagram):
-                    hello = self.quic.add(datagram)
-                    if hello:
-                        events.append(self._sni_event(ts, net, udp.dport, hello, "quic"))
+            if not fragmented:
+                datagram = bytes(udp.payload)
+                if pkt.haslayer(LLMNRQuery):
+                    events.extend(self._llmnr_events(ts, net, pkt[LLMNRQuery]))
+                elif pkt.haslayer(NBNSQueryRequest):
+                    events.extend(self._nbns_events(ts, net, pkt[NBNSQueryRequest]))
+                else:
+                    # Recognise DNS by shape on every port, never by scapy's port
+                    # binding alone: 53/5353 attract non-DNS noise (BitTorrent DHT,
+                    # QUIC, scans) that scapy will force-decode into a bogus DNS layer.
+                    # Shape validation is the single gate; it also covers local
+                    # forwarders / dnscrypt-proxy on custom ports.
+                    dns = parse_dns_message(datagram)
+                    if dns is not None:
+                        events.extend(self._dns_events(ts, net, dns, "udp"))
+                    elif _is_quic_long_header(datagram):
+                        hello = self.quic.add(datagram)
+                        if hello:
+                            events.append(self._sni_event(ts, net, udp.dport, hello, "quic"))
+                    elif _looks_like_dns(datagram):
+                        self.dns_parse_failures += 1  # DNS by shape, undecodable whole
             events.extend(self._flow_event(ts, net, "udp", udp.sport, udp.dport, "datagram"))
 
-        if tcp is None and udp is None and not is_ra:
+        if fragmented:
+            empty_fate = "ip_fragment"
+        elif tcp is None and udp is None and not is_ra:
             empty_fate = f"unhandled:{_ip_proto_name(net)}"
         else:
             empty_fate = "no_disclosure"
@@ -1737,6 +1790,7 @@ class PacketProcessor:
             },
             "parse_failed": {
                 "quic_initial": self.quic.decrypt_failures,
+                "dns": self.dns_parse_failures,
                 "packet": self.coverage.fate["parse_error"],
             },
         }

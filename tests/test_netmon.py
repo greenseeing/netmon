@@ -25,11 +25,13 @@ from scapy.layers.dns import (
 )
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.inet6 import (
+    ICMPv6DestUnreach,
     ICMPv6EchoRequest,
     ICMPv6ND_RA,
     ICMPv6NDOptPrefixInfo,
     ICMPv6NDOptRDNSS,
     IPv6,
+    IPv6ExtHdrFragment,
 )
 from scapy.layers.l2 import ARP, Ether
 from scapy.layers.llmnr import LLMNRQuery
@@ -1711,6 +1713,163 @@ class TestCoverageLedger:
             ans.time = PKT_TIME
             proc.process(ans)
         assert proc.summary()["coverage"]["evicted"]["names"] > 0
+
+
+class TestSilentDropHonesty:
+    # The ledger's whole promise is "a clean log is not a silent gap". A fragment we
+    # cannot reassemble must not vanish into "no_disclosure"/"unhandled": its L4
+    # content is skipped, but a first fragment still carries the flow disclosure, and
+    # a fragment that yields no event lands under the honest ip_fragment fate.
+    def test_first_fragment_still_records_the_flow(self) -> None:
+        proc = local_processor("192.168.1.50")
+        # First fragment of a large DNS response: MF set, payload truncated. The L4
+        # header is intact, so the flow (who talked to whom) must still surface.
+        pkt = Ether(
+            bytes(
+                Ether()
+                / IP(src="8.8.8.8", dst="192.168.1.50", flags="MF")
+                / UDP(sport=53, dport=54321)
+                / bytes(DNS(qr=1, qd=DNSQR(qname="big.example.com")))[:8]
+            )
+        )
+        pkt.time = PKT_TIME
+        events = proc.process(pkt)
+        assert [type(e) for e in events] == [FlowEvent]  # flow kept, payload not parsed
+        fate = proc.summary()["coverage"]["fate"]
+        assert fate.get("event") == 1
+        assert "no_disclosure" not in fate
+
+    def test_trailing_fragment_marked_ip_fragment(self) -> None:
+        proc = local_processor("192.168.1.50")
+        # A non-first fragment has no L4 header at all (frag offset > 0), so there is
+        # nothing to disclose but the fragment itself.
+        pkt = Ether(
+            bytes(Ether() / IP(src="8.8.8.8", dst="192.168.1.50", frag=100) / (b"\x00" * 40))
+        )
+        pkt.time = PKT_TIME
+        assert proc.process(pkt) == []
+        fate = proc.summary()["coverage"]["fate"]
+        assert fate["ip_fragment"] == 1
+        assert not any(k.startswith("unhandled") for k in fate)
+
+    def test_ipv6_first_fragment_still_records_the_flow(self) -> None:
+        proc = local_processor("2001:db8::50")
+        pkt = Ether(
+            bytes(
+                Ether()
+                / IPv6(src="2001:db8::1", dst="2001:db8::50")
+                / IPv6ExtHdrFragment(offset=0, m=1, nh=17)
+                / UDP(sport=53, dport=54321)
+                / bytes(DNS(qr=1, qd=DNSQR(qname="big.example.com")))[:8]
+            )
+        )
+        pkt.time = PKT_TIME
+        events = proc.process(pkt)
+        assert [type(e) for e in events] == [FlowEvent]
+        assert proc.summary()["coverage"]["fate"].get("event") == 1
+
+    def test_ipv6_trailing_fragment_marked_ip_fragment(self) -> None:
+        proc = local_processor("2001:db8::50")
+        pkt = Ether(
+            bytes(
+                Ether()
+                / IPv6(src="2001:db8::1", dst="2001:db8::50")
+                / IPv6ExtHdrFragment(offset=64, m=0, nh=17)
+                / (b"\x11" * 24)
+            )
+        )
+        pkt.time = PKT_TIME
+        assert proc.process(pkt) == []
+        assert proc.summary()["coverage"]["fate"]["ip_fragment"] == 1
+
+    def test_deduped_first_fragment_marked_ip_fragment(self) -> None:
+        proc = local_processor("192.168.1.50")
+        pkt = Ether(
+            bytes(
+                Ether()
+                / IP(src="8.8.8.8", dst="192.168.1.50", flags="MF")
+                / UDP(sport=53, dport=54321)
+                / (b"\x00" * 8)
+            )
+        )
+        pkt.time = PKT_TIME
+        proc.process(pkt)  # first sight: emits the flow
+        proc.process(pkt)  # flow already seen: no event, honest ip_fragment fate
+        fate = proc.summary()["coverage"]["fate"]
+        assert fate["event"] == 1
+        assert fate["ip_fragment"] == 1
+
+    def test_icmpv6_error_quoting_a_fragment_is_not_mistaken_for_one(self) -> None:
+        # A whole ICMPv6 error quotes the original (fragmented) datagram, header and
+        # all: the fragment header sits inside the error, not in our outer chain.
+        proc = local_processor("2001:db8::50")
+        pkt = Ether(
+            bytes(
+                Ether()
+                / IPv6(src="2001:db8::9", dst="2001:db8::50")
+                / ICMPv6DestUnreach()
+                / IPv6(src="a::1", dst="b::2")
+                / IPv6ExtHdrFragment(offset=5, m=0, nh=17)
+                / UDP()
+                / b"hello"
+            )
+        )
+        pkt.time = PKT_TIME
+        proc.process(pkt)
+        fate = proc.summary()["coverage"]["fate"]
+        assert "ip_fragment" not in fate
+        assert fate["unhandled:icmpv6"] == 1
+
+    def test_fragment_lands_in_exactly_one_fate(self) -> None:
+        proc = local_processor("192.168.1.50")
+        pkt = Ether(
+            bytes(Ether() / IP(src="8.8.8.8", dst="192.168.1.50", frag=100) / (b"\x00" * 8))
+        )
+        pkt.time = PKT_TIME
+        proc.process(pkt)
+        cov = proc.summary()["coverage"]
+        assert cov["packets"] == 1
+        assert sum(cov["fate"].values()) == 1
+
+    def test_plausible_dns_that_fails_to_parse_counts_as_dns_parse_failed(self) -> None:
+        proc = local_processor("192.168.1.50")
+        # A real query whose header lies (ancount=1 with no answer bytes): passes
+        # the shape gate but scapy cannot turn it into a valid message.
+        raw = bytearray(bytes(DNS(qr=0, qd=DNSQR(qname="tracker.example.com"))))
+        struct.pack_into(">H", raw, 6, 1)  # ancount 0 -> 1
+        pkt = Ether() / IP(src="192.168.1.50", dst="8.8.8.8") / UDP(sport=51000, dport=53) / bytes(
+            raw
+        )
+        pkt.time = PKT_TIME
+        proc.process(pkt)
+        cov = proc.summary()["coverage"]
+        assert cov["parse_failed"]["dns"] == 1
+        assert cov["fate"]["event"] == 1  # the flow itself still surfaces
+
+    def test_non_dns_noise_not_counted_as_dns_parse_failed(self) -> None:
+        proc = local_processor("192.168.1.50")
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="8.8.8.8")
+            / UDP(sport=51000, dport=53)
+            / bytes(range(40))
+        )
+        pkt.time = PKT_TIME
+        proc.process(pkt)
+        assert proc.summary()["coverage"]["parse_failed"]["dns"] == 0
+
+    def test_quic_initial_not_miscounted_as_dns_parse_failed(self) -> None:
+        proc = local_processor("192.168.1.50")
+        datagram = encrypt_initial(RFC_DCID, crypto_frame(handshake_message(b"x.example.net")))
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="93.184.216.34")
+            / UDP(sport=50000, dport=443)
+            / datagram
+        )
+        pkt.time = PKT_TIME
+        proc.process(pkt)
+        assert proc.summary()["coverage"]["parse_failed"]["dns"] == 0
 
 
 def dns_response(
