@@ -785,7 +785,11 @@ def _crypto_fragments(plaintext: bytes) -> list[tuple[int, bytes]]:
             if ftype == 0x06:  # CRYPTO
                 offset, pos = _read_varint(plaintext, pos)
                 length, pos = _read_varint(plaintext, pos)
-                frags.append((offset, plaintext[pos : pos + length]))
+                # Skip a zero-length CRYPTO frame: it carries no data, and storing an
+                # empty chunk both spun _reassemble forever and squatted its offset so
+                # the real fragment there was rejected (a network-triggerable vector).
+                if length:
+                    frags.append((offset, plaintext[pos : pos + length]))
                 pos += length
                 continue
             if ftype in (0x02, 0x03):  # ACK / ACK_ECN
@@ -819,7 +823,7 @@ def _reassemble(chunks: dict[int, bytes]) -> bytes:
     # relies on to drop straddling junk rather than blend it into the yielded tail.
     out = bytearray()
     pos = 0
-    while pos in chunks:
+    while chunks.get(pos):  # an empty chunk carries no bytes -> treat as the end, never spin
         out += chunks[pos]
         pos += len(chunks[pos])
     return bytes(out)

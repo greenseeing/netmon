@@ -77,6 +77,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A zero-length QUIC CRYPTO frame can no longer hang the reassembler.** Such a frame
+  is legal on the wire and, since QUIC Initial keys are publicly derivable, attacker-
+  craftable. It made `_crypto_fragments` emit an empty chunk, which spun the stream
+  reassembler forever (a network-triggerable denial of service) and squatted its offset
+  so the real ClientHello fragment there was rejected. Zero-length CRYPTO frames are now
+  skipped, and the reassembler treats an empty chunk as the end of the contiguous prefix.
 - **Reassembler eviction is per-flow LRU, not clear-all.** When the total byte cap
   was exceeded, `TcpReassembler`, `DnsTcpReassembler`, and `QuicReassembler` wiped
   *every* in-flight stream at once, dropping many SNIs together — and for QUIC this

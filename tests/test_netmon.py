@@ -78,6 +78,7 @@ from netmon import (
     _client_stream_start,
     _legacy_parser,
     _parse_run_args,
+    _reassemble,
     _run_parser,
     configure_logging,
     derive_initial_keys,
@@ -680,6 +681,25 @@ class TestQuicSniExtraction:
         hello = r.add(encrypt_initial(legit, crypto_frame(msg[mid:], offset=mid), pn=1))
         assert hello is not None
         assert hello.sni == "legit.example.com"
+
+    def test_reassemble_terminates_on_empty_chunk(self) -> None:
+        # An empty chunk at a reachable offset must be treated as the end of the
+        # contiguous prefix, never spun over forever (a zero-length QUIC CRYPTO frame
+        # is legal on the wire and attacker-craftable).
+        assert _reassemble({0: b""}) == b""
+        assert _reassemble({0: b"abc", 3: b""}) == b"abc"
+        assert _reassemble({0: b"ab", 2: b"cd"}) == b"abcd"  # normal case unchanged
+
+    def test_zero_length_crypto_frame_neither_hangs_nor_squats_offset(self) -> None:
+        # A QUIC Initial with a zero-length CRYPTO frame must not spin the reassembler
+        # and must not occupy offset 0 and block the real ClientHello that follows.
+        r = QuicReassembler()
+        assert r.add(encrypt_initial(RFC_DCID, crypto_frame(b"", offset=0), pn=0)) is None
+        hello = r.add(
+            encrypt_initial(RFC_DCID, crypto_frame(handshake_message(b"real.example.com")), pn=1)
+        )
+        assert hello is not None
+        assert hello.sni == "real.example.com"
 
     def test_coalesced_initial_isolated_by_length_field(self) -> None:
         reasm = QuicReassembler()
