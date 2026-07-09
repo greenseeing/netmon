@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **systemd sandbox hardening** — the recorder unit (install.sh and RUNBOOK, kept
+  in sync) adds the modern defence-in-depth set for a long-lived raw-socket
+  process storing browsing history: `RestrictAddressFamilies` (AF_PACKET capture,
+  AF_NETLINK enumeration, AF_UNIX for asyncio's own socketpair, AF_INET/6 for
+  scapy's ioctl queries), `SystemCallFilter=@system-service`,
+  `SystemCallArchitectures=native`, the `ProtectKernel*`/`ProtectControlGroups`/
+  `ProtectProc=invisible` family, `RestrictNamespaces`, `LockPersonality`,
+  `MemoryDenyWriteExecute`, `RestrictSUIDSGID`, `RestrictRealtime`,
+  `PrivateDevices`, and `MemoryHigh=384M`/`MemoryMax=512M` above the documented
+  worst-case footprint. `systemd-analyze security` exposure improves 6.0 (MEDIUM)
+  → 2.0 (OK), verified offline on systemd 257.
 - **In-run output rotation (`--rotate-mb`, `--rotate-keep`)** — dumpcap-style size
   caps for the recorder: each JSONL file (and the `--pcap` evidence file) rolls to
   a numbered archive at the cap, the active file keeps its canonical name, and

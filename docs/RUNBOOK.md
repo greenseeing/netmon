@@ -163,6 +163,32 @@ ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/log/netmon
 Restart=on-failure
+# Defence-in-depth for a long-lived raw-socket process storing browsing history.
+# AF_PACKET is the capture socket itself; AF_NETLINK backs glibc/scapy interface
+# enumeration (the 60s local-address refresh); AF_UNIX is asyncio's own signal
+# socketpair (asyncio.run creates it at startup); AF_INET/AF_INET6 back scapy's
+# ioctl-based interface queries. @system-service includes ioctl and @network-io
+# (verified on systemd 257). /proc/net stays readable under ProtectProc=invisible
+# (it is /proc/self/net).
+RestrictAddressFamilies=AF_PACKET AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+PrivateDevices=yes
+# Above the documented worst case (~100 MB of bounded tables + interpreter + the
+# 50k-packet queue): reclaim pressure at High gives an operator-visible warning
+# window; the hard Max kills a leak instead of the host swapping.
+MemoryHigh=384M
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
