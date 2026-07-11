@@ -32,8 +32,10 @@ from netmon import (
     consume,
     copy_to_clipboard,
     event_to_cells,
+    event_to_detail,
     open_private_new,
     persist_enabled,
+    printable,
 )
 
 if TYPE_CHECKING:
@@ -116,13 +118,6 @@ def _styled_cells(event: Event) -> list[Text]:
     ]
 
 
-def _format_detail(event: Event) -> str:
-    data = event.model_dump(exclude_none=True)
-    lines = [f"{event.kind}   {event.ts}"]
-    lines += [f"  {k}: {v}" for k, v in data.items() if k not in ("kind", "ts")]
-    return "\n".join(lines)
-
-
 class NetmonApp(App[None]):
     CSS = """
     Screen { layout: horizontal; }
@@ -167,16 +162,24 @@ class NetmonApp(App[None]):
         self._indicated_mode: str | None = None  # last mode painted onto the feed border
 
     def compose(self) -> ComposeResult:
+        # markup=False on every panel: this app renders data, never markup. _paint is
+        # typed to Text, which stops a str at the type level — but a panel added later and
+        # updated directly would slip past mypy, and this is what catches that.
         with Horizontal():
             with Vertical(id="feed-col"):
                 yield DataTable(id="feed")
-                yield Static("(select a row)", id="detail")
+                yield Static("(select a row)", id="detail", markup=False)
             with Vertical(id="side"):
-                yield Static(id="hosts")
-                yield Static(id="kinds")
+                yield Static(id="hosts", markup=False)
+                yield Static(id="kinds", markup=False)
                 yield Sparkline([0.0], id="eps")
-                yield Static(id="health")
+                yield Static(id="health", markup=False)
         yield Footer()
+
+    def _paint(self, selector: str, content: Text) -> None:
+        # The only place this module calls Static.update. Typed to Text, so a raw str —
+        # the crash — cannot reach a panel without mypy saying so.
+        self.query_one(selector, Static).update(content)
 
     def on_mount(self) -> None:
         table = self.query_one("#feed", DataTable)
@@ -282,9 +285,7 @@ class NetmonApp(App[None]):
         # Single source for the detail pane: tracks the shown event so `y` yanks exactly
         # what is on screen, and never leaves a stale event pinned when the pane clears.
         self._detail_event = event
-        self.query_one("#detail", Static).update(
-            _format_detail(event) if event is not None else placeholder
-        )
+        self._paint("#detail", Text(event_to_detail(event) if event is not None else placeholder))
 
     def _mode(self) -> Literal["FOLLOW", "INSPECT", "PAUSED"]:
         return "PAUSED" if self.paused else ("FOLLOW" if self._following else "INSPECT")
@@ -303,13 +304,19 @@ class NetmonApp(App[None]):
     def _render_panels(self) -> None:
         proc = self.session.processor
         hosts = proc.remote_hosts.most_common(12)
-        self.query_one("#hosts", Static).update(
-            "\n".join(f"{c:>5}  {h}" for h, c in hosts) or "(none yet)"
+        # remote_hosts keys are DNS/SNI-learned names straight off the wire, and they never
+        # pass through the feed's cell projection — so they are scrubbed here.
+        self._paint(
+            "#hosts",
+            Text("\n".join(f"{c:>5}  {printable(h)}" for h, c in hosts) or "(none yet)"),
         )
         counts = proc.event_counts
-        self.query_one("#kinds", Static).update(
-            "\n".join(f"{counts[k]:>6}  {k}" for k in sorted(counts, key=lambda k: -counts[k]))
-            or "(none yet)"
+        self._paint(
+            "#kinds",
+            Text(
+                "\n".join(f"{counts[k]:>6}  {k}" for k in sorted(counts, key=lambda k: -counts[k]))
+                or "(none yet)"
+            ),
         )
         self.query_one("#eps", Sparkline).data = self.model.rate_series() or [0.0]
         st = self.session.capture.stats()
@@ -320,7 +327,7 @@ class NetmonApp(App[None]):
             f"udrop   {st.userspace_dropped}\nkdrop   {kd}\n"
         )
         health.append(_MODE_HINT[mode], style=_MODE_STYLE[mode])
-        self.query_one("#health", Static).update(health)
+        self._paint("#health", health)
         self._refresh_mode_indicator(mode)
 
     def _rebuild_feed(self) -> None:
@@ -418,7 +425,7 @@ class NetmonApp(App[None]):
         if self._detail_event is None:
             self.notify("no packet selected", severity="warning")
             return
-        text = _format_detail(self._detail_event)
+        text = event_to_detail(self._detail_event)
         result = await asyncio.to_thread(
             copy_to_clipboard, text, env=os.environ, write=self._term_write
         )

@@ -17,12 +17,14 @@ from netmon import (
     CaptureStats,
     DashboardModel,
     DnsQueryEvent,
+    HttpEvent,
     JsonlWriter,
     PacketProcessor,
     Session,
     TlsSniEvent,
+    event_to_detail,
 )
-from netmon_tui import NetmonApp, _format_detail, run_dashboard
+from netmon_tui import NetmonApp, run_dashboard
 
 TS = "2025-07-02T23:46:40.123+00:00"
 PKT_TIME = 1751500000.123
@@ -70,6 +72,12 @@ def q(name: str) -> DnsQueryEvent:
 
 def sni(name: str) -> TlsSniEvent:
     return TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni=name, alpn=["h2"])
+
+
+def http_with_path(path: str) -> HttpEvent:
+    return HttpEvent(
+        ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=80, method="GET", path=path, host="x.example"
+    )
 
 
 class TestNetmonAppFeed:
@@ -390,9 +398,7 @@ class TestNetmonAppHardening:
             assert app._following is True
             await app.action_quit()
 
-    async def test_copy_detail_yanks_selected_event(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    async def test_copy_detail_yanks_selected_event(self, tmp_path: Path, monkeypatch) -> None:
         # `y` copies the selected packet's detail text (the same text shown in the pane)
         # through the clipboard helper; a confirmed local copy toasts success.
         model = DashboardModel()
@@ -413,7 +419,7 @@ class TestNetmonAppHardening:
             app.query_one("#feed", DataTable).move_cursor(row=0)
             await pilot.pause()
             await pilot.press("y")
-            assert copied == [_format_detail(event)]
+            assert copied == [event_to_detail(event)]
             assert "copyme.example.com" in copied[0]
             assert toasts == ["copied packet detail to clipboard"]
             await app.action_quit()
@@ -484,9 +490,7 @@ class TestNetmonAppHardening:
             assert toasts and "OSC 52" in toasts[0]
             await app.action_quit()
 
-    async def test_copy_detail_failed_result_warns(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    async def test_copy_detail_failed_result_warns(self, tmp_path: Path, monkeypatch) -> None:
         model = DashboardModel()
         app = NetmonApp(make_session(tmp_path), model)
         toasts: list[tuple[str, dict]] = []
@@ -506,9 +510,7 @@ class TestNetmonAppHardening:
             assert toasts[0][1].get("severity") == "warning"
             await app.action_quit()
 
-    async def test_copy_detail_logs_clipboard_event(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    async def test_copy_detail_logs_clipboard_event(self, tmp_path: Path, monkeypatch) -> None:
         model = DashboardModel()
         app = NetmonApp(make_session(tmp_path), model)
         async with app.run_test() as pilot:
@@ -526,7 +528,7 @@ class TestNetmonAppHardening:
                 await pilot.press("y")
             entries = [e for e in logs if e.get("event") == "clipboard_copy"]
             assert entries and entries[0]["result"] == "local"
-            assert entries[0]["chars"] == len(_format_detail(event))
+            assert entries[0]["chars"] == len(event_to_detail(event))
             await app.action_quit()
 
     async def test_term_write_emits_via_driver_from_worker_thread(
@@ -554,8 +556,11 @@ class TestNetmonAppHardening:
     async def test_worker_exception_surfaces_as_raise(self, tmp_path: Path, monkeypatch) -> None:
         # Fix #2: a failure in the consume worker (e.g. disk full) must not be
         # swallowed into a clean exit — run_dashboard re-raises it like headless does.
-        pkt = Ether() / IP(src="10.0.0.5", dst="10.0.0.1") / UDP(sport=5, dport=53) / DNS(
-            rd=1, qd=DNSQR(qname="boom.example", qtype="A")
+        pkt = (
+            Ether()
+            / IP(src="10.0.0.5", dst="10.0.0.1")
+            / UDP(sport=5, dport=53)
+            / DNS(rd=1, qd=DNSQR(qname="boom.example", qtype="A"))
         )
         pkt.time = PKT_TIME
         session = make_session(tmp_path, packets=(pkt,))
@@ -567,3 +572,73 @@ class TestNetmonAppHardening:
         args = argparse.Namespace(read=None, iface=None, bpf=None, tui=True)
         with pytest.raises(OSError, match="disk full"):
             await run_dashboard(session, args)
+
+
+# The exact shape that killed the overnight run: a wire-derived string in which a `[`
+# opens a markup tag parse and what follows it is not a valid tag. A bare `[` does not
+# raise on its own, which is why this survived testing and then fired at 00:23.
+HOSTILE = "evil[x=�].example.com"
+ANSI = "/a\x1b[2Jb\x00c"
+
+
+class TestNetmonAppHostileText:
+    async def test_hostile_sni_in_detail_pane_does_not_raise(self, tmp_path: Path) -> None:
+        # Wire text is data, never markup. The bracket must survive literally, too:
+        # escaping it would corrupt the evidence to protect the renderer.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        async with app.run_test():
+            app._set_detail(sni(HOSTILE))
+            assert "evil[x=" in str(app.query_one("#detail", Static).render())
+            await app.action_quit()
+
+    async def test_hostile_event_at_the_top_of_the_feed_does_not_crash(
+        self, tmp_path: Path
+    ) -> None:
+        # The overnight trigger, with no user interaction: the DataTable auto-highlights
+        # row 0 on the follow-mode repaint, which fires on_data_table_row_highlighted.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            model.add_event(sni(HOSTILE))
+            app._render()
+            await pilot.pause()
+            assert app.is_running
+            assert "evil[x=" in str(app.query_one("#detail", Static).render())
+            await app.action_quit()
+
+    async def test_hostile_hostname_in_hosts_panel_does_not_crash(self, tmp_path: Path) -> None:
+        # The same bug, one panel over: remote_hosts keys are DNS/SNI-derived names that
+        # never pass through the feed's cell projection.
+        session = make_session(tmp_path)
+        app = NetmonApp(session, DashboardModel())
+        async with app.run_test():
+            session.processor.remote_hosts.add(HOSTILE)
+            app._render()
+            assert "evil[x=" in str(app.query_one("#hosts", Static).render())
+            await app.action_quit()
+
+    async def test_control_chars_never_reach_the_feed_cells(self, tmp_path: Path) -> None:
+        # Rich and Textual strip only BEL/BS/VT/FF/CR — an ESC in an HTTP path reaches
+        # the operator's terminal and drives the cursor. A Text wrapper does not help.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test():
+            model.add_event(http_with_path(ANSI))
+            app._render()
+            row = app.query_one("#feed", DataTable).get_row_at(0)
+            assert "\x1b" not in "".join(str(cell) for cell in row)
+            assert "\x00" not in "".join(str(cell) for cell in row)
+            await app.action_quit()
+
+    async def test_no_panel_parses_markup(self, tmp_path: Path) -> None:
+        # The invariant, asserted where it can be violated: every Static this app composes
+        # renders what it is given. A panel added later cannot reintroduce the crash.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        async with app.run_test():
+            panels = app.query_one("#feed-col").query(Static).nodes
+            panels += app.query_one("#side").query(Static).nodes
+            assert panels
+            for panel in panels:
+                panel.update("[bold]x")
+                assert "[bold]x" in str(panel.render())
+            await app.action_quit()

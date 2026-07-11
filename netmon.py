@@ -10,6 +10,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -22,7 +23,7 @@ from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum, auto
 from pathlib import Path
 from typing import Annotated, Any, BinaryIO, Literal, NamedTuple, Protocol, TextIO, cast
 
@@ -158,6 +159,39 @@ RA_RDNSS_NAME = "rdnss"
 
 def dns_rcode(code: Any) -> str:
     return DNS_RCODES.get(int(code), str(int(code)))
+
+
+# A hostname is a type, not a str. TLS SNI (RFC 6066 §3) and a certificate SAN dNSName
+# (RFC 6125 §6.4) are the same grammar, and both name a server in the ledger and the feed
+# — so what counts as a name is decided once, here, at the parse seam.
+#
+# The rule is an allowlist, which is what makes it a bound on ciphertext rather than a
+# denylist chasing bad bytes: control characters, U+FFFD and binary are excluded by
+# construction. It validates and does not normalise — case and IP literals pass through
+# as sent, because netmon reports what the client did, not what the RFC wanted.
+#
+# DNS qnames deliberately do NOT pass through this: `_dmarc.x`, `1.0.0.10.in-addr.arpa`
+# and mDNS instance labels are a wider grammar, and an LDH gate there would delete real
+# telemetry. Nor is NameLedger typed on it — the ledger also holds qnames and the
+# RA_RDNSS_NAME role marker, so the guarantee is a parse-seam one, not a ledger invariant.
+_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_HOSTNAME_RE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+MAX_HOSTNAME_LEN = 253  # RFC 1035 §2.3.4: 255 wire octets -> 253 presentation characters
+
+
+class Hostname(str):
+    __slots__ = ()
+
+    def __new__(cls, value: str) -> "Hostname":
+        assert _HOSTNAME_RE.fullmatch(value), value  # bypassed parse(): programmer error
+        return super().__new__(cls, value)
+
+    @classmethod
+    def parse(cls, raw: str) -> "Hostname | None":
+        name = raw[:-1] if raw.endswith(".") else raw
+        if not 1 <= len(name) <= MAX_HOSTNAME_LEN or not _HOSTNAME_RE.fullmatch(name):
+            return None
+        return cls(name)
 
 
 class Event(BaseModel):
@@ -317,8 +351,18 @@ class NbnsEvent(Event):
 # it can reuse event_host()'s one authority for "the identifying name of an event"
 # instead of re-deriving per-kind host logic against raw dicts.
 _AnyEvent = Annotated[
-    DnsQueryEvent | DnsAnswerEvent | DnsEcsEvent | DnsResponseEvent | DnsHttpsEvent
-    | TlsSniEvent | HttpEvent | FlowEvent | ArpEvent | Icmp6RaEvent | LlmnrEvent | NbnsEvent,
+    DnsQueryEvent
+    | DnsAnswerEvent
+    | DnsEcsEvent
+    | DnsResponseEvent
+    | DnsHttpsEvent
+    | TlsSniEvent
+    | HttpEvent
+    | FlowEvent
+    | ArpEvent
+    | Icmp6RaEvent
+    | LlmnrEvent
+    | NbnsEvent,
     Field(discriminator="kind"),
 ]
 EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(_AnyEvent)
@@ -345,6 +389,44 @@ def iso(ts: float) -> str:
     # the timezone of whoever runs it — the feed, the detail pane, and the JSONL record
     # all read from this one authority. The offset keeps every timestamp unambiguous.
     return datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="milliseconds")
+
+
+# A terminal is an interpreter, and wire text is not ours to run. Rich and Textual strip
+# only BEL/BS/VT/FF/CR, so neither a Text nor a Content stops an \x1b[2J in an HTTP path
+# from driving the operator's cursor, a \n in a User-Agent from forging a line in the
+# detail pane, or a U+202E in a DNS name from rendering moc.live.knab as bank.evil.com —
+# hostname spoofing inside the tool whose whole job is naming the host that was contacted.
+#
+# Map, never drop: deleting the byte lies by omission, and the auditor needs to see it was
+# there. Every substitution is one cell wide, so column widths are untouched. U+FFFD is
+# left alone — it is already printable, and it is the parser's honest mark of a byte that
+# would not decode.
+#
+# The JSONL record needs none of this: it goes through JSONRenderer / model_dump_json, and
+# JSON escapes control bytes losslessly. The TUI and the clipboard are the only two places
+# where wire text becomes raw bytes on a terminal.
+_UNRENDERABLE: dict[int, str] = (
+    {c: chr(0x2400 + c) for c in range(0x20)}  # C0 -> Unicode Control Pictures
+    | {0x7F: "␡"}  # DEL
+    | dict.fromkeys(range(0x80, 0xA0), "�")  # C1: 8-bit CSI/OSC in some terminals
+    | dict.fromkeys(
+        (
+            0x2028,  # line separator: breaks a row exactly as \n does
+            0x2029,
+            0xFEFF,
+            *range(0x200B, 0x2010),  # zero-width and directional marks
+            *range(0x202A, 0x202F),  # bidi embeddings, incl. RIGHT-TO-LEFT OVERRIDE
+            *range(0x2066, 0x206A),  # bidi isolates
+        ),
+        "�",
+    )
+)
+
+
+def printable(value: str) -> str:
+    # Applies to one wire field, never to an assembled block: the layout's own newlines are
+    # added after this, which is what stops a wire \n from forging a line of its own.
+    return value.translate(_UNRENDERABLE)
 
 
 # --- Live dashboard (--tui) presentation model -------------------------------
@@ -479,13 +561,28 @@ def event_detail(event: Event) -> str:
 def event_to_cells(event: Event) -> list[str]:
     # TIME | KIND | DIR | HOST/NAME | DETAIL. Time is the HH:MM:SS.mmm slice of the ISO
     # ts the event already carries, which iso() renders in the host's local timezone.
+    #
+    # The one presentation projection of an event, so the one place the wire-derived cells
+    # are made safe to show. Deliberately not inside event_host/event_detail: those also
+    # back DashboardModel.passes and `query --host`, where scrubbing would change what
+    # matches, not just what is drawn.
     return [
         event.ts[11:23],
         event.kind,
         event_direction(event),
-        event_host(event),
-        event_detail(event),
+        printable(event_host(event)),
+        printable(event_detail(event)),
     ]
+
+
+def event_to_detail(event: Event) -> str:
+    # The detail pane's text, and the exact text `y` yanks — one authority, so what is
+    # copied is what is on screen. Every field is scrubbed as a leaf, before the layout
+    # adds its own newlines.
+    data = event.model_dump(exclude_none=True)
+    lines = [f"{event.kind}   {event.ts}"]
+    lines += [f"  {k}: {printable(str(v))}" for k, v in data.items() if k not in ("kind", "ts")]
+    return "\n".join(lines)
 
 
 class RateBucketer:
@@ -598,6 +695,37 @@ def _parse_alpn(msg: bytes, pos: int, elen: int) -> list[str]:
     return protocols
 
 
+SNI_HOST_NAME = 0x00
+
+
+def _parse_server_name(msg: bytes, pos: int, elen: int) -> Hostname | None:
+    # server_name extension body (RFC 6066 §3): a 2-byte list length, then each entry as
+    # name_type(1) + host_name_length(2) + host_name. Bounded by the extension's own
+    # length, exactly as _parse_alpn is — reading `nlen` against len(msg) instead is what
+    # let a coincidental 0x0000 extension in ciphertext hand back 200 bytes as an "SNI".
+    limit = min(pos + elen, len(msg))
+    if pos + 2 > limit:
+        return None
+    list_end = pos + 2 + int.from_bytes(msg[pos : pos + 2])
+    if list_end > limit:
+        return None  # the list length lies about its own extension
+    # Only the first entry is read, and that is the whole rule: host_name(0) is the only
+    # name_type RFC 6066 defines, and an undefined type has no defined body — so its length
+    # field cannot be trusted to skip it and reach a later entry. Anything but a host_name
+    # first is a malformed list, not a list to walk past.
+    p = pos + 2
+    if p + 3 > list_end or msg[p] != SNI_HOST_NAME:
+        return None
+    nlen = int.from_bytes(msg[p + 1 : p + 3])
+    p += 3
+    if p + nlen > list_end:
+        return None
+    try:
+        return Hostname.parse(msg[p : p + nlen].decode("ascii"))
+    except UnicodeDecodeError:
+        return None
+
+
 def parse_handshake_client_hello(msg: bytes) -> TlsClientHello | None:
     # `msg` begins at the TLS handshake header: type(1) + length(3) + body.
     # Used for both TLS-over-TCP (after stripping the record header) and QUIC
@@ -625,10 +753,7 @@ def parse_handshake_client_hello(msg: bytes) -> TlsClientHello | None:
             elen = int.from_bytes(msg[pos + 2 : pos + 4])
             pos += 4
             if etype == EXT_SERVER_NAME:
-                name_len = int.from_bytes(msg[pos + 3 : pos + 5])
-                if pos + 5 + name_len <= len(msg):
-                    name = msg[pos + 5 : pos + 5 + name_len]
-                    sni = name.decode("ascii", "replace") if name else None
+                sni = _parse_server_name(msg, pos, elen)
             elif etype == EXT_ALPN:
                 alpn = _parse_alpn(msg, pos, elen)
             elif etype == EXT_ENCRYPTED_CLIENT_HELLO:
@@ -641,13 +766,32 @@ def parse_handshake_client_hello(msg: bytes) -> TlsClientHello | None:
     return TlsClientHello(sni=sni, ech=ech, alpn=alpn)
 
 
+TLS_HANDSHAKE = 0x16
+TLS_CLIENT_HELLO = 0x01
+TLS_SERVER_HELLO = 0x02
+TLS_MAX_RECORD = 16384  # RFC 8446 §5.1: TLSPlaintext.length MUST NOT exceed 2^14
+
+
+def _handshake_record_length(payload: bytes, pos: int = 0) -> int | None:
+    # The one authority for "is this a TLS handshake record header, and how long is its
+    # body". legacy_record_version is 0x0300-0x0303, a record may not exceed 2^14, and a
+    # zero-length handshake fragment is forbidden (RFC 8446 §5.1) — bounds a ciphertext
+    # byte pair has to clear before it can pose as the opening of a ClientHello.
+    if pos + 5 > len(payload):
+        return None
+    if payload[pos] != TLS_HANDSHAKE or payload[pos + 1] != 0x03 or payload[pos + 2] > 0x03:
+        return None
+    length = int.from_bytes(payload[pos + 3 : pos + 5])
+    return length if 1 <= length <= TLS_MAX_RECORD else None
+
+
 def _handshake_record_spans(payload: bytes) -> Iterator[tuple[int, int]]:
-    # Yield each consecutive complete TLS handshake (0x16) record as its body's
-    # (start, end) offsets — the one authoritative record walk. Stops at the first
-    # non-handshake record or one whose declared length has not fully arrived.
+    # Yield each consecutive complete TLS handshake record as its body's (start, end)
+    # offsets — the one authoritative record walk. Stops at the first non-handshake
+    # record or one whose declared length has not fully arrived.
     pos = 0
-    while pos + 5 <= len(payload) and payload[pos] == 0x16:
-        end = pos + 5 + int.from_bytes(payload[pos + 3 : pos + 5])
+    while (length := _handshake_record_length(payload, pos)) is not None:
+        end = pos + 5 + length
         if end > len(payload):
             return
         yield pos + 5, end
@@ -667,14 +811,41 @@ def _reassemble_handshake_records(payload: bytes) -> bytes:
     return bytes(out)
 
 
-def parse_client_hello(payload: bytes) -> TlsClientHello | None:
-    # TLS record type 22 (handshake) wrapping a ClientHello (handshake type 1).
-    if len(payload) < 44 or payload[0] != 0x16 or payload[5] != 0x01:
-        return None
+class Scan(Enum):
+    INCOMPLETE = auto()  # keep buffering: more bytes could still complete the message
+    IMPOSSIBLE = auto()  # no future byte can make this stream disclose anything
+
+
+# A hello we could never assemble is a hello we can never parse, so the give-up bound is
+# the reassembler's own per-flow cap, not an invented number — TcpReassembler takes its
+# default from here. Stated twice, they could drift apart, and a per_flow_cap raised to
+# fit a larger post-quantum hello would start declaring legitimate streams IMPOSSIBLE
+# before their buffer was even full: an auditor silently missing a real disclosure.
+MAX_CLIENT_HELLO = 65536
+
+
+def parse_client_hello(payload: bytes) -> TlsClientHello | Scan:
+    # Three answers, not two. A stream that has not disclosed a ClientHello either has not
+    # finished arriving or provably never will, and collapsing those into None is what let
+    # a false-anchored ciphertext flow re-parse a growing 64 KB buffer on every segment
+    # until FIN — squatting on the LRU budget that genuine pending ClientHellos need.
+    if _handshake_record_length(payload) is None:
+        return Scan.INCOMPLETE if len(payload) < 5 else Scan.IMPOSSIBLE
+    if len(payload) >= 6 and payload[5] != TLS_CLIENT_HELLO:
+        return Scan.IMPOSSIBLE
     # Reassemble consecutive handshake records first, so a ClientHello fragmented across
     # records (common with post-quantum key shares) is dissected as one message.
-    # parse_handshake_client_hello waits for the whole handshake before parsing.
-    return parse_handshake_client_hello(_reassemble_handshake_records(payload))
+    handshake = _reassemble_handshake_records(payload)
+    hello = parse_handshake_client_hello(handshake)
+    if hello is not None:
+        return hello
+    if len(handshake) >= 4:
+        declared = 4 + int.from_bytes(handshake[1:4])
+        if declared > MAX_CLIENT_HELLO or len(handshake) >= declared:
+            return Scan.IMPOSSIBLE  # unassemblable, or complete and it disclosed nothing
+    if _cleartext_handshake_over(payload):
+        return Scan.IMPOSSIBLE
+    return Scan.INCOMPLETE
 
 
 TLS_HANDSHAKE_CERTIFICATE = 0x0B
@@ -690,6 +861,19 @@ def _cleartext_handshake_over(payload: bytes) -> bool:
     return pos < len(payload) and payload[pos] != 0x16
 
 
+def is_wildcard_name(name: str) -> bool:
+    return name.startswith("*.")
+
+
+def _certificate_name(raw: str) -> str | None:
+    # A leaf SAN dNSName is the same grammar as an SNI (RFC 6125 §6.4), except that it may
+    # be a wildcard. The wildcard is kept — a caller prefers a concrete SAN over one, so
+    # the marker has to survive — which is why this returns a str: `*.example.com` names a
+    # set of servers, so it is a pattern, not a Hostname.
+    base = raw[2:] if is_wildcard_name(raw) else raw
+    return raw if Hostname.parse(base) is not None else None
+
+
 def _leaf_san_dns_names(body: bytes) -> list[str]:
     # Certificate message body (RFC 5246 §7.4.2): a 3-byte chain length, then each
     # certificate as 3-byte length + DER. Only the leaf (first) names this server.
@@ -700,11 +884,12 @@ def _leaf_san_dns_names(body: bytes) -> list[str]:
             return []
         cert = x509.load_der_x509_certificate(der)
         san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-        return san.value.get_values_for_type(x509.DNSName)
+        names = san.value.get_values_for_type(x509.DNSName)
     except Exception:
         # Untrusted DER off the wire: a malformed or SAN-less certificate discloses
         # nothing, and must never take down the capture loop.
         return []
+    return [name for raw in names if (name := _certificate_name(raw)) is not None]
 
 
 def extract_certificate_sans(payload: bytes) -> list[str] | None:
@@ -1037,11 +1222,20 @@ def _http_tag(host: str | None) -> str | None:
     if not host:
         return None
     name, sep, port = host.rpartition(":")  # tolerate a Host: header carrying :port
-    hostname = name if sep and port.isdigit() else host
+    hostname = Hostname.parse(name if sep and port.isdigit() else host)
+    if hostname is None:
+        return None
     return "captive-portal" if hostname.lower() in CAPTIVE_PORTAL_HOSTS else None
 
 
-def parse_http_request(payload: bytes) -> tuple[str, str, str | None, str | None] | None:
+class HttpRequest(NamedTuple):
+    method: str
+    path: str
+    host: str | None
+    user_agent: str | None
+
+
+def parse_http_request(payload: bytes) -> HttpRequest | None:
     if not payload.startswith(HTTP_METHODS):
         return None
     # Wait for the full header block; a request split across segments is incomplete.
@@ -1060,7 +1254,22 @@ def parse_http_request(payload: bytes) -> tuple[str, str, str | None, str | None
                 host = value.strip()
             case "user-agent":
                 user_agent = value.strip()
-    return parts[0], parts[1], host, user_agent
+    return HttpRequest(parts[0], parts[1], host, user_agent)
+
+
+MAX_HTTP_HEAD = 16384  # 4x the usual server limit: a cookie-heavy request must still parse
+
+
+def scan_client_stream(stream: bytes) -> TlsClientHello | HttpRequest | Scan:
+    # The one question a buffered client stream is asked: what has it disclosed, and if
+    # nothing, can it still? The reassembler decides whether its anchor still holds; this
+    # decides whether the grammar can ever be satisfied. PacketProcessor only composes.
+    if _http_request_start(stream) is not StreamStart.REJECTED:
+        request = parse_http_request(stream)
+        if request is not None:
+            return request
+        return Scan.IMPOSSIBLE if len(stream) > MAX_HTTP_HEAD else Scan.INCOMPLETE
+    return parse_client_hello(stream)
 
 
 DNS_TYPE_SVCB = 64
@@ -1259,37 +1468,61 @@ def remote_scope(addr: str) -> str:
 FlowKey = tuple[str, int, str, int]
 
 
-def _client_stream_start(payload: bytes) -> bool:
+class StreamStart(Enum):
+    OPENS = auto()  # confirmed: these bytes open a stream worth tracking
+    UNDECIDED = auto()  # consistent so far, too few bytes to confirm
+    REJECTED = auto()  # provably not an opening
+
+
+_TLS_RECORD_PREFIX = b"\x16\x03"
+
+
+def _tls_hello_start(payload: bytes, handshake_type: bytes) -> StreamStart:
+    # A prefix too short to carry the handshake type is UNDECIDED, never OPENS. A
+    # ClientHello whose first TCP segment is three bytes must still anchor, or an attacker
+    # segments their way past the monitor — but the guess has to be confirmed once the
+    # bytes that settle it arrive. Trusting it forever is what let mid-stream ciphertext
+    # anchor a flow and then pose as a ClientHello for the rest of the connection.
+    if not (payload.startswith(_TLS_RECORD_PREFIX) or _TLS_RECORD_PREFIX.startswith(payload)):
+        return StreamStart.REJECTED
+    if not payload:
+        return StreamStart.REJECTED
+    if len(payload) < 6:
+        return StreamStart.UNDECIDED
+    if _handshake_record_length(payload) is None or payload[5:6] != handshake_type:
+        return StreamStart.REJECTED
+    return StreamStart.OPENS
+
+
+def _http_request_start(payload: bytes) -> StreamStart:
     if payload.startswith(HTTP_METHODS):
-        return True
-    # TLS handshake record (0x16) with the TLS major version (0x03) whose
-    # handshake type is ClientHello (0x01): excludes the server->client
-    # ServerHello (type 0x02), and the version byte separates a real TLS record
-    # from a DNS-over-TCP length prefix that merely happens to start 0x16.
-    return (
-        payload[:1] == b"\x16"
-        and payload[1:2] == b"\x03"
-        and (len(payload) < 6 or payload[5] == 0x01)
-    )
+        return StreamStart.OPENS
+    if payload and any(method.startswith(payload) for method in HTTP_METHODS):
+        return StreamStart.UNDECIDED
+    return StreamStart.REJECTED
 
 
-def _server_stream_start(payload: bytes) -> bool:
+def _client_stream_start(payload: bytes) -> StreamStart:
+    http = _http_request_start(payload)
+    if http is not StreamStart.REJECTED:
+        return http
+    return _tls_hello_start(payload, b"\x01")
+
+
+def _server_stream_start(payload: bytes) -> StreamStart:
     # The mirror gate for the server->client direction: a TLS handshake record whose
-    # first handshake message is a ServerHello (type 0x02) opens the flight that
-    # carries the TLS 1.2 Certificate in cleartext.
-    return (
-        payload[:1] == b"\x16"
-        and payload[1:2] == b"\x03"
-        and (len(payload) < 6 or payload[5] == 0x02)
-    )
+    # first handshake message is a ServerHello opens the flight that carries the TLS 1.2
+    # Certificate in cleartext.
+    return _tls_hello_start(payload, b"\x02")
 
 
 class _Stream:
-    __slots__ = ("base", "chunks", "size")
+    __slots__ = ("base", "chunks", "confirmed", "size")
 
-    def __init__(self, base: int) -> None:
+    def __init__(self, base: int, confirmed: bool) -> None:
         self.base = base  # TCP sequence number of the first tracked byte
         self.chunks: dict[int, bytes] = {}
+        self.confirmed = confirmed
         self.size = 0
 
 
@@ -1302,10 +1535,10 @@ class TcpReassembler:
     # encrypted application data.
     def __init__(
         self,
-        per_flow_cap: int = 65536,
+        per_flow_cap: int = MAX_CLIENT_HELLO,
         total_cap: int = 4_000_000,
         pending_cap: int = 262144,
-        start: Callable[[bytes], bool] = _client_stream_start,
+        start: Callable[[bytes], StreamStart] = _client_stream_start,
     ) -> None:
         # A single stream can grow to per_flow_cap, so the total budget must hold at
         # least one; otherwise LRU could never bring a lone oversized stream under cap.
@@ -1331,10 +1564,11 @@ class TcpReassembler:
     def add(self, key: FlowKey, seq: int, payload: bytes) -> bytes:
         stream = self._flows.get(key)
         if stream is None:
-            if not self.start(payload):
+            opening = self.start(payload)
+            if opening is StreamStart.REJECTED:
                 self._hold_pending(key, seq, payload)
                 return b""
-            stream = _Stream(seq)
+            stream = _Stream(seq, confirmed=opening is StreamStart.OPENS)
             self._flows[key] = stream
             # Store the verified opening segment's bytes before absorbing pending: the
             # anchor is authoritative, so unverified buffered data can only fill the
@@ -1343,12 +1577,21 @@ class TcpReassembler:
             self._absorb_pending(key, stream)
         else:
             self._store(stream, seq, payload)
+        merged = _reassemble_merged(stream.chunks)
+        if not stream.confirmed:
+            # A prefix too short to settle the question anchored this stream on a guess.
+            # Put the question to the gate again now that more bytes are in hand, against
+            # the contiguous prefix rather than one segment (a gap simply leaves the
+            # anchor provisional). A disconfirmed guess gives the flow back.
+            opening = self.start(merged)
+            if opening is StreamStart.REJECTED:
+                self.drop(key)
+                return b""
+            stream.confirmed = opening is StreamStart.OPENS
         self._flows.move_to_end(key)  # this stream is the one being processed
-        self._total, evicted = _evict_oldest(
-            self._flows, self._total, self.total_cap, _stream_size
-        )
+        self._total, evicted = _evict_oldest(self._flows, self._total, self.total_cap, _stream_size)
         self.cleared += evicted
-        return _reassemble_merged(stream.chunks)
+        return merged
 
     def _store(self, stream: _Stream, seq: int, payload: bytes) -> None:
         offset = seq - stream.base
@@ -1771,8 +2014,8 @@ class PacketProcessor:
                 if self.dns_tcp.tracks(key) or (
                     not self.reassembler.tracks(key)
                     and not self.certs.tracks(key)
-                    and not _client_stream_start(payload)
-                    and not _server_stream_start(payload)
+                    and _client_stream_start(payload) is StreamStart.REJECTED
+                    and _server_stream_start(payload) is StreamStart.REJECTED
                     and _dns_tcp_start(payload)
                 ):
                     for body in self.dns_tcp.add(key, int(tcp.seq), payload):
@@ -1783,45 +2026,48 @@ class PacketProcessor:
                             self.dns_parse_failures += 1
                 else:
                     stream = self.reassembler.add(key, int(tcp.seq), payload)
-                    hello = parse_client_hello(stream) if stream else None
-                    http = None if hello or not stream else parse_http_request(stream)
-                    if hello is not None:
+                    found = scan_client_stream(stream) if stream else Scan.INCOMPLETE
+                    if isinstance(found, TlsClientHello):
                         self.reassembler.drop(key)
-                        events.append(self._sni_event(ts, net, tcp.dport, hello, "tcp"))
-                    elif http:
+                        events.append(self._sni_event(ts, net, tcp.dport, found, "tcp"))
+                    elif isinstance(found, HttpRequest):
                         self.reassembler.drop(key)
-                        method, path, host, user_agent = http
                         events.append(
                             HttpEvent(
                                 ts=ts,
                                 src=net.src,
                                 dst=net.dst,
                                 dport=tcp.dport,
-                                method=method,
-                                path=redact_query_string(path) if self.redact_query else path,
-                                host=host,
-                                user_agent=user_agent,
-                                tag=_http_tag(host),
+                                method=found.method,
+                                path=redact_query_string(found.path)
+                                if self.redact_query
+                                else found.path,
+                                host=found.host,
+                                user_agent=found.user_agent,
+                                tag=_http_tag(found.host),
                             )
                         )
-                    elif not self.reassembler.tracks(key):
-                        # Not the client's opening flight: try the server->client
-                        # direction, where a TLS 1.2 certificate names this server
-                        # even when no SNI was ever captured. A key mid-ClientHello
-                        # is skipped — it can never be the server's flight, and
-                        # buffering it again would let bulk client traffic evict
-                        # genuinely pending server segments.
-                        flight = self.certs.add(key, int(tcp.seq), payload)
-                        sans = extract_certificate_sans(flight) if flight else None
-                        if sans is not None:
-                            self.certs.drop(key)
-                            if sans:
-                                # One name per server IP, wildcards last: a concrete
-                                # SAN paints the sharper picture. Fills gaps only —
-                                # never overwrites a DNS/SNI-learned name.
-                                concrete = [s for s in sans if not s.startswith("*.")]
-                                self.names.observe_if_absent(net.src, (concrete or sans)[0])
-                                cert_san = True
+                    else:
+                        if found is Scan.IMPOSSIBLE:
+                            self.reassembler.drop(key)
+                        if not self.reassembler.tracks(key):
+                            # Not the client's opening flight: try the server->client
+                            # direction, where a TLS 1.2 certificate names this server
+                            # even when no SNI was ever captured. A key mid-ClientHello
+                            # is skipped — it can never be the server's flight, and
+                            # buffering it again would let bulk client traffic evict
+                            # genuinely pending server segments.
+                            flight = self.certs.add(key, int(tcp.seq), payload)
+                            sans = extract_certificate_sans(flight) if flight else None
+                            if sans is not None:
+                                self.certs.drop(key)
+                                if sans:
+                                    # One name per server IP, wildcards last: a concrete
+                                    # SAN paints the sharper picture. Fills gaps only —
+                                    # never overwrites a DNS/SNI-learned name.
+                                    concrete = [s for s in sans if not is_wildcard_name(s)]
+                                    self.names.observe_if_absent(net.src, (concrete or sans)[0])
+                                    cert_san = True
             if flags.F or flags.R:
                 self.reassembler.drop(key)
                 self.certs.drop(key)
@@ -1869,7 +2115,10 @@ class PacketProcessor:
     ) -> TlsSniEvent:
         sni = hello.sni or ""  # ECH-only hello has no cover name; ech still emits
         if sni:
-            self.sni_names.add(sni)
+            # DNS is case-insensitive (RFC 4343), so the counter keys on the folded name
+            # or it buckets Example.com and example.com apart. The event keeps the bytes
+            # as sent: the index normalises, the record does not.
+            self.sni_names.add(sni.lower())
             self.names.observe(net.dst, sni)
         return TlsSniEvent(
             ts=ts,
@@ -2239,6 +2488,7 @@ def _log_write_failure(event: str, exc: Exception, **fields: str) -> None:
 
 class Writer(Protocol):
     write_failures: int
+
     def write(self, event: Event) -> None: ...
     def write_summary(self, summary: dict[str, Any]) -> None: ...
     def close(self) -> None: ...
@@ -2704,9 +2954,7 @@ def build_session(args: argparse.Namespace) -> Session:
 def announce_start(args: argparse.Namespace, session: Session) -> None:
     evidence = str(session.pcap_sink.path) if session.pcap_sink is not None else None
     if args.read:
-        log.info(
-            "replay_started", pcap=args.read, output=str(session.out_dir), evidence=evidence
-        )
+        log.info("replay_started", pcap=args.read, output=str(session.out_dir), evidence=evidence)
     elif isinstance(session.capture, LiveCapture):
         log.info(
             "capture_started",
@@ -2781,9 +3029,7 @@ def finalize(session: Session) -> dict[str, Any]:
     summary["capture"] = {
         "userspace_dropped": st.userspace_dropped,
         "kernel_dropped": "unavailable" if st.kernel_dropped is None else st.kernel_dropped,
-        "kernel_delivered": (
-            "unavailable" if st.kernel_delivered is None else st.kernel_delivered
-        ),
+        "kernel_delivered": ("unavailable" if st.kernel_delivered is None else st.kernel_delivered),
     }
     # A non-zero events_dropped means the record could not be fully written (a full
     # disk, a read-only remount, a quota) and is incomplete — surfaced so a truncated
@@ -2954,9 +3200,13 @@ def cmd_update(argv: list[str]) -> int:
         return 1
     new = git_("rev-parse", "--short", "HEAD").stdout.strip()
     systemctl = shutil.which("systemctl")
-    if systemctl and subprocess.run(
-        [systemctl, "is-active", "--quiet", "netmon.service"], check=False
-    ).returncode == 0:
+    if (
+        systemctl
+        and subprocess.run(
+            [systemctl, "is-active", "--quiet", "netmon.service"], check=False
+        ).returncode
+        == 0
+    ):
         subprocess.run([systemctl, "restart", "netmon.service"], check=False)
         print("restarted netmon.service")
     print(f"netmon updated {old} -> {new}" if old != new else f"already up to date ({new})")

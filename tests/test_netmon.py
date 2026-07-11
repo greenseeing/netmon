@@ -53,6 +53,7 @@ from netmon import (
     EVENT_ADAPTER,
     KIND_STYLE,
     KIND_TO_FILE,
+    MAX_CLIENT_HELLO,
     QUIC_V1,
     QUIC_V2,
     RA_RDNSS_NAME,
@@ -68,6 +69,7 @@ from netmon import (
     DnsTcpReassembler,
     Event,
     FlowEvent,
+    Hostname,
     HttpEvent,
     Icmp6RaEvent,
     JsonlWriter,
@@ -82,8 +84,11 @@ from netmon import (
     QuicReassembler,
     RateBucketer,
     ReplayCapture,
+    Scan,
     Session,
+    StreamStart,
     TcpReassembler,
+    TlsClientHello,
     TlsSniEvent,
     _client_stream_start,
     _dns_tcp_start,
@@ -103,6 +108,7 @@ from netmon import (
     event_direction,
     event_host,
     event_to_cells,
+    event_to_detail,
     extract_certificate_sans,
     finalize,
     header_protection_mask,
@@ -113,6 +119,7 @@ from netmon import (
     parse_client_hello,
     parse_handshake_client_hello,
     parse_http_request,
+    printable,
     question_list,
     refresh_local_ips_loop,
     remote_scope,
@@ -124,10 +131,21 @@ PKT_TIME = 1751500000.123
 EXPECTED_ISO = "2025-07-02T23:46:40.123+00:00"
 
 
+def server_name_entry(name: bytes, name_type: int = 0, declared_len: int | None = None) -> bytes:
+    # One ServerName (RFC 6066 §3): name_type(1) + host_name_length(2) + host_name.
+    # `name_type` and `declared_len` are open so a test can lie about either.
+    declared = len(name) if declared_len is None else declared_len
+    return bytes([name_type]) + struct.pack(">H", declared) + name
+
+
+def server_name_extension(entries: bytes, declared_list_len: int | None = None) -> bytes:
+    body = struct.pack(">H", len(entries) if declared_list_len is None else declared_list_len)
+    body += entries
+    return struct.pack(">H", 0) + struct.pack(">H", len(body)) + body
+
+
 def sni_extension(name: bytes) -> bytes:
-    entry = b"\x00" + struct.pack(">H", len(name)) + name
-    server_name_list = struct.pack(">H", len(entry)) + entry
-    return struct.pack(">H", 0) + struct.pack(">H", len(server_name_list)) + server_name_list
+    return server_name_extension(server_name_entry(name))
 
 
 def padding_extension(size: int) -> bytes:
@@ -179,13 +197,62 @@ def make_syn(src: str, dst: str, sport: int, dport: int, flags: str = "S") -> Pa
 
 def sni_of(payload: bytes) -> str | None:
     hello = parse_client_hello(payload)
-    return hello.sni if hello else None
+    return hello.sni if isinstance(hello, TlsClientHello) else None
 
 
 def single_flow(events: list[Event]) -> FlowEvent:
     (flow,) = events
     assert isinstance(flow, FlowEvent)
     return flow
+
+
+class TestHostname:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "example.com",
+            "a.b.c.example.co.uk",
+            "_dmarc.example.com",  # not strictly LDH, but real as an SNI in the wild
+            "xn--80ak6aa92e.com",  # punycode A-label: kept as sent, never IDNA-decoded
+            "router",  # single-label LAN names are real
+            "cdn-1.example.com",
+            "Example.COM",  # case is preserved: the record reports what was sent
+            "192.0.2.1",  # RFC 6066 forbids it, but a client that sends one is a fact
+        ],
+    )
+    def test_plausible_names_parse(self, raw: str) -> None:
+        assert Hostname.parse(raw) == raw
+
+    def test_trailing_dot_is_stripped(self) -> None:
+        assert Hostname.parse("example.com.") == "example.com"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            ".",
+            "example..com",  # empty label
+            "-lead.example.com",
+            "trail-.example.com",
+            "ex ample.com",
+            "ex\x00ample.com",  # the control bytes the old decode let through verbatim
+            "\x03\x00)\x01\x0b\x00",
+            "exa�mple.com",  # U+FFFD: the parser's own mark of an undecodable byte
+            "héllo.example.com",
+            "*.example.com",  # a wildcard is a pattern, not a hostname
+            "a" * 64 + ".example.com",  # label over 63
+            ("a." * 127) + "example.com",  # name over 253
+        ],
+    )
+    def test_implausible_names_are_rejected(self, raw: str) -> None:
+        assert Hostname.parse(raw) is None
+
+    def test_a_parsed_name_serialises_as_a_plain_string(self) -> None:
+        # It rides TlsSniEvent.sni: a str subclass so Pydantic needs no adapter for it.
+        name = Hostname.parse("example.com")
+        assert isinstance(name, str)
+        event = TlsSniEvent(ts=EXPECTED_ISO, src="a", dst="b", dport=443, sni=name or "")
+        assert json.loads(event.model_dump_json())["sni"] == "example.com"
 
 
 class TestParseClientHello:
@@ -198,36 +265,92 @@ class TestParseClientHello:
         )
         assert sni_of(payload) == "example.com"
 
-    def test_truncated_payload_returns_none(self) -> None:
+    def test_truncated_payload_is_incomplete(self) -> None:
         extensions = padding_extension(6) + sni_extension(b"example.com")
         payload = build_client_hello(extensions=extensions)
         truncated = payload[:50]
         assert len(truncated) >= 44
-        assert parse_client_hello(truncated) is None
+        assert parse_client_hello(truncated) is Scan.INCOMPLETE
 
-    def test_short_payload_below_minimum_length_returns_none(self) -> None:
-        assert parse_client_hello(b"\x16\x03\x01\x00\x05\x01") is None
+    def test_short_payload_below_minimum_length_is_incomplete(self) -> None:
+        assert parse_client_hello(b"\x16\x03\x01\x00\x05\x01") is Scan.INCOMPLETE
 
-    def test_non_tls_payload_returns_none(self) -> None:
-        assert parse_client_hello(b"not a tls record at all, just plain bytes") is None
+    def test_non_tls_payload_is_impossible(self) -> None:
+        payload = b"not a tls record at all, just plain bytes"
+        assert parse_client_hello(payload) is Scan.IMPOSSIBLE
 
-    def test_non_clienthello_handshake_type_returns_none(self) -> None:
+    def test_non_clienthello_handshake_type_is_impossible(self) -> None:
         extensions = sni_extension(b"example.com")
         payload = bytearray(build_client_hello(extensions=extensions))
         payload[5] = 0x02
-        assert parse_client_hello(bytes(payload)) is None
+        assert parse_client_hello(bytes(payload)) is Scan.IMPOSSIBLE
 
-    def test_clienthello_with_no_extensions_returns_none(self) -> None:
+    def test_clienthello_with_no_extensions_is_impossible(self) -> None:
+        # A complete handshake message that disclosed nothing: no later byte can change
+        # that, so the flow is given up on rather than buffered to the cap.
         payload = build_client_hello(extensions=b"")
         assert len(payload) >= 44
-        assert parse_client_hello(payload) is None
+        assert parse_client_hello(payload) is Scan.IMPOSSIBLE
+
+    def test_record_length_over_the_tls_maximum_is_impossible(self) -> None:
+        assert parse_client_hello(b"\x16\x03\x01\xff\xff\x01" + b"\x00" * 64) is Scan.IMPOSSIBLE
+
+    def test_unknown_legacy_version_is_impossible(self) -> None:
+        assert parse_client_hello(b"\x16\x03\x09\x00\x40\x01" + b"\x00" * 64) is Scan.IMPOSSIBLE
 
     def test_no_ech_extension_leaves_flag_false(self) -> None:
         payload = build_client_hello(extensions=sni_extension(b"example.com"))
         hello = parse_client_hello(payload)
-        assert hello is not None
+        assert isinstance(hello, TlsClientHello)
         assert hello.sni == "example.com"
         assert hello.ech is False
+
+
+def binary_server_name(size: int = 176) -> bytes:
+    # The shape the overnight run hit: bytes lifted straight out of a DoT ciphertext
+    # stream, which the parser handed back as an "SNI".
+    return random.Random(0).randbytes(size)
+
+
+class TestServerNameExtension:
+    def test_non_host_name_type_yields_no_sni(self) -> None:
+        # host_name(0) is the only name_type RFC 6066 defines. An undefined type has no
+        # defined body, so its length field cannot be trusted to skip it.
+        entry = server_name_entry(b"example.com", name_type=0x01)
+        payload = build_client_hello(extensions=server_name_extension(entry))
+        assert sni_of(payload) is None
+
+    def test_server_name_list_length_beyond_the_extension_is_rejected(self) -> None:
+        entry = server_name_entry(b"example.com")
+        ext = server_name_extension(entry, declared_list_len=len(entry) + 64)
+        assert sni_of(build_client_hello(extensions=ext)) is None
+
+    def test_name_length_beyond_the_extension_cannot_read_the_next_extension(self) -> None:
+        # An over-declared host_name_length must stay inside its own extension: it can
+        # neither swallow the ALPN extension that follows nor derail the walk past it.
+        lying = server_name_entry(b"safe.example.com", declared_len=200)
+        extensions = server_name_extension(lying) + alpn_extension(b"h2") + ech_extension()
+        hello = parse_client_hello(build_client_hello(extensions=extensions))
+        assert hello is not None
+        assert hello.sni is None
+        assert hello.alpn == ["h2"]
+
+    def test_empty_server_name_extension_yields_no_sni(self) -> None:
+        assert sni_of(build_client_hello(extensions=server_name_extension(b""))) is None
+
+    def test_binary_server_name_yields_no_sni(self) -> None:
+        entry = server_name_entry(binary_server_name())
+        payload = build_client_hello(extensions=server_name_extension(entry))
+        assert sni_of(payload) is None
+
+    def test_ech_still_emits_when_the_server_name_is_binary(self) -> None:
+        # Rejecting the junk name must not swallow the ech=True disclosure alongside it.
+        entry = server_name_entry(binary_server_name())
+        extensions = server_name_extension(entry) + ech_extension()
+        hello = parse_client_hello(build_client_hello(extensions=extensions))
+        assert hello is not None
+        assert hello.sni is None
+        assert hello.ech is True
 
 
 class TestEchDetection:
@@ -297,7 +420,7 @@ class TestEchOnlyEmission:
 
 
 BASE_SEQ = 1000
-CH_RECORD_HEADER = b"\x16\x03\x01\x00\x00\x01"  # TLS record + ClientHello handshake type
+CH_RECORD_HEADER = b"\x16\x03\x01\x01\x00\x01"  # TLS record + ClientHello handshake type
 
 
 def tcp_segment(
@@ -349,18 +472,23 @@ class TestMultiRecordClientHello:
         assert hello is not None
         assert hello.sni == "one.example.com"
 
-    def test_lying_sni_length_cannot_read_past_the_handshake(self) -> None:
-        # A ClientHello whose server_name length field over-declares must not spill the
-        # bytes of a following (now header-stripped) record into the parsed SNI.
-        name = b"safe.example.com"
-        entry = b"\x00" + struct.pack(">H", len(name) + 64) + name  # lying name_len
-        snl = struct.pack(">H", len(entry)) + entry
-        ext = struct.pack(">H", 0) + struct.pack(">H", len(snl)) + snl
+    def test_lying_sni_length_yields_no_hello(self) -> None:
+        # A ClientHello whose server_name length field over-declares is malformed, and a
+        # malformed name is no name: the extension must be rejected outright rather than
+        # clipped to whatever bytes happen to follow it.
+        ext = server_name_extension(server_name_entry(b"safe.example.com", declared_len=80))
         handshake = build_client_hello(extensions=ext)[5:]  # honest handshake length field
         trailing = b"evil.attacker.example/" * 8  # a following record's stripped payload
-        parsed = parse_handshake_client_hello(handshake + trailing)
-        sni = parsed.sni if parsed else None
-        assert sni is None or "attacker" not in sni
+        assert parse_handshake_client_hello(handshake + trailing) is None
+
+    def test_lying_sni_length_with_ech_still_reports_ech(self) -> None:
+        # Rejecting the lying name must not silently swallow a real disclosure with it.
+        ext = server_name_extension(server_name_entry(b"safe.example.com", declared_len=80))
+        handshake = build_client_hello(extensions=ext + ech_extension())[5:]
+        parsed = parse_handshake_client_hello(handshake + b"evil.attacker.example/" * 8)
+        assert parsed is not None
+        assert parsed.sni is None
+        assert parsed.ech is True
 
     def test_non_handshake_record_after_hello_not_concatenated(self) -> None:
         # A 0x17 application-data record following the ClientHello must not be folded
@@ -374,7 +502,7 @@ class TestMultiRecordClientHello:
     def test_incomplete_second_record_waits(self) -> None:
         # The second record's declared length has not fully arrived: no partial parse.
         full = two_record_client_hello(b"partial.example.com")
-        assert parse_client_hello(full[:-50]) is None
+        assert parse_client_hello(full[:-50]) is Scan.INCOMPLETE
 
     def test_two_record_hello_across_tcp_segments_yields_sni(self) -> None:
         # TCP segments a stream at MSS boundaries, not record boundaries, so the second
@@ -453,6 +581,41 @@ class TestSplitClientHelloReassembly:
         assert len(http_events) == 1
         assert http_events[0].host == "example.com"
 
+    def test_three_byte_first_segment_still_anchors_and_yields_sni(self) -> None:
+        # The evasion-resistance guard on the provisional anchor. A ClientHello whose
+        # first segment is too short to carry the handshake type must still be tracked,
+        # or an attacker segments their way past the monitor.
+        proc = local_processor("192.168.1.50")
+        hello = build_client_hello(extensions=sni_extension(b"tiny.example.com"))
+        proc.process(tcp_segment(hello[:3], flags="A", seq=BASE_SEQ))
+        done = proc.process(tcp_segment(hello[3:], flags="PA", seq=BASE_SEQ + 3))
+        sni_events = [e for e in done if isinstance(e, TlsSniEvent)]
+        assert len(sni_events) == 1
+        assert sni_events[0].sni == "tiny.example.com"
+
+    def test_two_byte_http_method_prefix_still_anchors(self) -> None:
+        # The same resistance the TLS side always had, now on the HTTP side: a first
+        # segment of b"GE" used to be rejected outright and the request lost for good.
+        proc = local_processor("192.168.1.50")
+        request = b"GET /a HTTP/1.1\r\nHost: split.example.com\r\n\r\n"
+        proc.process(tcp_segment(request[:2], dport=80, flags="A", seq=BASE_SEQ))
+        done = proc.process(tcp_segment(request[2:], dport=80, flags="PA", seq=BASE_SEQ + 2))
+        http_events = [e for e in done if isinstance(e, HttpEvent)]
+        assert len(http_events) == 1
+        assert http_events[0].host == "split.example.com"
+
+    def test_provisional_anchor_is_dropped_when_it_turns_out_to_be_a_serverhello(self) -> None:
+        # The guess is confirmed once the bytes that settle it arrive, never trusted
+        # forever: a ServerHello is not the client's opening flight.
+        proc = local_processor("192.168.1.50")
+        key = ("192.168.1.50", 51000, "93.184.216.34", 443)
+        proc.process(tcp_segment(b"\x16\x03\x01", flags="A", seq=BASE_SEQ))
+        assert key in proc.reassembler._flows
+        events = proc.process(tcp_segment(b"\x00\x2e\x02" + b"\x00" * 64, seq=BASE_SEQ + 3))
+        assert [e for e in events if isinstance(e, TlsSniEvent)] == []
+        assert key not in proc.reassembler._flows
+        assert proc.reassembler._total == 0
+
     def test_fin_drops_buffer_so_late_segment_is_not_reassembled(self) -> None:
         proc = local_processor("192.168.1.50")
         hello = pq_client_hello(b"dropped.example.com")
@@ -523,6 +686,35 @@ class TestTcpReassembler:
         assert key not in r._flows
         assert r._total == 0
 
+    def test_the_give_up_bound_is_the_buffer_it_gives_up_on(self) -> None:
+        # parse_client_hello calls a hello bigger than MAX_CLIENT_HELLO unassemblable. If
+        # per_flow_cap ever grew past it (to fit a larger post-quantum hello, say), a
+        # legitimate stream would be declared IMPOSSIBLE before its buffer was even full —
+        # the auditor silently missing a real disclosure. One number, so they cannot drift.
+        assert TcpReassembler().per_flow_cap == MAX_CLIENT_HELLO
+
+    def test_record_length_over_the_tls_maximum_is_not_anchored(self) -> None:
+        # A ciphertext byte pair that happens to read 16 03 still has to declare a record
+        # length a TLS record could actually have.
+        r = TcpReassembler()
+        key = ("a", 1, "b", 2)
+        assert r.add(key, 0, b"\x16\x03\x03\xff\xff\x01" + b"\x00" * 64) == b""
+        assert key not in r._flows
+
+    def test_short_ambiguous_prefix_anchors_provisionally(self) -> None:
+        r = TcpReassembler()
+        key = ("a", 1, "b", 2)
+        assert r.add(key, 0, b"\x16\x03") == b"\x16\x03"
+        assert r._flows[key].confirmed is False
+
+    def test_disconfirmed_provisional_anchor_is_dropped_and_bytes_reclaimed(self) -> None:
+        r = TcpReassembler()
+        key = ("a", 1, "b", 2)
+        r.add(key, 0, b"\x16\x03")
+        assert r.add(key, 2, b"\x03\x00\x2e\x02") == b""  # settles as a ServerHello
+        assert key not in r._flows
+        assert r._total == 0
+
 
 class TestTcpReassemblerOverlapAndReorder:
     KEY = ("192.168.1.50", 51000, "93.184.216.34", 443)
@@ -562,7 +754,7 @@ class TestTcpReassemblerOverlapAndReorder:
         r.add(self.KEY, BASE_SEQ, hello[:700])
         out = r.add(self.KEY, BASE_SEQ + 1400, hello[1400:])  # skips [700:1400]
         assert out == hello[:700]
-        assert parse_client_hello(out) is None
+        assert parse_client_hello(out) is Scan.INCOMPLETE
 
     def test_pending_pool_is_byte_bounded_under_a_flood(self) -> None:
         # Every non-opening segment is buffered pending its anchor; a flood of them
@@ -583,7 +775,7 @@ class TestTcpReassemblerOverlapAndReorder:
         r.drop(self.KEY)  # connection reset
         out = r.add(self.KEY, BASE_SEQ, first)  # anchor arrives after the drop
         assert out == first  # only the anchor's own bytes; the tail was discarded
-        assert parse_client_hello(out) is None
+        assert parse_client_hello(out) is Scan.INCOMPLETE
 
     def test_anchor_bytes_win_over_pending_garbage_at_same_seq(self) -> None:
         # A segment carrying non-opening bytes buffered at the sequence the real
@@ -607,6 +799,77 @@ class TestTcpReassemblerOverlapAndReorder:
         server_key = ("93.184.216.34", 443, "192.168.1.50", 51000)
         assert r.add(server_key, 0, b"\x16\x03\x03\x00\x00\x02" + b"\x00" * 4000) == b""
         assert server_key not in r._flows
+
+
+DOT_RESOLVER = "149.112.112.11"
+DOT_CLIENT = "192.168.11.32"
+DOT_KEY = (DOT_CLIENT, 51000, DOT_RESOLVER, 853)
+
+
+def dot_segment(data: bytes, seq: int = BASE_SEQ, flags: str = "A") -> Packet:
+    pkt = (
+        Ether()
+        / IP(src=DOT_CLIENT, dst=DOT_RESOLVER)
+        / TCP(sport=51000, dport=853, flags=flags, seq=seq)
+        / data
+    )
+    pkt.time = PKT_TIME
+    return pkt
+
+
+def false_anchor_ciphertext(count: int = 40) -> list[bytes]:
+    # Encrypted DNS-over-TLS application data whose first captured segment happens to
+    # begin like a handshake record carrying a ClientHello — the mid-stream coincidence
+    # that anchored the reassembler overnight. What follows it is a record of a
+    # different content type, which proves no cleartext handshake can still arrive.
+    rng = random.Random(0)
+    record = b"\x16\x03\x01" + struct.pack(">H", 320) + b"\x01" + rng.randbytes(319)
+    tail = bytearray(rng.randbytes(1081))
+    tail[0] = 0x17  # application data: the handshake is over
+    return [record + bytes(tail)] + [rng.randbytes(1400) for _ in range(count - 1)]
+
+
+def feed_dot(proc: PacketProcessor, chunks: list[bytes]) -> list[Event]:
+    events: list[Event] = []
+    seq = BASE_SEQ
+    for chunk in chunks:
+        events += proc.process(dot_segment(chunk, seq=seq))
+        seq += len(chunk)
+    return events
+
+
+class TestCiphertextFalseAnchor:
+    def test_binary_server_name_is_not_reported_as_an_sni(self) -> None:
+        # The overnight bug end to end: a "ClientHello" whose server_name holds ciphertext
+        # must disclose nothing. A name netmon cannot prove is a hostname is not a name.
+        proc = local_processor(DOT_CLIENT)
+        entry = server_name_entry(binary_server_name())
+        hello = build_client_hello(extensions=server_name_extension(entry))
+        events = proc.process(dot_segment(hello, flags="PA"))
+        assert [e for e in events if isinstance(e, TlsSniEvent)] == []
+
+    def test_binary_server_name_does_not_poison_the_name_ledger(self) -> None:
+        # The blast radius beyond the one event: a junk SNI also names the resolver's IP
+        # in the ledger and buckets it in the top-SNI counter.
+        proc = local_processor(DOT_CLIENT)
+        entry = server_name_entry(binary_server_name())
+        proc.process(dot_segment(build_client_hello(extensions=server_name_extension(entry))))
+        assert proc.names.lookup(DOT_RESOLVER) is None
+        assert proc.sni_names.most_common(1) == []
+
+    def test_ciphertext_flow_is_abandoned_not_buffered(self) -> None:
+        # A stream that can never be a ClientHello must be given up on, not re-parsed
+        # over a growing buffer until FIN. A squatting false anchor also consumes the
+        # reassembler's LRU budget, which can evict genuinely pending ClientHellos.
+        proc = local_processor(DOT_CLIENT)
+        feed_dot(proc, false_anchor_ciphertext())
+        assert DOT_KEY not in proc.reassembler._flows
+        assert proc.reassembler._total == 0
+
+    def test_ciphertext_never_emits_an_sni_event(self) -> None:
+        proc = local_processor(DOT_CLIENT)
+        events = feed_dot(proc, false_anchor_ciphertext())
+        assert [e for e in events if isinstance(e, TlsSniEvent)] == []
 
 
 SERVER_IP = "93.184.216.34"
@@ -668,17 +931,19 @@ def server_certificate_flight(*sans: str) -> bytes:
 
 
 class TestServerStreamStart:
-    def test_serverhello_record_is_a_server_start(self) -> None:
-        assert _server_stream_start(b"\x16\x03\x03\x00\x2e\x02")
+    def test_serverhello_record_opens_the_server_flight(self) -> None:
+        assert _server_stream_start(b"\x16\x03\x03\x00\x2e\x02") is StreamStart.OPENS
 
-    def test_clienthello_record_is_not(self) -> None:
-        assert not _server_stream_start(CH_RECORD_HEADER)
+    def test_clienthello_record_is_rejected(self) -> None:
+        assert _server_stream_start(CH_RECORD_HEADER) is StreamStart.REJECTED
 
-    def test_ambiguous_short_prefix_is_permissive(self) -> None:
-        assert _server_stream_start(b"\x16\x03")
+    def test_ambiguous_short_prefix_is_undecided(self) -> None:
+        # Too few bytes to settle it: anchor provisionally rather than lose a
+        # ServerHello an attacker split across segments.
+        assert _server_stream_start(b"\x16\x03") is StreamStart.UNDECIDED
 
-    def test_application_data_is_not(self) -> None:
-        assert not _server_stream_start(b"\x17\x03\x03\x00\x10")
+    def test_application_data_is_rejected(self) -> None:
+        assert _server_stream_start(b"\x17\x03\x03\x00\x10") is StreamStart.REJECTED
 
 
 class TestExtractCertificateSans:
@@ -906,9 +1171,7 @@ class TestOutputRotation:
             for i in range(10):
                 sink.write(make_syn("192.168.1.50", "93.184.216.34", 40000 + i, 443))
 
-    def test_prune_orders_archives_numerically_past_the_pad_width(
-        self, tmp_path: Path
-    ) -> None:
+    def test_prune_orders_archives_numerically_past_the_pad_width(self, tmp_path: Path) -> None:
         # Lexical ordering would sort 100000 before 99999 and prune the newest
         # archives; the ring must order by sequence number.
         writer = JsonlWriter(tmp_path / "run", rotate_bytes=300, rotate_keep=2)
@@ -1034,9 +1297,7 @@ class TestLiveCaptureQueue:
 
 class TestCmdUpdate:
     def _which(self, *, systemctl: bool = True) -> Any:
-        return lambda name: (
-            None if (name == "systemctl" and not systemctl) else f"/usr/bin/{name}"
-        )
+        return lambda name: None if (name == "systemctl" and not systemctl) else f"/usr/bin/{name}"
 
     def test_refuses_when_git_or_uv_missing(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1328,9 +1589,7 @@ class TestTunnelAndNonEthernet:
         # A tun/wireguard/ppp capture has no Ethernet header — the frame IS the IP
         # packet. It must decode like any other, not fall into a non_ip fate.
         proc = local_processor("192.168.1.50")
-        pkt = IP(src="192.168.1.50", dst="93.184.216.34") / TCP(
-            sport=51000, dport=443, flags="S"
-        )
+        pkt = IP(src="192.168.1.50", dst="93.184.216.34") / TCP(sport=51000, dport=443, flags="S")
         pkt.time = PKT_TIME
         flow = single_flow(proc.process(pkt))
         assert flow.direction == "outbound"
@@ -1338,9 +1597,7 @@ class TestTunnelAndNonEthernet:
 
     def test_raw_ipv6_frame_yields_a_flow(self) -> None:
         proc = local_processor("2606:4700::10")
-        pkt = IPv6(src="2606:4700::10", dst="2606:4700::1") / TCP(
-            sport=51000, dport=443, flags="S"
-        )
+        pkt = IPv6(src="2606:4700::10", dst="2606:4700::1") / TCP(sport=51000, dport=443, flags="S")
         pkt.time = PKT_TIME
         flow = single_flow(proc.process(pkt))
         assert flow.remote_ip == "2606:4700::1"
@@ -1348,8 +1605,10 @@ class TestTunnelAndNonEthernet:
     def test_cooked_linux_frame_decodes_the_ip_inside(self) -> None:
         # A pcap captured with -i any wraps frames in Linux cooked (SLL) headers.
         proc = local_processor("192.168.1.50")
-        pkt = CookedLinux(proto=0x0800) / IP(src="192.168.1.50", dst="93.184.216.34") / TCP(
-            sport=51000, dport=443, flags="S"
+        pkt = (
+            CookedLinux(proto=0x0800)
+            / IP(src="192.168.1.50", dst="93.184.216.34")
+            / TCP(sport=51000, dport=443, flags="S")
         )
         pkt.time = PKT_TIME
         flow = single_flow(proc.process(pkt))
@@ -1414,9 +1673,11 @@ class TestTunnelAndNonEthernet:
         # A fragmented outer header cannot vouch for a complete inner one: never
         # descend into what may be a truncated inner packet.
         proc = local_processor("192.168.1.50")
-        pkt = Ether() / IP(
-            src="192.168.1.50", dst="203.0.113.1", proto=41, flags="MF"
-        ) / (b"\x60" + b"\x00" * 39)
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="203.0.113.1", proto=41, flags="MF")
+            / (b"\x60" + b"\x00" * 39)
+        )
         pkt.time = PKT_TIME
         proc.process(pkt)
         assert proc.summary()["coverage"]["fate"]["ip_fragment"] == 1
@@ -1750,10 +2011,7 @@ class TestQuicViaProcess:
 class TestParseHttpRequest:
     def test_full_request_with_host_and_user_agent(self) -> None:
         payload = (
-            b"GET /index.html HTTP/1.1\r\n"
-            b"Host: example.com\r\n"
-            b"User-Agent: pytest-agent/1.0\r\n"
-            b"\r\n"
+            b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: pytest-agent/1.0\r\n\r\n"
         )
         assert parse_http_request(payload) == (
             "GET",
@@ -1794,8 +2052,14 @@ class TestMalformedPacketResilience:
     # account it, and keep going — one bad packet cannot kill the capture loop.
     @staticmethod
     def _pkt(dns_bytes: bytes):
-        p = Ether(bytes(Ether() / IP(src="10.0.0.5", dst="10.0.0.1")
-                        / UDP(sport=40000, dport=53) / dns_bytes))
+        p = Ether(
+            bytes(
+                Ether()
+                / IP(src="10.0.0.5", dst="10.0.0.1")
+                / UDP(sport=40000, dport=53)
+                / dns_bytes
+            )
+        )
         p.time = PKT_TIME
         return p
 
@@ -1814,8 +2078,14 @@ class TestMalformedPacketResilience:
     def test_fuzzed_malformed_packets_never_crash_the_worker(self) -> None:
         seeds = [
             bytes(DNS(rd=1, qd=DNSQR(qname="example.com", qtype="A"))),
-            bytes(DNS(qr=1, qd=DNSQR(qname="a.com"),
-                      an=DNSRR(rrname="a.com", type="A", rdata="1.1.1.1"), ancount=1)),
+            bytes(
+                DNS(
+                    qr=1,
+                    qd=DNSQR(qname="a.com"),
+                    an=DNSRR(rrname="a.com", type="A", rdata="1.1.1.1"),
+                    ancount=1,
+                )
+            ),
             bytes(DNS(rd=1, qd=DNSQR(qname="x.com"), ar=DNSRROPT(rrname=""))),
         ]
         rng = random.Random(20260708)
@@ -1844,14 +2114,25 @@ class TestNonDnsTrafficOnDnsPorts:
     # so the port bindings actually fire, as they do on a live capture.
     @staticmethod
     def _udp(port: int, payload: bytes) -> Packet:
-        p = Ether(bytes(Ether() / IP(src="115.55.224.86", dst="192.168.11.32")
-                        / UDP(sport=port, dport=port) / payload))
+        p = Ether(
+            bytes(
+                Ether()
+                / IP(src="115.55.224.86", dst="192.168.11.32")
+                / UDP(sport=port, dport=port)
+                / payload
+            )
+        )
         p.time = PKT_TIME
         return p
 
     # A BitTorrent DHT find_node datagram (bencode) like the ones in the report.
-    _DHT = (b"d1:ad2:id20:" + bytes(range(20)) + b"6:target20:" + bytes(range(20, 40))
-            + b"e1:q9:find_node1:t4:abcd1:y1:qe")
+    _DHT = (
+        b"d1:ad2:id20:"
+        + bytes(range(20))
+        + b"6:target20:"
+        + bytes(range(20, 40))
+        + b"e1:q9:find_node1:t4:abcd1:y1:qe"
+    )
 
     @pytest.mark.parametrize("port", [53, 5353])
     def test_dht_noise_is_not_reported_as_dns(self, port: int) -> None:
@@ -2318,14 +2599,10 @@ class TestFlowScope:
         pkt = make_syn("192.168.1.50", "8.8.8.8", 51000, 443)
         assert single_flow(processor.process(pkt)).scope == "internet"
 
-    def test_scope_multicast_for_ipv4_multicast_target(
-        self, processor: PacketProcessor
-    ) -> None:
+    def test_scope_multicast_for_ipv4_multicast_target(self, processor: PacketProcessor) -> None:
         assert remote_scope("239.255.255.250") == "multicast"
 
-    def test_scope_multicast_for_ipv6_multicast_target(
-        self, processor: PacketProcessor
-    ) -> None:
+    def test_scope_multicast_for_ipv6_multicast_target(self, processor: PacketProcessor) -> None:
         assert remote_scope("ff12::8384") == "multicast"
 
     def test_scope_distinguishes_cgnat_loopback_linklocal(self) -> None:
@@ -2342,11 +2619,13 @@ class TestAddressClassFlow:
     # and LAN-internal traffic is 'local', not double-emitted or mislabelled 'transit'.
     def test_both_local_loopback_dedups_to_one_local_flow(self) -> None:
         proc = local_processor("127.0.0.1")
-        req = Ether() / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(
-            sport=54321, dport=5000, flags="S"
+        req = (
+            Ether() / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(sport=54321, dport=5000, flags="S")
         )
-        rep = Ether() / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(
-            sport=5000, dport=54321, flags="SA"
+        rep = (
+            Ether()
+            / IP(src="127.0.0.1", dst="127.0.0.1")
+            / TCP(sport=5000, dport=54321, flags="SA")
         )
         req.time = PKT_TIME
         rep.time = PKT_TIME
@@ -2405,11 +2684,7 @@ class TestServiceGuess:
 
     def test_udp_443_is_quic(self) -> None:
         processor = local_processor("192.168.1.50")
-        pkt = (
-            Ether()
-            / IP(src="192.168.1.50", dst="93.184.216.34")
-            / UDP(sport=51000, dport=443)
-        )
+        pkt = Ether() / IP(src="192.168.1.50", dst="93.184.216.34") / UDP(sport=51000, dport=443)
         pkt.time = PKT_TIME
         assert single_flow(processor.process(pkt)).service == "quic"
 
@@ -2468,9 +2743,7 @@ class TestLogFilePermissions:
         out = tmp_path / "run-x"
         writer = JsonlWriter(out)
         writer.write(
-            DnsQueryEvent(
-                ts=EXPECTED_ISO, src="a", dst="b", transport="udp", qname="x", qtype="A"
-            )
+            DnsQueryEvent(ts=EXPECTED_ISO, src="a", dst="b", transport="udp", qname="x", qtype="A")
         )
         writer.close()
         mode = (out / "dns.jsonl").stat().st_mode
@@ -2665,8 +2938,10 @@ def write_replay_pcap(path: Path) -> None:
         / UDP(sport=54321, dport=53)
         / DNS(rd=1, qd=DNSQR(qname="example.com", qtype="A"))
     )
-    syn = Ether() / IP(src="192.168.1.50", dst="93.184.216.34") / TCP(
-        sport=51000, dport=443, flags="S"
+    syn = (
+        Ether()
+        / IP(src="192.168.1.50", dst="93.184.216.34")
+        / TCP(sport=51000, dport=443, flags="S")
     )
     hello = (
         Ether()
@@ -2774,8 +3049,12 @@ def dns_svcb_packet(
         params.append(SvcParam(key="ech", value=ech))
     cls = DNSRRSVCB if rtype == "SVCB" else DNSRRHTTPS
     rr = cls(
-        rrname=qname, type=rtype, ttl=300, svc_priority=priority,
-        target_name=target, svc_params=params,
+        rrname=qname,
+        type=rtype,
+        ttl=300,
+        svc_priority=priority,
+        target_name=target,
+        svc_params=params,
     )
     pkt = (
         Ether()
@@ -2793,8 +3072,12 @@ class TestDnsHttpsRecords:
     def test_https_answer_emits_event_with_hints_and_ech(self) -> None:
         proc = local_processor("192.168.1.50")
         pkt = dns_svcb_packet(
-            "example.com", alpn=[b"h3", b"h2"], port=443,
-            ipv4hint=["192.0.2.1"], ipv6hint=["2001:db8::1"], ech=b"\x00\x01\x02",
+            "example.com",
+            alpn=[b"h3", b"h2"],
+            port=443,
+            ipv4hint=["192.0.2.1"],
+            ipv6hint=["2001:db8::1"],
+            ech=b"\x00\x01\x02",
         )
         events = proc.process(pkt)
         https = [e for e in events if isinstance(e, DnsHttpsEvent)]
@@ -2834,8 +3117,13 @@ class TestDnsHttpsRecords:
         writer = JsonlWriter(tmp_path / "run-x")
         writer.write(
             DnsHttpsEvent(
-                ts=EXPECTED_ISO, resolver="8.8.8.8", qname="example.com", rtype="HTTPS",
-                priority=1, target="", ttl=300,
+                ts=EXPECTED_ISO,
+                resolver="8.8.8.8",
+                qname="example.com",
+                rtype="HTTPS",
+                priority=1,
+                target="",
+                ttl=300,
             )
         )
         writer.close()
@@ -2850,7 +3138,8 @@ class TestServiceAnnotations:
     def test_captive_portal_host_tagged(self) -> None:
         proc = local_processor("192.168.1.50")
         http = next(
-            e for e in proc.process(self._http_get(b"captive.apple.com"))
+            e
+            for e in proc.process(self._http_get(b"captive.apple.com"))
             if isinstance(e, HttpEvent)
         )
         assert http.tag == "captive-portal"
@@ -2865,7 +3154,8 @@ class TestServiceAnnotations:
     def test_captive_portal_host_with_port_tagged(self) -> None:
         proc = local_processor("192.168.1.50")
         http = next(
-            e for e in proc.process(self._http_get(b"captive.apple.com:80"))
+            e
+            for e in proc.process(self._http_get(b"captive.apple.com:80"))
             if isinstance(e, HttpEvent)
         )
         assert http.tag == "captive-portal"
@@ -2895,8 +3185,12 @@ class TestRunAgainstReplay:
         pcap = tmp_path / "replay.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
         )
         await run(args)
         run_dir = next((tmp_path / "logs").iterdir())
@@ -2911,8 +3205,12 @@ class TestRunAgainstReplay:
         # A wrong -r path must fail with a clean exit, not crash the reader mid-run
         # with a traceback and leave an empty run directory behind.
         args = argparse.Namespace(
-            read=str(tmp_path / "nope.pcap"), iface=None, bpf=None,
-            output=str(tmp_path / "logs"), quiet=True, keep_query=False,
+            read=str(tmp_path / "nope.pcap"),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
         )
         with pytest.raises(SystemExit) as exc:
             await run(args)
@@ -2998,8 +3296,12 @@ class TestDiskFullResilience:
         write_replay_pcap(pcap)
         monkeypatch.setattr(netmon, "open_private_new", lambda _p: _FullDiskFile())
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
         )
         await run(args)  # previously crashed on ENOSPC; must now complete cleanly
 
@@ -3134,8 +3436,12 @@ class TestPcapEvidenceSink:
         pcap = tmp_path / "in.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
         )
         await run(args)  # no `pcap` attr => default off
         run_dir = next((tmp_path / "logs").glob("run-*"))
@@ -3145,23 +3451,31 @@ class TestPcapEvidenceSink:
         pcap = tmp_path / "in.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False, pcap=True,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
+            pcap=True,
         )
         await run(args)
         out = next((tmp_path / "logs").glob("run-*/capture.pcap"))
         assert out.stat().st_mode & 0o077 == 0
 
-    async def test_replay_pcap_round_trips_without_corrupting_packets(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_replay_pcap_round_trips_without_corrupting_packets(self, tmp_path: Path) -> None:
         # `netmon -r <in.pcap> --pcap` reads then re-writes; every packet must survive
         # byte-for-byte so a preserved capture is faithful evidence.
         src = tmp_path / "in.pcap"
         write_replay_pcap(src)
         args = argparse.Namespace(
-            read=str(src), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False, pcap=True,
+            read=str(src),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
+            pcap=True,
         )
         await run(args)
         out = next((tmp_path / "logs").glob("run-*/capture.pcap"))
@@ -3182,7 +3496,10 @@ class TestPcapEvidenceSink:
         monkeypatch.setattr(netmon, "open_private_new_bytes", lambda _p: _FullDiskFile())
         proc = local_processor("192.168.1.50")
         session = Session(
-            tmp_path / "run", proc, NullWriter(), ReplayCapture(pcap),
+            tmp_path / "run",
+            proc,
+            NullWriter(),
+            ReplayCapture(pcap),
             PcapSink(tmp_path / "run" / "capture.pcap"),
         )
         async for pkt in session.capture.packets():
@@ -3382,8 +3699,11 @@ class TestSilentDropHonesty:
         # the shape gate but scapy cannot turn it into a valid message.
         raw = bytearray(bytes(DNS(qr=0, qd=DNSQR(qname="tracker.example.com"))))
         struct.pack_into(">H", raw, 6, 1)  # ancount 0 -> 1
-        pkt = Ether() / IP(src="192.168.1.50", dst="8.8.8.8") / UDP(sport=51000, dport=53) / bytes(
-            raw
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="8.8.8.8")
+            / UDP(sport=51000, dport=53)
+            / bytes(raw)
         )
         pkt.time = PKT_TIME
         proc.process(pkt)
@@ -3499,8 +3819,11 @@ class TestDnsResponseOutcomes:
         writer = JsonlWriter(tmp_path / "run-x")
         writer.write(
             DnsResponseEvent(
-                ts=EXPECTED_ISO, resolver="8.8.8.8", qname="nope.example.com",
-                qtype="A", rcode="NXDOMAIN",
+                ts=EXPECTED_ISO,
+                resolver="8.8.8.8",
+                qname="nope.example.com",
+                qtype="A",
+                rcode="NXDOMAIN",
             )
         )
         writer.close()
@@ -3512,10 +3835,7 @@ class TestDnsResponseOutcomes:
         proc = local_processor("192.168.1.50")
         truncated = bytes(DNS(qr=1, rcode=SERVFAIL, qdcount=1))[:12]
         pkt = (
-            Ether()
-            / IP(src="8.8.8.8", dst="192.168.1.50")
-            / UDP(sport=53, dport=54321)
-            / truncated
+            Ether() / IP(src="8.8.8.8", dst="192.168.1.50") / UDP(sport=53, dport=54321) / truncated
         )
         pkt = Ether(bytes(pkt))
         pkt.time = PKT_TIME
@@ -3728,8 +4048,11 @@ class TestArpDiscovery:
     def test_is_at_emits_resolved_binding(self) -> None:
         proc = local_processor("192.168.1.50")
         pkt = arp_pkt(
-            op=2, psrc="192.168.1.1", hwsrc="11:22:33:44:55:66",
-            pdst="192.168.1.50", hwdst="aa:bb:cc:dd:ee:01",
+            op=2,
+            psrc="192.168.1.1",
+            hwsrc="11:22:33:44:55:66",
+            pdst="192.168.1.50",
+            hwdst="aa:bb:cc:dd:ee:01",
         )
         arp = next(e for e in proc.process(pkt) if isinstance(e, ArpEvent))
         assert arp.op == "is-at"
@@ -3793,8 +4116,12 @@ class TestDnsAuthorityAdditional:
     def test_https_record_in_additional_section_emits_dns_https(self) -> None:
         proc = local_processor("192.168.1.50")
         rr = DNSRRHTTPS(
-            rrname="example.com", type="HTTPS", ttl=300, svc_priority=1,
-            target_name=".", svc_params=[SvcParam(key="alpn", value=[b"h3"])],
+            rrname="example.com",
+            type="HTTPS",
+            ttl=300,
+            svc_priority=1,
+            target_name=".",
+            svc_params=[SvcParam(key="alpn", value=[b"h3"])],
         )
         pkt = (
             Ether()
@@ -3815,7 +4142,9 @@ class TestDnsAuthorityAdditional:
             / IP(src="8.8.8.8", dst="192.168.1.50")
             / UDP(sport=53, dport=54321)
             / DNS(
-                qr=1, rcode=0, qd=DNSQR(qname="example.com"),
+                qr=1,
+                rcode=0,
+                qd=DNSQR(qname="example.com"),
                 ns=DNSRR(rrname="example.com", type="NS", ttl=3600, rdata="ns1.example.net"),
                 ar=DNSRR(rrname="ns1.example.net", type="A", ttl=3600, rdata="192.0.2.53"),
             )
@@ -3832,10 +4161,15 @@ class TestDnsAuthorityAdditional:
             / IP(src="8.8.8.8", dst="192.168.1.50")
             / UDP(sport=53, dport=54321)
             / DNS(
-                qr=1, rcode=3, qd=DNSQR(qname="sub.example.com"),
+                qr=1,
+                rcode=3,
+                qd=DNSQR(qname="sub.example.com"),
                 ns=DNSRRSOA(
-                    rrname="example.com", type="SOA", ttl=3600,
-                    mname="ns1.example.com", rname="hostmaster.example.com",
+                    rrname="example.com",
+                    type="SOA",
+                    ttl=3600,
+                    mname="ns1.example.com",
+                    rname="hostmaster.example.com",
                 ),
             )
         )
@@ -3854,7 +4188,8 @@ class TestDnsAuthorityAdditional:
             / IP(src="8.8.8.8", dst="192.168.1.50")
             / UDP(sport=53, dport=54321)
             / DNS(
-                qr=1, qd=DNSQR(qname="example.com"),
+                qr=1,
+                qd=DNSQR(qname="example.com"),
                 an=DNSRR(rrname="example.com", type="A", ttl=300, rdata="93.184.216.34"),
             )
         )
@@ -3892,8 +4227,11 @@ def dns_tcp_segments(msg: Packet, split_at: int, base_seq: int = 5000) -> list[P
 class TestDnsTcpReassembler:
     def _prefixed(self, qname: str, payload_len: int = 60) -> bytes:
         body = bytes(
-            DNS(qr=1, qd=DNSQR(qname=qname), an=DNSRR(rrname=qname, type="TXT", ttl=60,
-                rdata="x" * payload_len))
+            DNS(
+                qr=1,
+                qd=DNSQR(qname=qname),
+                an=DNSRR(rrname=qname, type="TXT", ttl=60, rdata="x" * payload_len),
+            )
         )
         return len(body).to_bytes(2, "big") + body
 
@@ -4002,7 +4340,8 @@ class TestDnsTcpReassembler:
     def test_process_reassembles_tcp_dns_answer_across_segments(self) -> None:
         proc = local_processor("192.168.1.50")
         msg = DNS(
-            qr=1, qd=DNSQR(qname="big.example.com"),
+            qr=1,
+            qd=DNSQR(qname="big.example.com"),
             an=DNSRR(rrname="big.example.com", type="A", ttl=300, rdata="93.184.216.34"),
         )
         seg1, seg2 = dns_tcp_segments(msg, split_at=20)
@@ -4016,12 +4355,16 @@ class TestDnsTcpReassembler:
     def test_process_single_segment_tcp_dns_still_parses(self) -> None:
         proc = local_processor("192.168.1.50")
         msg = DNS(
-            qr=1, qd=DNSQR(qname="whole.example.com"),
+            qr=1,
+            qd=DNSQR(qname="whole.example.com"),
             an=DNSRR(rrname="whole.example.com", type="A", ttl=300, rdata="1.2.3.4"),
         )
-        full = Ether() / IP(src="8.8.8.8", dst="192.168.1.50") / TCP(
-            sport=53, dport=40000, flags="PA", seq=5000
-        ) / msg
+        full = (
+            Ether()
+            / IP(src="8.8.8.8", dst="192.168.1.50")
+            / TCP(sport=53, dport=40000, flags="PA", seq=5000)
+            / msg
+        )
         full = Ether(bytes(full))
         full.time = PKT_TIME
         answers = [e for e in proc.process(full) if isinstance(e, DnsAnswerEvent)]
@@ -4050,8 +4393,11 @@ class TestDnsNonStandardPorts:
             Ether()
             / IP(src="127.0.0.1", dst="192.168.1.50")
             / UDP(sport=5335, dport=50000)
-            / DNS(qr=1, qd=DNSQR(qname="split.test"),
-                  an=DNSRR(rrname="split.test", type="A", ttl=60, rdata="10.1.2.3"))
+            / DNS(
+                qr=1,
+                qd=DNSQR(qname="split.test"),
+                an=DNSRR(rrname="split.test", type="A", ttl=60, rdata="10.1.2.3"),
+            )
         )
         pkt = Ether(bytes(pkt))
         pkt.time = PKT_TIME
@@ -4067,8 +4413,11 @@ class TestDnsNonStandardPorts:
 
     def test_port_53_unchanged(self) -> None:
         proc = local_processor("192.168.1.50")
-        queries = [e for e in proc.process(dns_query_pkt("std.test", dport=53))
-                   if isinstance(e, DnsQueryEvent)]
+        queries = [
+            e
+            for e in proc.process(dns_query_pkt("std.test", dport=53))
+            if isinstance(e, DnsQueryEvent)
+        ]
         assert len(queries) == 1
         assert queries[0].qname == "std.test"
 
@@ -4092,14 +4441,19 @@ class TestDnsTcpVsTlsRouting:
         # flags2 byte is 0x01 (rcode FORMERR) must NOT be mistaken for a TLS
         # ClientHello — the TLS version byte (0x03) is the discriminator.
         dns_tcp_like = b"\x16\x00" + b"\x00\x00" + b"\x00" + b"\x01" + b"\x00" * 20
-        assert _client_stream_start(dns_tcp_like) is False
-        assert _client_stream_start(b"\x16\x03\x01\x00\x05\x01" + b"\x00" * 20) is True
+        assert _client_stream_start(dns_tcp_like) is StreamStart.REJECTED
+        opens = _client_stream_start(b"\x16\x03\x01\x00\x19\x01" + b"\x00" * 20)
+        assert opens is StreamStart.OPENS
 
     def _formerr_body_in_0x16_band(self) -> bytes:
         for pad in range(5560, 5920):
             body = bytes(
-                DNS(qr=1, rcode=1, qd=DNSQR(qname="big.example.com"),
-                    an=DNSRR(rrname="big.example.com", type="TXT", ttl=60, rdata="x" * pad))
+                DNS(
+                    qr=1,
+                    rcode=1,
+                    qd=DNSQR(qname="big.example.com"),
+                    an=DNSRR(rrname="big.example.com", type="TXT", ttl=60, rdata="x" * pad),
+                )
             )
             if 0x1600 <= len(body) <= 0x16FF and body[3] == 0x01:
                 return body
@@ -4111,10 +4465,18 @@ class TestDnsTcpVsTlsRouting:
         framed = len(body).to_bytes(2, "big") + body
         assert framed[0] == 0x16 and framed[5] == 0x01  # the exact collision
         first, second = framed[:3000], framed[3000:]
-        seg1 = Ether() / IP(src="8.8.8.8", dst="192.168.1.50") / TCP(
-            sport=53, dport=40000, flags="A", seq=7000) / first
-        seg2 = Ether() / IP(src="8.8.8.8", dst="192.168.1.50") / TCP(
-            sport=53, dport=40000, flags="PA", seq=7000 + 3000) / second
+        seg1 = (
+            Ether()
+            / IP(src="8.8.8.8", dst="192.168.1.50")
+            / TCP(sport=53, dport=40000, flags="A", seq=7000)
+            / first
+        )
+        seg2 = (
+            Ether()
+            / IP(src="8.8.8.8", dst="192.168.1.50")
+            / TCP(sport=53, dport=40000, flags="PA", seq=7000 + 3000)
+            / second
+        )
         seg1.time = seg2.time = PKT_TIME
         proc.process(seg1)
         answers = [e for e in proc.process(seg2) if isinstance(e, DnsAnswerEvent)]
@@ -4129,7 +4491,8 @@ class TestDnsTcpVsTlsRouting:
         proc = local_processor("192.168.1.50")
         payload = two_record_client_hello(b"boundary.example.com", alpn_extension(b"h2"))
         first, second = payload[:16389], payload[16389:]  # split exactly at the record edge
-        assert _client_stream_start(first) and not _client_stream_start(second)
+        assert _client_stream_start(first) is StreamStart.OPENS
+        assert _client_stream_start(second) is StreamStart.REJECTED
         assert _dns_tcp_start(second)  # the collision that used to misroute it
         proc.process(tcp_segment(first, flags="A", seq=BASE_SEQ))
         done = proc.process(tcp_segment(second, flags="PA", seq=BASE_SEQ + len(first)))
@@ -4254,10 +4617,19 @@ class TestEventDirection:
     def test_flow_uses_its_direction(self) -> None:
         def flow(direction: str) -> FlowEvent:
             return FlowEvent(
-                ts=TS, proto="tcp", direction=direction, scope="internet", birth="observed",
-                local_ip="10.0.0.5", local_port=51000, remote_ip="1.2.3.4", remote_port=443,
-                service="https", hostname="github.com",
+                ts=TS,
+                proto="tcp",
+                direction=direction,
+                scope="internet",
+                birth="observed",
+                local_ip="10.0.0.5",
+                local_port=51000,
+                remote_ip="1.2.3.4",
+                remote_port=443,
+                service="https",
+                hostname="github.com",
             )
+
         assert event_direction(flow("outbound")) == "→"
         assert event_direction(flow("inbound")) == "←"
         assert event_direction(flow("transit")) == "↔"
@@ -4265,8 +4637,11 @@ class TestEventDirection:
 
     def test_arp_is_link_local_glyph(self) -> None:
         arp = ArpEvent(
-            ts=TS, op="who-has", sender_ip="10.0.0.5",
-            sender_mac="aa:bb:cc:dd:ee:ff", target_ip="10.0.0.1",
+            ts=TS,
+            op="who-has",
+            sender_ip="10.0.0.5",
+            sender_mac="aa:bb:cc:dd:ee:ff",
+            target_ip="10.0.0.1",
         )
         assert event_direction(arp) == "·"
 
@@ -4298,6 +4673,76 @@ class TestIso:
         assert line["timestamp"].endswith("+08:00")
 
 
+def hostile_http() -> HttpEvent:
+    return HttpEvent(
+        ts=TS,
+        src="10.0.0.5",
+        dst="1.2.3.4",
+        dport=80,
+        method="GET",
+        path="/a\x1b[2Jb\x00c",
+        host="x.example",
+        user_agent="curl\n  sni: bank.example.com",
+    )
+
+
+class TestPrintable:
+    def test_control_bytes_become_visible_pictures(self) -> None:
+        assert printable("a\x1b[31mb\x00") == "a␛[31mb␀"
+
+    def test_no_control_byte_survives(self) -> None:
+        scrubbed = printable("".join(chr(c) for c in range(0x20)) + "\x7f")
+        assert not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in scrubbed)
+
+    def test_a_wire_newline_cannot_forge_a_line(self) -> None:
+        # The reason printable() has no newline exemption and is applied to leaf fields
+        # only: a \n in a User-Agent must not write a line of its own into the detail
+        # pane, or into what `y` puts on the operator's clipboard.
+        assert "\n" not in printable("curl\n  sni: bank.example.com")
+
+    def test_bidi_override_is_neutralised(self) -> None:
+        # U+202E renders moc.live.knab as bank.evil.com — hostname spoofing inside a tool
+        # whose entire job is naming the host that was contacted.
+        assert "‮" not in printable("moc.live.knab‮")
+
+    @pytest.mark.parametrize(
+        "text", ["[2001:db8::1]:443", "/search?q=a[0]", "héllo.example.com", "�"]
+    )
+    def test_legitimate_text_survives_unchanged(self, text: str) -> None:
+        # Brackets are legal in an IPv6 Host header and an HTTP path, and U+FFFD is the
+        # parser's honest mark of an undecodable byte. None of it may be mangled.
+        assert printable(text) == text
+
+    def test_length_is_preserved(self) -> None:
+        # One char in, one char out — so the DataTable's column widths are untouched.
+        text = "a\x1b[2Jb\x00c‮d"
+        assert len(printable(text)) == len(text)
+
+    def test_event_to_cells_scrubs_wire_text(self) -> None:
+        # Rich and Textual strip only BEL/BS/VT/FF/CR, so a Text-wrapped cell still
+        # carries an ESC to the terminal. The cell projection is where that stops.
+        cells = "".join(event_to_cells(hostile_http()))
+        assert "\x1b" not in cells
+        assert "\x00" not in cells
+
+    def test_event_to_detail_scrubs_every_field(self) -> None:
+        detail = event_to_detail(hostile_http())
+        assert "\x1b" not in detail
+        assert "\x00" not in detail
+
+    def test_a_wire_newline_cannot_forge_a_detail_line(self) -> None:
+        # The User-Agent tries to write "  sni: bank.example.com" as a line of its own — a
+        # field this event never carried. It stays inside the user_agent line, visibly.
+        detail = event_to_detail(hostile_http())
+        assert "  sni: bank.example.com" not in detail.splitlines()
+        assert "␊  sni: bank.example.com" in detail
+
+    def test_event_to_detail_keeps_one_line_per_field(self) -> None:
+        event = hostile_http()
+        fields = len(event.model_dump(exclude_none=True)) - 2  # kind and ts share line one
+        assert event_to_detail(event).count("\n") == fields
+
+
 class TestEventToCells:
     def test_five_columns_and_time_slice(self) -> None:
         cells = event_to_cells(q("example.com"))  # q() carries the UTC TS literal
@@ -4312,9 +4757,17 @@ class TestEventToCells:
 
     def test_inbound_flow_host_is_hostname_then_ip(self) -> None:
         named = FlowEvent(
-            ts=TS, proto="tcp", direction="inbound", scope="internet", birth="pre-existing",
-            local_ip="10.0.0.5", local_port=443, remote_ip="1.2.3.4", remote_port=51000,
-            service="https", hostname="github.com",
+            ts=TS,
+            proto="tcp",
+            direction="inbound",
+            scope="internet",
+            birth="pre-existing",
+            local_ip="10.0.0.5",
+            local_port=443,
+            remote_ip="1.2.3.4",
+            remote_port=51000,
+            service="https",
+            hostname="github.com",
         )
         anon = named.model_copy(update={"hostname": None})
         assert event_host(named) == "github.com"
@@ -4322,8 +4775,14 @@ class TestEventToCells:
 
     def test_http_detail_has_method_and_path(self) -> None:
         h = HttpEvent(
-            ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=80, method="GET",
-            host="neverssl.com", path="/", user_agent="curl",
+            ts=TS,
+            src="10.0.0.5",
+            dst="1.2.3.4",
+            dport=80,
+            method="GET",
+            host="neverssl.com",
+            path="/",
+            user_agent="curl",
         )
         assert event_detail(h) == "GET /"
 
@@ -4335,8 +4794,15 @@ class TestEventToCells:
             ),
             DnsResponseEvent(ts=TS, resolver="10.0.0.1", qname="x", qtype="A", rcode="NXDOMAIN"),
             DnsHttpsEvent(
-                ts=TS, resolver="10.0.0.1", qname="x", rtype="HTTPS", priority=1,
-                target=".", alpn=["h3"], ech=True, ttl=60,
+                ts=TS,
+                resolver="10.0.0.1",
+                qname="x",
+                rtype="HTTPS",
+                priority=1,
+                target=".",
+                alpn=["h3"],
+                ech=True,
+                ttl=60,
             ),
             DnsEcsEvent(
                 ts=TS, src="10.0.0.5", dst="10.0.0.1", qname="x", client_subnet="1.2.3.0/24"
@@ -4345,17 +4811,34 @@ class TestEventToCells:
                 ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="github.com", alpn=["h2"]
             ),
             HttpEvent(
-                ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=80, method="GET",
-                host="x", path="/", user_agent=None,
+                ts=TS,
+                src="10.0.0.5",
+                dst="1.2.3.4",
+                dport=80,
+                method="GET",
+                host="x",
+                path="/",
+                user_agent=None,
             ),
             FlowEvent(
-                ts=TS, proto="udp", direction="outbound", scope="lan", birth="datagram",
-                local_ip="10.0.0.5", local_port=5353, remote_ip="224.0.0.251",
-                remote_port=5353, service="mdns", hostname=None,
+                ts=TS,
+                proto="udp",
+                direction="outbound",
+                scope="lan",
+                birth="datagram",
+                local_ip="10.0.0.5",
+                local_port=5353,
+                remote_ip="224.0.0.251",
+                remote_port=5353,
+                service="mdns",
+                hostname=None,
             ),
             ArpEvent(
-                ts=TS, op="who-has", sender_ip="10.0.0.5",
-                sender_mac="aa:bb:cc:dd:ee:ff", target_ip="10.0.0.1",
+                ts=TS,
+                op="who-has",
+                sender_ip="10.0.0.5",
+                sender_mac="aa:bb:cc:dd:ee:ff",
+                target_ip="10.0.0.1",
             ),
             Icmp6RaEvent(
                 ts=TS, router="fe80::1", prefixes=["2001:db8::/64"], rdnss=["2001:db8::1"]
@@ -4398,13 +4881,27 @@ class TestRenderHelpersAcrossModuleCopies:
 
         alt = self._alt_module()
         http = alt.HttpEvent(
-            ts=TS, src="127.0.0.1", dst="127.0.0.1", dport=43383, method="GET",
-            host="127.0.0.1:43383", path="/rest/system/error", user_agent=None,
+            ts=TS,
+            src="127.0.0.1",
+            dst="127.0.0.1",
+            dport=43383,
+            method="GET",
+            host="127.0.0.1:43383",
+            path="/rest/system/error",
+            user_agent=None,
         )
         flow = alt.FlowEvent(
-            ts=TS, proto="tcp", direction="outbound", scope="internet", birth="observed",
-            local_ip="127.0.0.1", local_port=1, remote_ip="160.79.104.10", remote_port=443,
-            service="https", hostname="github.com",
+            ts=TS,
+            proto="tcp",
+            direction="outbound",
+            scope="internet",
+            birth="observed",
+            local_ip="127.0.0.1",
+            local_port=1,
+            remote_ip="160.79.104.10",
+            remote_port=443,
+            service="https",
+            hostname="github.com",
         )
         assert not isinstance(http, netmon.HttpEvent)  # genuinely a different class object
         assert event_host(http) == "127.0.0.1:43383"
@@ -4420,8 +4917,13 @@ class TestRunTuiMode:
         pcap = tmp_path / "replay.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False, tui=True,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
+            tui=True,
         )
         await run(args)  # run_dashboard runs headless (no tty), consumes replay, finalizes
         run_dir = next((tmp_path / "logs").iterdir())
@@ -4495,24 +4997,55 @@ def write_query_fixture(run_dir: Path) -> None:
     # A recorded run with a mix of kinds and deliberately-scrambled write order, so a
     # query that returns chronological output proves it sorts rather than echoes files.
     w = JsonlWriter(run_dir)
-    w.write(FlowEvent(
-        ts="2025-07-02T10:00:04.000+00:00", proto="tcp", direction="inbound",
-        scope="local", birth="observed", local_ip="192.168.1.50", local_port=50000,
-        remote_ip="192.168.1.1", remote_port=445, service="microsoft-ds", hostname=None,
-    ))
-    w.write(DnsQueryEvent(
-        ts="2025-07-02T10:00:01.000+00:00", src="192.168.1.50", dst="8.8.8.8",
-        transport="udp", qname="alpha.example", qtype="A",
-    ))
-    w.write(TlsSniEvent(
-        ts="2025-07-02T10:00:02.000+00:00", src="192.168.1.50", dst="93.184.216.34",
-        dport=443, sni="beta.example",
-    ))
-    w.write(FlowEvent(
-        ts="2025-07-02T10:00:03.000+00:00", proto="tcp", direction="outbound",
-        scope="internet", birth="observed", local_ip="192.168.1.50", local_port=51000,
-        remote_ip="93.184.216.34", remote_port=443, service="https", hostname="beta.example",
-    ))
+    w.write(
+        FlowEvent(
+            ts="2025-07-02T10:00:04.000+00:00",
+            proto="tcp",
+            direction="inbound",
+            scope="local",
+            birth="observed",
+            local_ip="192.168.1.50",
+            local_port=50000,
+            remote_ip="192.168.1.1",
+            remote_port=445,
+            service="microsoft-ds",
+            hostname=None,
+        )
+    )
+    w.write(
+        DnsQueryEvent(
+            ts="2025-07-02T10:00:01.000+00:00",
+            src="192.168.1.50",
+            dst="8.8.8.8",
+            transport="udp",
+            qname="alpha.example",
+            qtype="A",
+        )
+    )
+    w.write(
+        TlsSniEvent(
+            ts="2025-07-02T10:00:02.000+00:00",
+            src="192.168.1.50",
+            dst="93.184.216.34",
+            dport=443,
+            sni="beta.example",
+        )
+    )
+    w.write(
+        FlowEvent(
+            ts="2025-07-02T10:00:03.000+00:00",
+            proto="tcp",
+            direction="outbound",
+            scope="internet",
+            birth="observed",
+            local_ip="192.168.1.50",
+            local_port=51000,
+            remote_ip="93.184.216.34",
+            remote_port=443,
+            service="https",
+            hostname="beta.example",
+        )
+    )
     w.close()
 
 
@@ -4598,9 +5131,16 @@ class TestNetmonQuery:
         # query must order by the parsed instant.
         def flow_at(ts: str, remote_ip: str) -> FlowEvent:
             return FlowEvent(
-                ts=ts, proto="tcp", direction="outbound", scope="internet",
-                birth="observed", local_ip="192.168.1.50", local_port=51000,
-                remote_ip=remote_ip, remote_port=443, service="https",
+                ts=ts,
+                proto="tcp",
+                direction="outbound",
+                scope="internet",
+                birth="observed",
+                local_ip="192.168.1.50",
+                local_port=51000,
+                remote_ip=remote_ip,
+                remote_port=443,
+                service="https",
             )
 
         run = tmp_path / "run-x"
@@ -4665,8 +5205,14 @@ class TestRunPersistence:
         pcap = tmp_path / "replay.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False, tui=False, log=False,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
+            tui=False,
+            log=False,
         )
         await run(args)
         assert not (tmp_path / "logs").exists()  # ephemeral: no run dir, no JSONL
@@ -4676,8 +5222,14 @@ class TestRunPersistence:
         pcap = tmp_path / "replay.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False, tui=True, log=False,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
+            tui=True,
+            log=False,
         )
         await run(args)
         assert not (tmp_path / "logs").exists()
@@ -4687,8 +5239,14 @@ class TestRunPersistence:
         pcap = tmp_path / "replay.pcap"
         write_replay_pcap(pcap)
         args = argparse.Namespace(
-            read=str(pcap), iface=None, bpf=None, output=str(tmp_path / "logs"),
-            quiet=True, keep_query=False, tui=True, log=True,
+            read=str(pcap),
+            iface=None,
+            bpf=None,
+            output=str(tmp_path / "logs"),
+            quiet=True,
+            keep_query=False,
+            tui=True,
+            log=True,
         )
         await run(args)
         run_dir = next((tmp_path / "logs").iterdir())

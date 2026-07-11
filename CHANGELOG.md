@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A junk SNI could be read out of encrypted bytes, and then crash the TUI.** An
+  overnight run emitted a `tls_sni` event for a DNS-over-TLS flow whose `sni` held
+  ~200 bytes of ciphertext, which then killed the dashboard with a `MarkupError`.
+  Three defects composed, each now closed independently:
+  - The `server_name` extension walk never read the `name_type` byte and bounded the
+    host name by the whole handshake message instead of the extension's own length, so
+    a coincidental `0x0000` extension in ciphertext yielded a 200-byte "SNI". The walk
+    now follows RFC 6066 §3 and is bounded by `elen`, exactly as `_parse_alpn` already
+    was, and every name passes a new `Hostname` value type — an allowlist grammar
+    (strict-ASCII, LDH + underscore, label ≤63, name ≤253) shared with certificate SAN
+    dNSNames. A name netmon cannot prove is a hostname is no longer a name. Validation
+    only: case and IP literals reach `tls.jsonl` as sent.
+  - A mid-stream TCP segment could false-anchor the reassembler, which then never gave
+    up on the flow — re-parsing a growing 64 KB buffer on every segment until FIN, and
+    squatting on the LRU budget that genuine pending ClientHellos need. The anchor gate
+    is now tri-state (`StreamStart`): a prefix too short to settle the question anchors
+    provisionally and is *confirmed* once the bytes arrive, so an evasive three-byte
+    first segment still anchors (the HTTP side gains the same resistance) while a
+    disconfirmed guess gives the flow back. `parse_client_hello` is likewise tri-state
+    (`Scan`): a stream that provably can never be a ClientHello is abandoned, not
+    buffered. The TLS record header is validated once, in one place, with a legacy-version
+    and 2^14 length bound.
+  - Wire text reached the terminal as *markup*, and — separately and more quietly — as
+    raw control bytes. Rich and Textual strip only BEL/BS/VT/FF/CR, so an `ESC` in an
+    HTTP path already drove the operator's cursor through the feed's DETAIL column, and
+    a `\n` in a User-Agent could forge a line in the detail pane and in the `y` clipboard
+    yank. Every wire-derived leaf now passes through `printable()` (control characters,
+    C1, and bidi/zero-width marks become one-cell Control Pictures — mapped, never
+    dropped, so the auditor still sees the byte was there), every panel is
+    `markup=False`, and a single `Text`-typed `_paint` funnel makes a raw `str` at a
+    panel a mypy error rather than an overnight crash. The JSONL record is unchanged:
+    JSON already escapes control bytes losslessly.
+- **Top-SNI counts no longer split on case.** `sni_names` keys on the case-folded name
+  (DNS is case-insensitive, RFC 4343); the event keeps the bytes as sent.
+
 ### Added
 
 - **Operator-path test coverage** — the trust-critical CLI and capture paths a
