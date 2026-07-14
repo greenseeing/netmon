@@ -1020,14 +1020,31 @@ class EventFilter:
     directions: frozenset[str] = frozenset(DIRECTION_VALUES)
     scopes: frozenset[str] = frozenset(SCOPE_VALUES)
     host: str = ""
+    # The leak dimensions. None (not "the full set") means unconstrained, because unlike kind
+    # or scope, most events have NO finding — so "filter by rule" has to mean "only events
+    # that have one", while "don't filter by rule" must still pass the events that don't.
+    min_severity: Severity | None = None
+    rules: frozenset[str] | None = None
 
     def matches(self, event: Event) -> bool:
-        return (
+        if not (
             event.kind in self.kinds
             and event_direction_name(event) in self.directions
             and event_scope(event) in self.scopes
             and self.host.casefold() in event_host(event).casefold()
-        )
+        ):
+            return False
+        if self.min_severity is None and self.rules is None:
+            return True
+        finding = assess(event)
+        if finding is None:
+            return False  # asked for leaks; this event is not one
+        if (
+            self.min_severity is not None
+            and SEVERITY_RANK[finding.severity] < SEVERITY_RANK[self.min_severity]
+        ):
+            return False  # ranked, never compared as strings — see SEVERITY_RANK
+        return self.rules is None or str(finding.rule) in self.rules
 
     def is_unconstrained(self) -> bool:
         return (
@@ -3778,6 +3795,17 @@ def _query_parser() -> argparse.ArgumentParser:
         help="only events whose peer is in these scopes (repeatable)",
     )
     p.add_argument("--host", default="", help="substring match on the event's host / SNI / qname")
+    p.add_argument(
+        "--min-severity",
+        choices=[str(s) for s in Severity],
+        help="only events whose leak finding is at least this severe",
+    )
+    p.add_argument(
+        "--rule",
+        action="append",
+        choices=[str(r) for r in Rule],
+        help="only events matching these leak rules (repeatable)",
+    )
     return p
 
 
@@ -3790,6 +3818,8 @@ def _filter_from_args(args: argparse.Namespace) -> EventFilter:
         directions=frozenset(args.direction or DIRECTION_VALUES),
         scopes=frozenset(args.scope or SCOPE_VALUES),
         host=args.host,
+        min_severity=Severity(args.min_severity) if args.min_severity else None,
+        rules=frozenset(args.rule) if args.rule else None,
     )
 
 
@@ -3830,17 +3860,72 @@ def _event_time(ev: Event) -> datetime:
     return dt if dt.tzinfo is not None else dt.astimezone()
 
 
-def cmd_query(argv: list[str]) -> int:
-    args = _query_parser().parse_args(argv)
-    run_dir = Path(args.run_dir)
+def _open_run_dir(run_dir: Path, prog: str) -> bool:
     if not run_dir.is_dir():
-        print(f"netmon query: no such run directory: {run_dir}", file=sys.stderr)
-        return 1
+        print(f"netmon {prog}: no such run directory: {run_dir}", file=sys.stderr)
+        return False
     # A completed run always leaves summary.json even if it captured nothing, so a
     # zero-event run is recognised (prints nothing) rather than mistaken for a bad path.
     run_files = set(KIND_TO_FILE.values()) | {"summary.json"}
     if not any((run_dir / name).exists() for name in run_files):
-        print(f"netmon query: not a netmon run directory: {run_dir}", file=sys.stderr)
+        print(f"netmon {prog}: not a netmon run directory: {run_dir}", file=sys.stderr)
+        return False
+    return True
+
+
+def _audit_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="netmon audit",
+        description="re-read a recorded run and report what it disclosed (read-only; no capture)",
+    )
+    p.add_argument("run_dir", help="a logs/run-* directory to read")
+    p.add_argument(
+        "--min-severity",
+        choices=[str(s) for s in Severity],
+        default="low",
+        help="report only findings at least this severe (default: low)",
+    )
+    return p
+
+
+def cmd_audit(argv: list[str]) -> int:
+    # The headless diagnosis surface, and the proof of the whole architecture: findings are
+    # recomputed from the record, so this works on a run captured BEFORE the rules existed.
+    # Nothing was migrated; the evidence was always sufficient.
+    args = _audit_parser().parse_args(argv)
+    run_dir = Path(args.run_dir)
+    if not _open_run_dir(run_dir, "audit"):
+        return 1
+    floor = SEVERITY_RANK[Severity(args.min_severity)]
+    ledger = FindingLedger(cap=1000)
+    for event in _load_run_events(run_dir, frozenset(KIND_VALUES)):
+        finding = assess(event)
+        if finding is not None and SEVERITY_RANK[finding.severity] >= floor:
+            ledger.add(finding)
+    rows = ledger.top(1000)
+    if not rows:
+        print(f"no findings at or above {args.min_severity} in {run_dir}")
+        # Not an assurance: netmon has no notion of "unusual", so this says no known-shape
+        # disclosure was recorded — not that nothing leaked.
+        print("(this means no known-shape disclosure was recorded, not that nothing leaked)")
+        return 0
+    counts = ledger.by_severity()
+    tally = ", ".join(f"{counts[s]} {s}" for s in ("high", "medium", "low") if counts.get(s))
+    print(f"{run_dir}: {tally}\n")
+    for finding, count in rows:
+        seen = f" (x{count})" if count > 1 else ""
+        print(f"[{str(finding.severity).upper():>6}] {finding.rule}{seen}")
+        print(f"         subject: {printable(finding.subject)}")
+        print(f"         leaked : {printable(finding.leaked)}")
+        print(f"         to     : {printable(finding.to)}")
+        print(f"         advice : {finding.advice}\n")
+    return 0
+
+
+def cmd_query(argv: list[str]) -> int:
+    args = _query_parser().parse_args(argv)
+    run_dir = Path(args.run_dir)
+    if not _open_run_dir(run_dir, "query"):
         return 1
     selection = _filter_from_args(args)
     events = [ev for ev in _load_run_events(run_dir, selection.kinds) if selection.matches(ev)]
@@ -3864,6 +3949,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(cmd_service(argv[1:]))
     if argv and argv[0] == "query":
         sys.exit(cmd_query(argv[1:]))
+    if argv and argv[0] == "audit":
+        sys.exit(cmd_audit(argv[1:]))
     if argv and argv[0] == "run":
         args = _parse_run_args(argv[1:])
     else:

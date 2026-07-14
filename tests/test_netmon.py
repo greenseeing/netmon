@@ -5665,6 +5665,53 @@ class TestNetmonQuery:
         assert rows[0]["remote_ip"] == "192.168.1.1"
         assert "hostname" not in rows[0]  # stayed absent, did not resurrect as null
 
+    def test_min_severity_selects_only_the_leaks(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The fixture's lookup goes to 8.8.8.8 -> cleartext-dns, MEDIUM. Nothing in it is HIGH.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--min-severity", "medium")
+        assert {r["kind"] for r in rows} == {"dns_query"}
+        assert query_lines(capsys, str(run), "--min-severity", "high") == []
+
+    def test_min_severity_ranks_rather_than_comparing_strings(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # "high" < "low" as strings. A predicate that compared them that way would drop the
+        # MEDIUM finding from `--min-severity low` instead of including it.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--min-severity", "low")
+        assert {r["kind"] for r in rows} == {"dns_query"}
+
+    def test_rule_filter_selects_one_rule(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--rule", "cleartext-dns")
+        assert {r["kind"] for r in rows} == {"dns_query"}
+        assert query_lines(capsys, str(run), "--rule", "wpad-broadcast") == []
+
+    def test_leak_flags_compose_with_the_other_dimensions(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        assert query_lines(capsys, str(run), "--min-severity", "low", "--scope", "lan") == []
+
+    def test_query_still_prints_the_raw_recorded_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # query is a view over the record, never a rewriter of it: no severity is injected
+        # into the output, because the JSONL is evidence and a finding is interpretation.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        (row,) = query_lines(capsys, str(run), "--min-severity", "medium")
+        assert "severity" not in row and "rule" not in row
+        assert row["qname"] == "alpha.example"
+
     def test_sort_uses_instant_not_lexical_across_offsets(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -5794,3 +5841,110 @@ class TestRunPersistence:
         run_dir = next((tmp_path / "logs").iterdir())
         assert (run_dir / "dns.jsonl").exists()
         assert (run_dir / "netmon.log").exists()
+
+
+class TestNetmonAudit:
+    def _audit(self, capsys: pytest.CaptureFixture[str], *argv: str) -> str:
+        with pytest.raises(SystemExit) as exc:
+            main(["audit", *argv])
+        assert exc.value.code == 0
+        return capsys.readouterr().out
+
+    def test_reports_findings_with_the_full_diagnosis(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        out = self._audit(capsys, str(run))
+        assert "cleartext-dns" in out
+        assert "8.8.8.8" in out
+        # What leaked, to whom, and what to do about it. A finding that cannot be acted on is
+        # just an alarm.
+        assert "leaked :" in out and "to     :" in out and "advice :" in out
+
+    def test_works_on_a_run_recorded_before_findings_existed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # THE headline property, and the whole argument for computing findings instead of
+        # storing them. This run dir holds nothing but JSONL an older netmon wrote: no
+        # findings block, no severity field, no version marker, nothing migrated. The
+        # evidence was always sufficient -- only the interpretation is new.
+        run = tmp_path / "run-old"
+        run.mkdir()
+        (run / "dns.jsonl").write_text(
+            json.dumps(
+                {
+                    "ts": "2025-01-01T10:00:00.000+00:00",
+                    "kind": "dns_query",
+                    "src": "192.168.1.50",
+                    "dst": "8.8.8.8",
+                    "transport": "udp",
+                    "qname": "secret-project.internal",
+                    "qtype": "A",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out = self._audit(capsys, str(run))
+        assert "internal-name-escaped" in out
+        assert "HIGH" in out
+        assert "secret-project.internal" in out
+
+    def test_min_severity_floor(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        assert "cleartext-dns" in self._audit(capsys, str(run), "--min-severity", "medium")
+        out = self._audit(capsys, str(run), "--min-severity", "high")
+        assert "no findings at or above high" in out
+
+    def test_a_quiet_run_does_not_claim_you_are_safe(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # netmon has no notion of "unusual", so "no findings" is a much smaller claim than
+        # "nothing leaked", and it must not be allowed to read as the larger one.
+        run = tmp_path / "run-quiet"
+        run.mkdir()
+        (run / "summary.json").write_text("{}", encoding="utf-8")
+        out = self._audit(capsys, str(run))
+        assert "not that nothing leaked" in out
+
+    def test_rejects_a_path_that_is_not_a_run_directory(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            main(["audit", str(tmp_path)])
+        assert exc.value.code == 1
+        assert "not a netmon run directory" in capsys.readouterr().err
+
+    def test_never_crashes_on_a_hand_edited_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        with (run / "dns.jsonl").open("a", encoding="utf-8") as f:
+            f.write("{ truncated\n")
+        assert "cleartext-dns" in self._audit(capsys, str(run))  # a read-only view, never fatal
+
+    def test_a_hostile_subject_is_scrubbed_before_it_reaches_the_terminal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A report is not a script. The subject came off the wire.
+        run = tmp_path / "run-x"
+        run.mkdir()
+        (run / "llmnr.jsonl").write_text(
+            json.dumps(
+                {
+                    "ts": "2025-01-01T10:00:00.000+00:00",
+                    "kind": "llmnr",
+                    "src": "192.168.1.50",
+                    "dst": "224.0.0.252",
+                    "qname": "evil\u001b[2Jname",
+                    "qtype": "A",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out = self._audit(capsys, str(run))
+        assert "\x1b" not in out

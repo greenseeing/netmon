@@ -10,7 +10,7 @@ Passive network monitor for auditing what your device leaks to the ISP and which
 | `tls.jsonl` | SNI from the ClientHello of every HTTPS connection — TCP TLS and decrypted QUIC Initials (`transport`), the cleartext `alpn` list, with `ech: true` marking a cover name (see Limitations) |
 | `http.jsonl` | Plaintext HTTP requests: method, path, Host, User-Agent; known captive-portal probes carry `tag: "captive-portal"` |
 | `flows.jsonl` | Every new connection: protocol, direction (`outbound`/`inbound` across the LAN edge, `local` for LAN-internal or loopback, `transit` for mirrored upstream traffic), local/remote IP+port, service guess, hostname (reverse-mapped from observed DNS answers), scope (`internet`, `cgnat`, `lan`, `linklocal`, `loopback`, or `multicast`), and a `note` on disclosive services (NTP, STARTTLS mail) |
-| `summary.json` | Written on exit: top DNS names, top SNI hostnames, top internet hosts, event counts |
+| `summary.json` | Written on exit: top DNS names, top SNI hostnames, top internet hosts, event counts, and the run's **leak findings** (see below) |
 
 All events carry ISO 8601 timestamps in the host's local timezone (with an explicit UTC offset) at millisecond precision. Runs that persist — `netmon run --log`, the background recorder, or the legacy `python netmon.py` form — write to `<output>/run-<stamp>/`.
 
@@ -48,7 +48,8 @@ netmon run --log        # ...and persist the JSONL record to logs/run-<stamp>/
 netmon run --headless   # classic per-event stdout logs instead of the dashboard
 netmon update           # pull latest + re-sync deps; restart the recorder if running
 netmon service status   # background recorder: start|stop|status|enable|disable|logs
-netmon query <run-dir>  # filter a recorded run's JSONL by kind/host/scope (read-only)
+netmon query <run-dir>  # filter a recorded run's JSONL by kind/direction/scope/host/leak
+netmon audit <run-dir>  # what did this run disclose? (read-only; no capture)
 ```
 
 Live capture needs `CAP_NET_RAW`: with `--setcap` it just runs; otherwise the launcher re-execs under `sudo` (one prompt). Capture flags carry over — `-i wlan0`, `--bpf 'not port 22'`, `-q`, `-r <pcap>` (replay, no privilege), `--keep-query`, `--pcap`. Stop with Ctrl-C.
@@ -103,6 +104,21 @@ netmon query logs/run-20250702-100000 --kind dns_query --kind tls_sni  # repeata
 ```
 
 Repeat a flag to widen a dimension (`--kind a --kind b` = either); combine flags to narrow (kind **and** scope **and** host). `--scope` classifies the peer at the other end of *any* event, so `--scope internet` includes the DNS query that named the host and the SNI that announced it — not just the flow. The same three vocabularies drive the dashboard's filter, so what you learn here transfers there.
+
+## Leak findings
+
+netmon rates what each recorded event **discloses** — a cleartext `POST`, an internal hostname sent to a public resolver, an EDNS Client-Subnet record carrying your own network prefix — and says what leaked, to whom, and what to do about it. The dashboard shows them in a `leaks` panel; the headless recorder puts the rollup in `summary.json`; and `netmon audit` re-reads a recorded run:
+
+```sh
+netmon audit logs/run-20250702-100000                      # what did this run disclose?
+netmon audit logs/run-20250702-100000 --min-severity high  # just the ones that matter
+netmon query logs/run-20250702-100000 --min-severity high  # ...as the raw recorded events
+netmon query logs/run-20250702-100000 --rule cleartext-http
+```
+
+Findings are **recomputed from the record, never stored in it**. The JSONL stays raw evidence and severity stays interpretation, so improving a rule re-reads every run already on disk — `netmon audit` works on a run captured before this feature existed, with nothing migrated.
+
+**These are not detections.** netmon has no baseline, no threat intelligence, and no notion of "unusual" — see *What this tool does NOT show you*. A rule may only claim what the event's own fields prove, which is why a flow to an SMTP port is rated `medium` and its advice says netmon cannot see whether the client upgraded with STARTTLS, rather than alleging a credential leak it never observed. **An empty leaks panel means no known-shape disclosure was recorded — not that nothing leaked.**
 
 Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
