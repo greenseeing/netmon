@@ -7,8 +7,9 @@ import pytest
 pytest.importorskip("textual")
 
 from scapy.layers.dns import DNS, DNSQR
-from scapy.layers.inet import IP, UDP
+from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.l2 import Ether
+from scapy.packet import Raw
 from structlog.testing import capture_logs
 from textual.widgets import DataTable, SelectionList, Static
 
@@ -20,10 +21,13 @@ from netmon import (
     CaptureStats,
     DashboardModel,
     DnsQueryEvent,
+    Finding,
     HttpEvent,
     JsonlWriter,
     PacketProcessor,
+    Rule,
     Session,
+    Severity,
     TlsSniEvent,
     event_to_detail,
 )
@@ -710,6 +714,95 @@ class TestNetmonAppHardening:
 # raise on its own, which is why this survived testing and then fired at 00:23.
 HOSTILE = "evil[x=�].example.com"
 ANSI = "/a\x1b[2Jb\x00c"
+
+
+class TestNetmonAppLeaksPanel:
+    def _leaky_session(self, tmp_path: Path) -> Session:
+        # A cleartext POST to the internet: the one event a leak auditor most wants named.
+        pkts = (
+            Ether()
+            / IP(src="192.168.1.50", dst="93.184.216.34")
+            / TCP(sport=40000, dport=80, flags="S"),
+            Ether()
+            / IP(src="192.168.1.50", dst="93.184.216.34")
+            / TCP(sport=40000, dport=80, flags="PA", seq=1)
+            / Raw(b"POST /login HTTP/1.1\r\nHost: neverssl.com\r\n\r\n"),
+        )
+        for p in pkts:
+            p.time = PKT_TIME
+        return make_session(tmp_path, pkts)
+
+    async def test_a_leak_is_named_in_the_panel_with_its_count(self, tmp_path: Path) -> None:
+        app = NetmonApp(self._leaky_session(tmp_path), DashboardModel())
+        async with app.run_test() as pilot:
+            for _ in range(10):
+                await pilot.pause()
+                app._render()
+                if "neverssl.com" in str(app.query_one("#leaks", Static).render()):
+                    break
+            panel = str(app.query_one("#leaks", Static).render())
+            assert "neverssl.com" in panel
+            assert "leaks · 1H" in str(app.query_one("#leaks", Static).border_title)
+            await app.action_quit()
+
+    async def test_an_empty_panel_does_not_read_as_an_assurance(self, tmp_path: Path) -> None:
+        # netmon has no notion of "unusual". "Nothing matching a known shape was recorded" is
+        # a much smaller claim than "nothing leaked", and the panel must not imply the latter.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        async with app.run_test():
+            app._render()
+            assert "none recorded" in str(app.query_one("#leaks", Static).render())
+            assert str(app.query_one("#leaks", Static).border_title) == "leaks"
+            await app.action_quit()
+
+    async def test_a_hostile_subject_is_scrubbed_before_it_reaches_the_panel(
+        self, tmp_path: Path
+    ) -> None:
+        # The finding's subject is wire-derived (a queried name), so it is exactly the hole
+        # printable() exists to close — an escape sequence here would drive the operator's
+        # terminal from a panel whose whole job is naming what was contacted.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        async with app.run_test():
+            app.session.processor.findings.add(
+                Finding(
+                    rule=Rule.LAN_NAME_BROADCAST,
+                    severity=Severity.HIGH,
+                    subject="evil\x1b[2Jname",
+                    leaked="x",
+                    to="y",
+                    advice="z",
+                )
+            )
+            app._render()
+            panel = str(app.query_one("#leaks", Static).render())
+            assert "\x1b" not in panel
+            await app.action_quit()
+
+    async def test_a_high_severity_row_is_accented_in_the_feed(self, tmp_path: Path) -> None:
+        # Links the panel to the feed without adding a sixth column.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            model.add_event(
+                HttpEvent(
+                    ts=TS,
+                    src="192.168.1.50",
+                    dst="93.184.216.34",
+                    dport=80,
+                    method="POST",
+                    host="neverssl.com",
+                    path="/login",
+                )
+            )
+            model.add_event(q("benign.example.com"))
+            app._render()
+            await pilot.pause()
+            table = app.query_one("#feed", DataTable)
+            benign_dir = table.get_row_at(0)[2]  # newest-first: the dns_query, added last
+            leaky_dir = table.get_row_at(1)[2]  # the cleartext POST
+            assert "red" in str(leaky_dir.style)
+            assert "red" not in str(benign_dir.style)
+            await app.action_quit()
 
 
 class TestNetmonAppHostileText:

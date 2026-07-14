@@ -852,6 +852,19 @@ class FindingLedger:
 # authority per fact — the feed's per-kind colour, direction glyph, and the
 # HOST/NAME and DETAIL projections of an Event all live here, once.
 
+# One style and one single-cell glyph per severity, so the leaks panel aligns in a
+# fixed-width column. An invariant test asserts every Severity is covered.
+SEVERITY_STYLE: dict[Severity, str] = {
+    Severity.HIGH: "bold red",
+    Severity.MEDIUM: "yellow",
+    Severity.LOW: "dim white",
+}
+SEVERITY_GLYPH: dict[Severity, str] = {
+    Severity.HIGH: "!",
+    Severity.MEDIUM: "•",
+    Severity.LOW: "·",
+}
+
 # One truecolor style token per emitted kind, so a row is recognisable by colour
 # at a glance. An invariant test asserts every KIND_TO_FILE key is covered.
 KIND_STYLE: dict[str, str] = {

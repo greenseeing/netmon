@@ -27,12 +27,17 @@ from netmon import (
     KIND_STYLE,
     KIND_VALUES,
     SCOPE_VALUES,
+    SEVERITY_GLYPH,
+    SEVERITY_STYLE,
     CopyResult,
     DashboardModel,
     Event,
     EventFilter,
+    PacketProcessor,
     Session,
+    Severity,
     announce_start,
+    assess,
     configure_logging,
     consume,
     copy_to_clipboard,
@@ -119,10 +124,20 @@ def _fit_column_widths(feed_width: int) -> list[int]:
 def _styled_cells(event: Event) -> list[Text]:
     style = KIND_STYLE.get(event.kind, "white")
     ts, kind, direction, host, detail = event_to_cells(event)
+    # A high-severity finding accents the row's existing DIR cell rather than adding a
+    # sixth column: event_to_cells returns exactly five, and _fit_column_widths is built on
+    # that count, so a new column would ripple through the layout. This is enough to tell
+    # the operator which line the leaks panel is talking about.
+    finding = assess(event)
+    dir_style = (
+        SEVERITY_STYLE[finding.severity]
+        if finding is not None and finding.severity is Severity.HIGH
+        else style
+    )
     return [
         Text(ts, style="dim"),
         Text(kind, style=style),
-        Text(direction, style=style),
+        Text(direction, style=dir_style),
         Text(host, style=f"bold {style}"),
         Text(detail, style="dim"),
     ]
@@ -183,7 +198,7 @@ class NetmonApp(App[None]):
     #feed.inspecting { border: round $warning; border-title-color: $warning; }
     #feed.paused { border: round $error; border-title-color: $error; }
     #detail { height: 1fr; border: round $secondary; padding: 0 1; color: $text-muted; }
-    #hosts, #kinds, #health { border: round $accent; padding: 0 1; }
+    #leaks, #hosts, #kinds, #health { border: round $accent; padding: 0 1; }
     #eps { height: 5; border: round $accent; }
     """
 
@@ -233,6 +248,8 @@ class NetmonApp(App[None]):
                 yield DataTable(id="feed")
                 yield Static("(select a row)", id="detail", markup=False)
             with Vertical(id="side"):
+                # First in the column: the leaks are the headline, not a footnote.
+                yield Static(id="leaks", markup=False)
                 yield Static(id="hosts", markup=False)
                 yield Static(id="kinds", markup=False)
                 yield Sparkline([0.0], id="eps")
@@ -251,6 +268,7 @@ class NetmonApp(App[None]):
         for wid, title in (
             ("#feed", "live feed"),
             ("#detail", "detail"),
+            ("#leaks", "leaks"),
             ("#hosts", "top hosts"),
             ("#kinds", "by kind"),
             ("#eps", "events/sec"),
@@ -383,8 +401,39 @@ class NetmonApp(App[None]):
             title if self.model.filter.is_unconstrained() else f"{title} · filter: {label}"
         )
 
+    def _render_leaks(self, proc: PacketProcessor) -> None:
+        rows = proc.findings.top(10)
+        panel = Text()
+        for i, (finding, count) in enumerate(rows):
+            if i:
+                panel.append("\n")
+            style = SEVERITY_STYLE[finding.severity]
+            panel.append(f"{SEVERITY_GLYPH[finding.severity]} ", style=style)
+            # subject is wire-derived — a queried name, an SNI, an address — so it goes
+            # through printable() before it reaches a terminal, exactly like every other
+            # panel that shows something off the wire. This is the hole printable() exists
+            # to close, not belt-and-braces.
+            panel.append(f"{printable(finding.subject)[:18]:<18}", style=style)
+            panel.append(f"{count:>5}", style="dim")
+        if not rows:
+            # An empty panel must not read as an assurance. netmon has no notion of
+            # "unusual": nothing matching a known shape was recorded, which is a smaller
+            # claim than "nothing leaked".
+            panel.append("(none recorded)", style="dim")
+        self._paint("#leaks", panel)
+        counts = proc.findings.by_severity()
+        tally = " ".join(
+            f"{counts[str(sev)]}{str(sev)[0].upper()}"
+            for sev in (Severity.HIGH, Severity.MEDIUM, Severity.LOW)
+            if counts.get(str(sev))
+        )
+        self.query_one("#leaks", Static).border_title = Text(
+            f"leaks · {tally}" if tally else "leaks"
+        )
+
     def _render_panels(self) -> None:
         proc = self.session.processor
+        self._render_leaks(proc)
         hosts = proc.remote_hosts.most_common(12)
         # remote_hosts keys are DNS/SNI-learned names straight off the wire, and they never
         # pass through the feed's cell projection — so they are scrubbed here.
