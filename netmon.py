@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import socket
+import string
 import struct
 import subprocess
 import sys
@@ -639,6 +640,27 @@ _DEMOTE = {
 }
 
 
+def _ptr_address(name: str) -> str | None:
+    # Rebuild the address a reverse-lookup name is asking about. Both forms reverse their
+    # labels, but they do NOT reconstruct the same way, and treating them alike is a trap:
+    # in-addr.arpa reverses four octets and rejoins them with dots, while ip6.arpa reverses
+    # THIRTY-TWO nibbles that must be regrouped into hextets and joined with colons. Joining
+    # nibbles with dots yields a string no parser accepts, remote_scope() then falls back to
+    # "lan" for anything unparseable, and every public IPv6 PTR gets branded an escaped
+    # internal name — a HIGH finding on ordinary reverse DNS, which is precisely the
+    # cry-wolf failure the rules exist to avoid.
+    if name.endswith(".in-addr.arpa"):
+        labels = name.removesuffix(".in-addr.arpa").split(".")
+        return ".".join(reversed(labels)) if len(labels) == 4 else None
+    if name.endswith(".ip6.arpa"):
+        nibbles = name.removesuffix(".ip6.arpa").split(".")
+        if len(nibbles) != 32 or not all(n in string.hexdigits and len(n) == 1 for n in nibbles):
+            return None  # a partial or malformed PTR proves nothing
+        digits = "".join(reversed(nibbles))
+        return ":".join(digits[i : i + 4] for i in range(0, 32, 4))
+    return None
+
+
 def _is_internal_name(qname: str) -> bool:
     name = qname.rstrip(".").casefold()
     if not name:
@@ -648,11 +670,11 @@ def _is_internal_name(qname: str) -> bool:
     if "." not in name:
         return True  # a single label: a bare machine name, meaningless outside your LAN
     if name.endswith(_PRIVATE_PTR):
-        # A reverse lookup only leaks topology if the address being resolved is private.
-        head = name.removesuffix(".in-addr.arpa").removesuffix(".ip6.arpa")
-        octets = head.split(".")[::-1]
-        with contextlib.suppress(ValueError):
-            return remote_scope(".".join(octets)) not in _OFF_NET
+        # A reverse lookup only leaks topology if the address it asks about is private. An
+        # address we cannot reconstruct proves nothing, so it is not a finding: silence beats
+        # a false HIGH.
+        addr = _ptr_address(name)
+        return addr is not None and remote_scope(addr) not in _OFF_NET
     return False
 
 
@@ -1090,11 +1112,16 @@ class EventFilter:
         return self.rules is None or str(finding.rule) in self.rules
 
     def is_unconstrained(self) -> bool:
+        # EVERY dimension, including the leak ones. Omitting them would let a filter that
+        # hides most of the feed still report itself as "all" — the exact mistake the border
+        # label exists to prevent.
         return (
             len(self.kinds) == len(KIND_VALUES)
             and len(self.directions) == len(DIRECTION_VALUES)
             and len(self.scopes) == len(SCOPE_VALUES)
             and not self.host
+            and self.min_severity is None
+            and self.rules is None
         )
 
     def label(self) -> str:
@@ -1113,6 +1140,10 @@ class EventFilter:
         ]
         if self.host:
             parts.append(f"host~{printable(self.host)}")
+        if self.min_severity is not None:
+            parts.append(f"leak>={self.min_severity}")
+        if self.rules is not None:
+            parts.append(f"rule {len(self.rules)}/{len(Rule)}")
         return " · ".join(parts)
 
 

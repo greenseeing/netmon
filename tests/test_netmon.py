@@ -65,7 +65,9 @@ from netmon import (
     SERVICE_BY_PORT,
     SERVICE_LEAK,
     SERVICE_NOTES,
+    SEVERITY_GLYPH,
     SEVERITY_RANK,
+    SEVERITY_STYLE,
     ArpEvent,
     BoundedCounter,
     CaptureStats,
@@ -108,6 +110,7 @@ from netmon import (
     _dns_tcp_start,
     _legacy_parser,
     _parse_run_args,
+    _ptr_address,
     _reassemble,
     _run_parser,
     _server_stream_start,
@@ -6119,3 +6122,64 @@ class TestQueryCsv:
         rows = self._csv(capsys, str(run), "--min-severity", "medium")
         assert len(rows) == 2
         assert rows[1][1] == "dns_query"
+
+
+class TestReverseLookupsAreNotAllInternal:
+    # Regression. Both PTR forms reverse their labels, but they do NOT rebuild the same way:
+    # in-addr.arpa rejoins four octets with dots, while ip6.arpa must regroup 32 nibbles into
+    # hextets joined by colons. Joining nibbles with dots produced a string no parser accepts;
+    # remote_scope() falls back to "lan" for anything unparseable, so EVERY ip6.arpa lookup --
+    # public ones included -- was branded an escaped internal name and rated HIGH. Reverse DNS
+    # is routine traffic, so that is a HIGH finding firing constantly on nothing: exactly the
+    # cry-wolf failure the rules exist to prevent.
+    GOOGLE_V6 = "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"
+    ULA_V6 = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa"
+
+    def test_a_public_ipv6_reverse_lookup_is_not_an_internal_name(self) -> None:
+        f = assess(q(self.GOOGLE_V6, dst="8.8.8.8"))
+        assert f is not None
+        assert f.rule is Rule.CLEARTEXT_DNS  # NOT internal-name-escaped
+
+    def test_a_private_ipv6_reverse_lookup_still_is(self) -> None:
+        f = assess(q(self.ULA_V6, dst="8.8.8.8"))
+        assert f is not None
+        assert (f.rule, f.severity) == (Rule.INTERNAL_NAME_ESCAPED, Severity.HIGH)
+
+    def test_the_ipv6_address_is_reconstructed_correctly(self) -> None:
+        assert _ptr_address(self.GOOGLE_V6) == "2001:4860:4860:0000:0000:0000:0000:8888"
+        assert _ptr_address("50.1.168.192.in-addr.arpa") == "192.168.1.50"
+
+    def test_a_malformed_ptr_proves_nothing_and_is_not_a_finding(self) -> None:
+        # Silence beats a false HIGH: an address we cannot rebuild is not evidence of a leak.
+        for bogus in (
+            "1.2.3.ip6.arpa",  # too few nibbles
+            "z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.z.ip6.arpa",  # not hex
+            "1.2.3.in-addr.arpa",  # too few octets
+        ):
+            assert _ptr_address(bogus) is None
+            f = assess(q(bogus, dst="8.8.8.8"))
+            assert f is not None and f.rule is Rule.CLEARTEXT_DNS
+
+
+class TestSeverityStyleCoverage:
+    # The comment beside these tables claimed a test asserted this. It did not exist, and a
+    # new Severity would have crashed the leaks panel with a KeyError at render time.
+    def test_every_severity_has_a_style_and_a_glyph(self) -> None:
+        assert set(SEVERITY_STYLE) == set(Severity)
+        assert set(SEVERITY_GLYPH) == set(Severity)
+
+    def test_every_glyph_is_one_cell_wide(self) -> None:
+        # The panel aligns its columns by character count.
+        assert all(len(g) == 1 for g in SEVERITY_GLYPH.values())
+
+
+class TestEventFilterReportsLeakConstraints:
+    def test_a_leak_filtered_feed_does_not_call_itself_unconstrained(self) -> None:
+        # Otherwise a filter hiding most of the feed would report itself as "all" in the
+        # border — the precise mistake the label exists to prevent.
+        assert not EventFilter(min_severity=Severity.HIGH).is_unconstrained()
+        assert not EventFilter(rules=frozenset({"cleartext-dns"})).is_unconstrained()
+
+    def test_the_label_names_the_leak_constraint(self) -> None:
+        assert "leak>=high" in EventFilter(min_severity=Severity.HIGH).label()
+        assert "rule 1/" in EventFilter(rules=frozenset({"cleartext-dns"})).label()
