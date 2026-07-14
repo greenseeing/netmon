@@ -3852,7 +3852,7 @@ def _query_parser() -> argparse.ArgumentParser:
         description="filter a recorded run's JSONL by kind/direction/scope/host "
         "(read-only; no capture)",
     )
-    p.add_argument("run_dir", help="a logs/run-* directory to read")
+    _add_run_dir_arg(p)
     p.add_argument(
         "--kind", action="append", choices=KIND_VALUES, help="only these kinds (repeatable)"
     )
@@ -3941,6 +3941,47 @@ def _event_time(ev: Event) -> datetime:
     return dt if dt.tzinfo is not None else dt.astimezone()
 
 
+DEFAULT_OUTPUT = "logs"
+
+
+def _add_run_dir_arg(p: argparse.ArgumentParser) -> None:
+    # Optional: the run an operator wants is nearly always the newest one, and making them
+    # paste a timestamp to say so is busywork. `netmon audit` with no argument used to be an
+    # argparse usage error, which told a first-time user nothing about what it actually needs.
+    p.add_argument(
+        "run_dir",
+        nargs="?",
+        help="a run-* directory to read (default: the newest under the output dir)",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        default=DEFAULT_OUTPUT,
+        help=f"where runs live (default: {DEFAULT_OUTPUT})",
+    )
+
+
+def _resolve_run_dir(args: argparse.Namespace, prog: str) -> Path | None:
+    if args.run_dir is not None:
+        return Path(args.run_dir)
+    root = Path(args.output)
+    # Sort by NAME, not mtime: run dirs are run-YYYYmmdd-HHMMSS, so the name sorts
+    # chronologically, while mtime does not — reading an old run, or rsyncing one, touches it
+    # and would make it masquerade as the newest.
+    runs = sorted((p for p in root.glob("run-*") if p.is_dir()), key=lambda p: p.name)
+    if not runs:
+        print(
+            f"netmon {prog}: no runs found in {root}/ — record one first "
+            f"(`netmon run --log -o {root}`), or name a run directory",
+            file=sys.stderr,
+        )
+        return None
+    # Say which one, and say it on STDERR: stdout is the data. A "using ..." line on stdout
+    # would land as the first row of `netmon query --format csv > leaks.csv`.
+    print(f"netmon {prog}: reading {runs[-1]}", file=sys.stderr)
+    return runs[-1]
+
+
 def _open_run_dir(run_dir: Path, prog: str) -> bool:
     if not run_dir.is_dir():
         print(f"netmon {prog}: no such run directory: {run_dir}", file=sys.stderr)
@@ -3959,7 +4000,7 @@ def _audit_parser() -> argparse.ArgumentParser:
         prog="netmon audit",
         description="re-read a recorded run and report what it disclosed (read-only; no capture)",
     )
-    p.add_argument("run_dir", help="a logs/run-* directory to read")
+    _add_run_dir_arg(p)
     p.add_argument(
         "--min-severity",
         choices=[str(s) for s in Severity],
@@ -3974,8 +4015,8 @@ def cmd_audit(argv: list[str]) -> int:
     # recomputed from the record, so this works on a run captured BEFORE the rules existed.
     # Nothing was migrated; the evidence was always sufficient.
     args = _audit_parser().parse_args(argv)
-    run_dir = Path(args.run_dir)
-    if not _open_run_dir(run_dir, "audit"):
+    run_dir = _resolve_run_dir(args, "audit")
+    if run_dir is None or not _open_run_dir(run_dir, "audit"):
         return 1
     floor = SEVERITY_RANK[Severity(args.min_severity)]
     ledger = FindingLedger(cap=1000)
@@ -4005,8 +4046,8 @@ def cmd_audit(argv: list[str]) -> int:
 
 def cmd_query(argv: list[str]) -> int:
     args = _query_parser().parse_args(argv)
-    run_dir = Path(args.run_dir)
-    if not _open_run_dir(run_dir, "query"):
+    run_dir = _resolve_run_dir(args, "query")
+    if run_dir is None or not _open_run_dir(run_dir, "query"):
         return 1
     selection = _filter_from_args(args)
     events = [ev for ev in _load_run_events(run_dir, selection.kinds) if selection.matches(ev)]

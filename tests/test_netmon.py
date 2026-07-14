@@ -6183,3 +6183,98 @@ class TestEventFilterReportsLeakConstraints:
     def test_the_label_names_the_leak_constraint(self) -> None:
         assert "leak>=high" in EventFilter(min_severity=Severity.HIGH).label()
         assert "rule 1/" in EventFilter(rules=frozenset({"cleartext-dns"})).label()
+
+
+class TestDefaultRunDir:
+    # `netmon audit` with no argument used to be an argparse usage error. The run directory it
+    # wants is almost always the newest one under the default output dir, so ask for that.
+
+    def _runs(self, tmp_path: Path, *stamps: str) -> Path:
+        root = tmp_path / "logs"
+        for stamp in stamps:
+            write_query_fixture(root / f"run-{stamp}")
+        return root
+
+    def test_audit_with_no_argument_uses_the_newest_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._runs(tmp_path, "20250101-100000", "20250703-120000", "20250702-100000")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            main(["audit"])
+        assert exc.value.code == 0
+        captured = capsys.readouterr()
+        assert "cleartext-dns" in captured.out
+        # Which run it chose is said out loud -- a tool that silently picks a file for you and
+        # does not say which is a tool you cannot trust the output of.
+        assert "run-20250703-120000" in captured.err
+
+    def test_query_with_no_argument_uses_the_newest_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._runs(tmp_path, "20250702-100000", "20250703-120000")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            main(["query", "--kind", "tls_sni"])
+        assert exc.value.code == 0
+        rows = [json.loads(ln) for ln in capsys.readouterr().out.splitlines()]
+        assert [r["kind"] for r in rows] == ["tls_sni"]
+
+    def test_the_chosen_run_is_announced_on_stderr_not_stdout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `netmon query --format csv > leaks.csv` must not get a "using run ..." line as its
+        # first row. stdout is the data; stderr is the conversation.
+        self._runs(tmp_path, "20250702-100000")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["query", "--format", "csv"])
+        captured = capsys.readouterr()
+        assert captured.out.splitlines()[0] == ",".join(CSV_COLUMNS)
+        assert "run-20250702-100000" in captured.err
+
+    def test_an_explicit_run_dir_still_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._runs(tmp_path, "20250702-100000", "20250703-120000")
+        monkeypatch.chdir(tmp_path)
+        older = str(tmp_path / "logs" / "run-20250702-100000")
+        with pytest.raises(SystemExit) as exc:
+            main(["audit", older])
+        assert exc.value.code == 0
+        assert "run-20250703-120000" not in capsys.readouterr().err  # no auto-pick happened
+
+    def test_no_runs_at_all_says_how_to_make_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The whole point: an operator who has never recorded anything must be told what to do,
+        # not handed an argparse usage string.
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            main(["audit"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "no runs found" in err
+        assert "netmon run --log" in err
+
+    def test_the_output_dir_is_honoured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_query_fixture(tmp_path / "elsewhere" / "run-20250702-100000")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            main(["audit", "-o", "elsewhere"])
+        assert exc.value.code == 0
+        assert "cleartext-dns" in capsys.readouterr().out
+
+    def test_newest_is_by_stamp_not_mtime(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Run dirs are named run-YYYYmmdd-HHMMSS, which sorts chronologically. mtime does not:
+        # querying an old run, or an rsync that copied it, would touch it and make it look new.
+        root = self._runs(tmp_path, "20250703-120000", "20250101-100000")
+        (root / "run-20250101-100000").touch()  # the OLD run is now the most recently modified
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["audit"])
+        assert "run-20250703-120000" in capsys.readouterr().err

@@ -124,15 +124,17 @@ netmon rates what each recorded event **discloses** — a cleartext `POST`, an i
 
 ```sh
 # 1. record. Browse for a while, then quit the dashboard with `q`.
-netmon run --log -o ~/netmon-logs          # ...or --headless --log -q for no dashboard
+netmon run --log                           # ...or --headless --log -q for no dashboard
 
-# 2. read the newest run
-RUN=$(ls -dt ~/netmon-logs/run-* | head -1)
+# 2. read it. With no run directory given, both commands take the newest run
+#    under the output dir (default: logs/) and say on stderr which one they chose.
+netmon audit                               # what did this run disclose?
+netmon audit --min-severity high           # just the ones that matter
+netmon query --min-severity high           # ...as the raw recorded events
+netmon query --rule cleartext-http
 
-netmon audit "$RUN"                        # what did this run disclose?
-netmon audit "$RUN" --min-severity high    # just the ones that matter
-netmon query "$RUN" --min-severity high    # ...as the raw recorded events
-netmon query "$RUN" --rule cleartext-http
+netmon audit logs/run-20250702-100000      # or name one explicitly
+netmon audit -o ~/netmon-logs              # or point at a different output dir
 ```
 
 A run directory is `run-<stamp>/` holding the JSONL record plus `summary.json`. The live dashboard shows findings in its `leaks` panel as they happen; the headless recorder, having no dashboard, puts the rollup in `summary.json`. The systemd recorder writes to `/var/log/netmon/` as the `netmon` user, so reading those runs needs `sudo netmon audit /var/log/netmon/run-<stamp>`.

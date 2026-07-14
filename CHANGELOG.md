@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`audit` and `query` default to the newest run.** Both used to demand a run directory, so
+  `netmon audit` on its own answered with an argparse usage error — which tells a first-time
+  user nothing about what it actually wants, and invites the reasonable guess that CSV must be
+  a flag on `netmon run`. They now read the newest run under the output dir (`-o`, default
+  `logs/`) and announce which one they picked. That announcement goes to **stderr**: stdout is
+  the data, and a "reading ..." line on stdout would land as the first row of
+  `netmon query --format csv > leaks.csv`. With no runs at all, they now say how to make one.
+  "Newest" is by run-directory *name* (`run-YYYYmmdd-HHMMSS`, which sorts chronologically) and
+  not by mtime, since reading or copying an old run touches it and would make it masquerade as
+  the latest.
+
 - **`netmon audit <run>` and `netmon query --format csv`.** `audit` re-reads a recorded run
   and reports what it disclosed, grouped worst-first with the full diagnosis. It works on runs
   captured **before** leak findings existed — nothing was migrated, because the evidence was

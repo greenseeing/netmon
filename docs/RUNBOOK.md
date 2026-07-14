@@ -184,24 +184,29 @@ capture wrote, so the sequence is always **record, then read** — and `netmon r
 `--log` is ephemeral by design and leaves nothing behind to read.
 
 ```sh
-netmon run --log -o ~/netmon-logs          # record (or --headless --log -q for no dashboard)
-RUN=$(ls -dt ~/netmon-logs/run-* | head -1)   # newest run
+netmon run --log        # record (or --headless --log -q for no dashboard) -> logs/run-<stamp>/
 ```
+
+Given no run directory, `audit` and `query` both read the **newest run** under the output dir
+(default `logs/`, override with `-o`) and print which one they chose **on stderr**, so a
+redirected `--format csv` is unaffected. Name a directory explicitly to override.
 
 `netmon audit` recomputes the leak findings from the record and prints the diagnosis —
 what leaked, to whom, and what to do about it:
 
 ```sh
-netmon audit "$RUN"
-netmon audit "$RUN" --min-severity high
+netmon audit                                  # the newest run under logs/
+netmon audit --min-severity high
+netmon audit -o /var/log/netmon               # the recorder's runs (needs sudo, see below)
+netmon audit logs/run-20250702-100000         # a specific run
 ```
 
 `netmon query` returns the raw recorded events, filtered:
 
 ```sh
-netmon query "$RUN" --kind tls_sni --host example.com
-netmon query "$RUN" --scope internet                    # everything that left the LAN
-netmon query "$RUN" --min-severity high --rule cleartext-http
+netmon query --kind tls_sni --host example.com
+netmon query --scope internet                 # everything that left the LAN
+netmon query --min-severity high --rule cleartext-http
 ```
 
 `--format csv` projects the dashboard's five columns for a spreadsheet. It is an **export from
@@ -210,8 +215,8 @@ recorder writes JSONL (the evidence) and CSV is derived from it on demand, so th
 disagree:
 
 ```sh
-umask 077                                              # a run is your browsing history
-netmon query "$RUN" --min-severity medium --format csv > leaks.csv
+umask 077                                     # a run is your browsing history
+netmon query --min-severity medium --format csv > leaks.csv
 ```
 
 A CSV cell beginning `'` is a **neutralised formula**: spreadsheets execute cells starting
@@ -222,7 +227,7 @@ apostrophe to recover the original.
 its runs need root to read:
 
 ```sh
-sudo netmon audit "$(sudo ls -dt /var/log/netmon/run-* | head -1)" --min-severity high
+sudo netmon audit -o /var/log/netmon --min-severity high
 ```
 
 ## 7. Continuous monitoring (systemd)
