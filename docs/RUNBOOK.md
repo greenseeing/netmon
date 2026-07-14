@@ -177,6 +177,54 @@ jq -rs 'sort_by(.ts) | .[] | "\(.ts) \(.kind) \(.sni // .qname // .hostname // .
 
 **What your ISP sees even with HTTPS:** every `qname` in `dns.jsonl` (unless DNS is encrypted), every `sni` in `tls.jsonl`, every `remote_ip` in internet-scope flows, and everything in `http.jsonl` in full. And beyond what netmon can capture — traffic-analysis (packet sizes/timing), TLS fingerprints, TLS 1.2 server certs, IPv6 MAC leakage — see "What this tool does NOT show you" in the [README](../README.md).
 
+### 6B. Reading a recorded run — `audit` and `query`
+
+**Both are offline readers. Neither captures.** They take a *run directory* that a previous
+capture wrote, so the sequence is always **record, then read** — and `netmon run` without
+`--log` is ephemeral by design and leaves nothing behind to read.
+
+```sh
+netmon run --log -o ~/netmon-logs          # record (or --headless --log -q for no dashboard)
+RUN=$(ls -dt ~/netmon-logs/run-* | head -1)   # newest run
+```
+
+`netmon audit` recomputes the leak findings from the record and prints the diagnosis —
+what leaked, to whom, and what to do about it:
+
+```sh
+netmon audit "$RUN"
+netmon audit "$RUN" --min-severity high
+```
+
+`netmon query` returns the raw recorded events, filtered:
+
+```sh
+netmon query "$RUN" --kind tls_sni --host example.com
+netmon query "$RUN" --scope internet                    # everything that left the LAN
+netmon query "$RUN" --min-severity high --rule cleartext-http
+```
+
+`--format csv` projects the dashboard's five columns for a spreadsheet. It is an **export from
+the record, not a logging format** — there is no `--format csv` on `netmon run`, because the
+recorder writes JSONL (the evidence) and CSV is derived from it on demand, so the two cannot
+disagree:
+
+```sh
+umask 077                                              # a run is your browsing history
+netmon query "$RUN" --min-severity medium --format csv > leaks.csv
+```
+
+A CSV cell beginning `'` is a **neutralised formula**: spreadsheets execute cells starting
+`=`/`+`/`-`/`@`, and netmon records DNS names and HTTP paths verbatim off the wire. Strip the
+apostrophe to recover the original.
+
+**The systemd recorder writes as the `netmon` user into `/var/log/netmon` (mode `0700`)**, so
+its runs need root to read:
+
+```sh
+sudo netmon audit "$(sudo ls -dt /var/log/netmon/run-* | head -1)" --min-severity high
+```
+
 ## 7. Continuous monitoring (systemd)
 
 `install.sh --enable-service` sets this all up: a dedicated non-root `netmon` user,

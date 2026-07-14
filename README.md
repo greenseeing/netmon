@@ -118,22 +118,35 @@ Repeat a flag to widen a dimension (`--kind a --kind b` = either); combine flags
 
 ## Leak findings
 
-netmon rates what each recorded event **discloses** — a cleartext `POST`, an internal hostname sent to a public resolver, an EDNS Client-Subnet record carrying your own network prefix — and says what leaked, to whom, and what to do about it. The dashboard shows them in a `leaks` panel; the headless recorder puts the rollup in `summary.json`; and `netmon audit` re-reads a recorded run:
+netmon rates what each recorded event **discloses** — a cleartext `POST`, an internal hostname sent to a public resolver, an EDNS Client-Subnet record carrying your own network prefix — and says what leaked, to whom, and what to do about it.
+
+**`audit` and `query` read a recording — they never capture.** So there are always two steps: record a run, then read it. `netmon run` on its own is ephemeral by design and writes nothing, which means there is nothing to audit afterwards; `--log` is what puts a run on disk.
 
 ```sh
-netmon audit logs/run-20250702-100000                      # what did this run disclose?
-netmon audit logs/run-20250702-100000 --min-severity high  # just the ones that matter
-netmon query logs/run-20250702-100000 --min-severity high  # ...as the raw recorded events
-netmon query logs/run-20250702-100000 --rule cleartext-http
+# 1. record. Browse for a while, then quit the dashboard with `q`.
+netmon run --log -o ~/netmon-logs          # ...or --headless --log -q for no dashboard
+
+# 2. read the newest run
+RUN=$(ls -dt ~/netmon-logs/run-* | head -1)
+
+netmon audit "$RUN"                        # what did this run disclose?
+netmon audit "$RUN" --min-severity high    # just the ones that matter
+netmon query "$RUN" --min-severity high    # ...as the raw recorded events
+netmon query "$RUN" --rule cleartext-http
 ```
+
+A run directory is `run-<stamp>/` holding the JSONL record plus `summary.json`. The live dashboard shows findings in its `leaks` panel as they happen; the headless recorder, having no dashboard, puts the rollup in `summary.json`. The systemd recorder writes to `/var/log/netmon/` as the `netmon` user, so reading those runs needs `sudo netmon audit /var/log/netmon/run-<stamp>`.
 
 Findings are **recomputed from the record, never stored in it**. The JSONL stays raw evidence and severity stays interpretation, so improving a rule re-reads every run already on disk — `netmon audit` works on a run captured before this feature existed, with nothing migrated.
 
 ### CSV, for a spreadsheet
 
+CSV is an **export from a recorded run**, not a logging format — there is no `--format csv` on `netmon run`. The recorder always writes JSONL, and CSV is projected out of it on demand, so the two can never disagree about what happened:
+
 ```sh
-umask 077                                                   # this file is your browsing history
-netmon query logs/run-* --min-severity high --format csv > leaks.csv
+umask 077                                                  # this file is your browsing history
+netmon query "$RUN" --format csv > run.csv                 # the whole run
+netmon query "$RUN" --min-severity medium --format csv > leaks.csv   # just the leaks
 ```
 
 CSV is **the dashboard's view, not the record**: the same five columns the feed shows (`ts, kind, direction, host, detail`), so it is lossy on purpose and its header never changes when a new event kind is added. The full record is always one `netmon query` away. A cell beginning `'` is a **neutralised formula** — Excel and LibreOffice execute any cell starting `=`, `+`, `-` or `@`, and netmon records DNS names and HTTP paths exactly as they came off the wire, so the leading apostrophe (the spreadsheet's own literal-text marker) keeps the name legible while stopping it from running.
