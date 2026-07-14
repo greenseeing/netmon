@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import csv
 import errno
 import io
 import json
@@ -50,6 +51,7 @@ from scapy.packet import Packet
 from scapy.utils import rdpcap, wrpcap
 
 from netmon import (
+    CSV_COLUMNS,
     DIRECTION_VALUES,
     EVENT_ADAPTER,
     KIND_STYLE,
@@ -116,6 +118,7 @@ from netmon import (
     cmd_service,
     cmd_update,
     configure_logging,
+    csv_cell,
     derive_initial_keys,
     event_detail,
     event_direction,
@@ -124,6 +127,7 @@ from netmon import (
     event_remote_addr,
     event_scope,
     event_to_cells,
+    event_to_csv_row,
     event_to_detail,
     extract_certificate_sans,
     finalize,
@@ -5948,3 +5952,170 @@ class TestNetmonAudit:
         )
         out = self._audit(capsys, str(run))
         assert "\x1b" not in out
+
+
+class TestCsvCell:
+    def test_a_formula_leader_is_neutralised(self) -> None:
+        # A DNS name recorded faithfully off the wire becomes a command the auditor's machine
+        # runs when they open the export. A spreadsheet is an interpreter, exactly like a
+        # terminal, and wire text is not ours to run in either.
+        assert csv_cell("=cmd|'/C calc'!A0") == "'=cmd|'/C calc'!A0"
+        for leader in "=+-@":
+            assert csv_cell(f"{leader}danger").startswith("'")
+
+    def test_the_original_character_stays_visible(self) -> None:
+        # Map, never drop: deleting the leader would lie by omission about what was on the
+        # wire, and the apostrophe is the spreadsheet's own literal-text marker.
+        assert csv_cell("=x").lstrip("'") == "=x"
+
+    def test_an_empty_cell_is_not_prefixed(self) -> None:
+        # The trap: `"" in "=+-@"` is True, so a str membership test would stamp an apostrophe
+        # onto every empty cell in the file. _CSV_FORMULA_LEADERS is a frozenset for this.
+        assert csv_cell("") == ""
+
+    def test_an_ordinary_name_is_untouched(self) -> None:
+        assert csv_cell("api.github.com") == "api.github.com"
+
+    def test_terminal_escapes_never_survive(self) -> None:
+        # The CSV is on its way to a terminal too, where JSON's escaping no longer protects us.
+        assert "\x1b" not in csv_cell("evil\x1b[2Jname")
+        assert "\x00" not in csv_cell("nul\x00byte")
+
+    def test_a_cell_can_never_contain_a_newline(self) -> None:
+        # So a row is always one physical line: the file stays greppable, and a wire \n
+        # cannot forge a row.
+        assert "\n" not in csv_cell("a\nb")
+
+    def test_is_idempotent(self) -> None:
+        assert csv_cell(csv_cell("=x\x1by")) == csv_cell("=x\x1by")
+
+
+class TestEventToCsvRow:
+    def test_columns_match_the_feed_cell_count(self) -> None:
+        # A sixth feed cell must never silently misalign the export.
+        assert len(CSV_COLUMNS) == len(event_to_cells(q("x")))
+
+    def test_every_kind_renders_a_row(self) -> None:
+        for e in sample_events():
+            row = event_to_csv_row(e)
+            assert len(row) == len(CSV_COLUMNS)
+            assert all(isinstance(c, str) for c in row)
+
+    def test_the_timestamp_is_the_full_stamp_not_the_feeds_time_slice(self) -> None:
+        # The feed shows HH:MM:SS.mmm because it is a view of *now*. An exported run spans
+        # midnight and gets sorted in a spreadsheet.
+        row = event_to_csv_row(q("x"))
+        assert row[0] == TS
+        assert row[0] != event_to_cells(q("x"))[0]
+
+
+class TestQueryCsv:
+    def _csv(self, capsys: pytest.CaptureFixture[str], *argv: str) -> list[list[str]]:
+        with pytest.raises(SystemExit) as exc:
+            main(["query", *argv, "--format", "csv"])
+        assert exc.value.code == 0
+        return list(csv.reader(io.StringIO(capsys.readouterr().out)))
+
+    def test_prints_a_header_and_a_row_per_event(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = self._csv(capsys, str(run))
+        assert rows[0] == list(CSV_COLUMNS)
+        assert len(rows) == 5  # header + the fixture's four events
+
+    def test_jsonl_remains_the_default(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        assert query_lines(capsys, str(run))  # still parses as JSON: the old contract holds
+
+    def test_a_zero_event_run_still_prints_the_header(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A headerless CSV is not a CSV; a spreadsheet opening one guesses at the columns.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = self._csv(capsys, str(run), "--kind", "arp")
+        assert rows == [list(CSV_COLUMNS)]
+
+    def test_a_comma_in_a_path_round_trips(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        w = JsonlWriter(run)
+        w.write(
+            HttpEvent(
+                ts=TS,
+                src="192.168.1.50",
+                dst="93.184.216.34",
+                dport=80,
+                method="GET",
+                host="x.example",
+                path="/a,b,c",
+            )
+        )
+        w.close()
+        rows = self._csv(capsys, str(run))
+        assert rows[1][4] == "GET /a,b,c"  # one cell, not three
+
+    def test_a_wire_newline_cannot_forge_a_row(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        w = JsonlWriter(run)
+        w.write(
+            HttpEvent(
+                ts=TS,
+                src="192.168.1.50",
+                dst="93.184.216.34",
+                dport=80,
+                method="GET",
+                host="x.example",
+                path="/a\nGET /forged",
+            )
+        )
+        w.close()
+        rows = self._csv(capsys, str(run))
+        assert len(rows) == 2  # header + exactly one event
+
+    def test_a_hostile_qname_arrives_inert(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        w = JsonlWriter(run)
+        w.write(
+            DnsQueryEvent(
+                ts=TS,
+                src="192.168.1.50",
+                dst="8.8.8.8",
+                transport="udp",
+                qname="=cmd|'/C calc'!A0",
+                qtype="A",
+            )
+        )
+        w.close()
+        rows = self._csv(capsys, str(run))
+        assert rows[1][3].startswith("'=")  # neutralised, and still legible
+
+    def test_composes_with_every_filter(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = self._csv(capsys, str(run), "--kind", "tls_sni")
+        assert len(rows) == 2
+        assert rows[1][1] == "tls_sni"
+
+    def test_a_spreadsheet_of_exactly_the_leaks(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The payoff of computing findings from the record rather than storing them: one
+        # command turns an overnight recording into a spreadsheet of just its leaks.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = self._csv(capsys, str(run), "--min-severity", "medium")
+        assert len(rows) == 2
+        assert rows[1][1] == "dns_query"

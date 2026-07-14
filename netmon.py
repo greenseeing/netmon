@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import csv
 import errno
 import hashlib
 import hmac
@@ -428,6 +429,28 @@ def printable(value: str) -> str:
     # Applies to one wire field, never to an assembled block: the layout's own newlines are
     # added after this, which is what stops a wire \n from forging a line of its own.
     return value.translate(_UNRENDERABLE)
+
+
+# A spreadsheet is an interpreter too, and the same rule applies: wire text is not ours to
+# run. Excel and LibreOffice evaluate any cell whose first character is = + - @, so a DNS name
+# of `=cmd|'/C calc'!A0`, recorded faithfully off the wire, becomes a command on the auditor's
+# machine the moment they open the export.
+#
+# Same posture as printable(): map, never drop. A leading apostrophe is the spreadsheet's own
+# "this cell is literal text" marker, so the original character stays visible and one strip
+# recovers it — whereas deleting it would lie by omission about what was on the wire.
+#
+# frozenset, NOT a str: `"" in "=+-@"` is True, so a str membership test would stamp an
+# apostrophe onto every empty cell in the file. There is a test.
+_CSV_FORMULA_LEADERS = frozenset("=+-@")
+
+
+def csv_cell(value: str) -> str:
+    # printable() runs first and is idempotent, so a cell can never contain a newline: a row
+    # is always one physical line, which keeps the export greppable and safe to `cat` on its
+    # way to a terminal.
+    text = printable(value)
+    return f"'{text}" if text[:1] in _CSV_FORMULA_LEADERS else text
 
 
 # --- Event classification ----------------------------------------------------
@@ -990,6 +1013,26 @@ def event_to_cells(event: Event) -> list[str]:
         printable(event_host(event)),
         printable(event_detail(event)),
     ]
+
+
+CSV_COLUMNS = ("ts", "kind", "direction", "host", "detail")
+
+
+def event_to_csv_row(event: Event) -> list[str]:
+    # The same five projections the live feed shows. CSV is not a new idea about what an event
+    # looks like flattened — event_to_cells already IS that idea, already scrubbed, already
+    # tested per kind — so this re-serialises it rather than inventing a second schema that
+    # could disagree with the first.
+    #
+    # Two changes the medium demands: the full ISO timestamp (the feed slices the date off
+    # because it is a view of *now*; an exported run spans midnight and gets sorted in a
+    # spreadsheet), and a formula-neutralised cell.
+    #
+    # The header is a projection, not a schema: a thirteenth event kind adds rows, never
+    # columns, so nobody's pivot table breaks. Lossy by design — CSV is the dashboard's view,
+    # the JSONL is the evidence.
+    _, *rest = event_to_cells(event)
+    return [csv_cell(cell) for cell in (event.ts, *rest)]
 
 
 def event_to_detail(event: Event) -> str:
@@ -3806,6 +3849,13 @@ def _query_parser() -> argparse.ArgumentParser:
         choices=[str(r) for r in Rule],
         help="only events matching these leak rules (repeatable)",
     )
+    p.add_argument(
+        "--format",
+        choices=("jsonl", "csv"),
+        default="jsonl",
+        help="jsonl (default) prints the raw recorded line; csv projects the dashboard's "
+        "five columns for a spreadsheet",
+    )
     return p
 
 
@@ -3930,6 +3980,15 @@ def cmd_query(argv: list[str]) -> int:
     selection = _filter_from_args(args)
     events = [ev for ev in _load_run_events(run_dir, selection.kinds) if selection.matches(ev)]
     events.sort(key=_event_time)  # one timeline across per-kind files
+    if args.format == "csv":
+        # lineterminator="\n": the excel dialect's default \r\n would leave a stray CR in a
+        # piped stream. The header is written even for zero rows — a headerless CSV is not a
+        # CSV, and a spreadsheet opening one guesses at the columns.
+        out = csv.writer(sys.stdout, lineterminator="\n")
+        out.writerow(CSV_COLUMNS)
+        for ev in events:
+            out.writerow(event_to_csv_row(ev))
+        return 0
     for ev in events:
         print(ev.model_dump_json(exclude_none=True))
     return 0

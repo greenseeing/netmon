@@ -118,6 +118,15 @@ netmon query logs/run-20250702-100000 --rule cleartext-http
 
 Findings are **recomputed from the record, never stored in it**. The JSONL stays raw evidence and severity stays interpretation, so improving a rule re-reads every run already on disk — `netmon audit` works on a run captured before this feature existed, with nothing migrated.
 
+### CSV, for a spreadsheet
+
+```sh
+umask 077                                                   # this file is your browsing history
+netmon query logs/run-* --min-severity high --format csv > leaks.csv
+```
+
+CSV is **the dashboard's view, not the record**: the same five columns the feed shows (`ts, kind, direction, host, detail`), so it is lossy on purpose and its header never changes when a new event kind is added. The full record is always one `netmon query` away. A cell beginning `'` is a **neutralised formula** — Excel and LibreOffice execute any cell starting `=`, `+`, `-` or `@`, and netmon records DNS names and HTTP paths exactly as they came off the wire, so the leading apostrophe (the spreadsheet's own literal-text marker) keeps the name legible while stopping it from running.
+
 **These are not detections.** netmon has no baseline, no threat intelligence, and no notion of "unusual" — see *What this tool does NOT show you*. A rule may only claim what the event's own fields prove, which is why a flow to an SMTP port is rated `medium` and its advice says netmon cannot see whether the client upgraded with STARTTLS, rather than alleging a credential leak it never observed. **An empty leaks panel means no known-shape disclosure was recorded — not that nothing leaked.**
 
 Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).

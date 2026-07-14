@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`netmon audit <run>` and `netmon query --format csv`.** `audit` re-reads a recorded run
+  and reports what it disclosed, grouped worst-first with the full diagnosis. It works on runs
+  captured **before** leak findings existed — nothing was migrated, because the evidence was
+  always sufficient and only the interpretation is new. `query` gains `--min-severity` and
+  `--rule` (which extend the *same* filter, not a second one), so one command turns an
+  overnight recording into a spreadsheet of exactly its leaks.
+
+  CSV is the dashboard's five columns — lossy on purpose, and its header is a projection
+  rather than a schema, so a new event kind adds rows and never columns. **A spreadsheet is an
+  interpreter too**: Excel and LibreOffice execute any cell starting `=`, `+`, `-` or `@`, and
+  netmon records DNS names and HTTP paths verbatim from the wire — so a queried name of
+  `=cmd|'/C calc'!A0` would otherwise become a command on the auditor's machine the moment they
+  opened the file. Cells are neutralised with a leading apostrophe, the same *map, never drop*
+  posture the terminal-escape scrubber takes: the original character stays visible, because
+  deleting it would lie by omission about what was on the wire.
+
 - **netmon now says what each event *discloses*.** It recorded `dns.jsonl`, `http.jsonl` and
   `flows.jsonl` and left you to already know that a cleartext POST, or an EDNS Client-Subnet
   record, is a leak. A deterministic assessment now rates every event and explains it: what
