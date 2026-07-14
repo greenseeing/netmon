@@ -25,6 +25,20 @@ uv run mypy netmon.py netmon_tui.py  # types
 The tests decode crafted packets with scapy in-process — no capture privileges
 or network access are needed to run them.
 
+## If you touch `pyproject.toml`
+
+`requirements.txt` is generated, never hand-edited — it is what lets netmon be
+installed with nothing but a Python interpreter and pip. Regenerate it whenever a
+dependency changes:
+
+```sh
+uv lock
+uv export --format requirements.txt --extra tui --no-dev --no-emit-project --locked > requirements.txt
+```
+
+`uv run pytest -q` fails if you forget: `tests/test_packaging.py` re-runs that
+export and compares.
+
 ## Guidelines
 
 - Keep the tool **passive**: it reads traffic, it must never transmit.
@@ -35,6 +49,8 @@ or network access are needed to run them.
 - Keep the capture/parse **core** dependency-light and in `netmon.py`; the
   headless tool runs with no Textual installed. UI-only code and its dependency
   belong in `netmon_tui.py` behind the `tui` optional extra.
+- Every generated artifact gets a test that fails when it drifts from its source.
+  There is no CI here — `uv run pytest -q` *is* the gate.
 
 ## Licensing of contributions
 

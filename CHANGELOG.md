@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **netmon can be installed with nothing but Python and pip.** The install path
+  required uv, and got it by piping `astral.sh/uv/install.sh` into `sh` as root — a
+  step install.sh's own header calls an unchecksummed trust boundary. A user running
+  the documented one-liner on a machine without the Astral toolchain could not install
+  netmon at all. A generated `requirements.txt` is now checked in, exported from
+  `uv.lock` with the `tui` extra and full `--hash` pins, so
+  `pip install --require-hashes -r requirements.txt` gives the same integrity guarantee
+  `uv sync` does — which matters most to the person who declined the unchecked download
+  in the first place. The file is never hand-edited: `uv export` writes its own
+  invocation into the header, and `tests/test_packaging.py` reads that command back out
+  and re-runs it, so the artifact documents how it is made and the test executes that
+  documentation. There is no CI here, so every generated artifact gets a test that fails
+  when it drifts.
+
 ### Fixed
 
 - **A junk SNI could be read out of encrypted bytes, and then crash the TUI.** An
