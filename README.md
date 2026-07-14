@@ -16,7 +16,18 @@ All events carry ISO 8601 timestamps in the host's local timezone (with an expli
 
 ## Install
 
-One command — but read it before you run it (never pipe a script you haven't seen):
+On a stock Debian/Ubuntu box, first:
+
+```sh
+sudo apt install git python3-venv libcap2-bin
+```
+
+`git` is required — and not only to install: `netmon update` is a `git pull --ff-only` against
+the checkout, which is what lets it refuse a dirty tree and tell you exactly which revision you
+are running. `python3-venv` is what Debian splits `venv`/`ensurepip` into; `libcap2-bin` is only
+needed for `--setcap`.
+
+Then one command — but read it before you run it (never pipe a script you haven't seen):
 
 ```sh
 curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh

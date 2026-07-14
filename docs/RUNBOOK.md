@@ -5,12 +5,23 @@ How to deploy, run, verify, and read the passive network monitor on any Linux ho
 ## 1. Requirements
 
 - Linux (uses `AF_PACKET` raw sockets; macOS/Windows not supported)
+- **`git`** — required, and not only to install: `netmon update` *is* a `git pull --ff-only`
+  against the checkout, which is what lets it refuse a dirty tree and report exactly which
+  revision you are running. A leak auditor that cannot name its own revision is a poor one.
 - **Either** Python ≥ 3.13 with its `venv` module (`apt install python3.13 python3.13-venv`)
   **or** [uv](https://docs.astral.sh/uv/). The installer uses whichever it finds, and only
   fetches uv when the host has no usable Python at all. If it finds neither it says so, names
   what it found, and gives you both remedies.
+- `libcap2-bin` — only for `--setcap` (the passwordless TUI)
+- `curl` — only if the installer has to bootstrap uv: no usable Python **and** no uv
 - `tcpdump` binary — only needed if you pass `--bpf` (scapy shells out to it to compile the filter)
 - Root or `CAP_NET_RAW` (section 3)
+
+Everything the default install needs on a stock Debian/Ubuntu box:
+
+```sh
+sudo apt install git python3-venv libcap2-bin
+```
 
 ## 2. Install
 
