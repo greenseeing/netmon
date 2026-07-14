@@ -47,6 +47,13 @@ LOG_DIR="/var/log/netmon"
 SVC_USER="netmon"
 VENV_PY="$NETMON_DIR/.venv/bin/python3"
 
+# libcap2-bin installs get/setcap into /usr/sbin, which is not on every environment's PATH
+# (sudo's secure_path, a stripped env, a minimal container). This script only ever runs as
+# root, so putting the sbin dirs on PATH here is free — and it means setcap and getcap resolve
+# the same way, rather than one working and the other silently not. The launcher, which runs
+# unprivileged and cannot make that assumption, carries its own lookup.
+PATH="/usr/sbin:/sbin:$PATH"
+
 die() { echo "netmon-install: $*" >&2; exit 1; }
 
 validate_prefix() {
@@ -328,14 +335,29 @@ maybe_setcap() {
   command -v setcap >/dev/null || die "setcap not found (apt install libcap2-bin)"
   getent group "$SVC_USER" >/dev/null || groupadd --system "$SVC_USER"
   echo "==> granting cap_net_raw to $target (scoped to the '$SVC_USER' group)"
-  setcap cap_net_raw+eip "$target"
+
+  # ORDER IS LOAD-BEARING: chown/chmod FIRST, setcap LAST.
+  #
+  # The kernel clears a file's capabilities on any ownership change, exactly as it clears the
+  # setuid bit (chown_common() raises ATTR_KILL_PRIV for every non-directory, and the
+  # capability LSM then drops the security.capability xattr). So a setcap that runs BEFORE the
+  # chown is silently undone: the grant appears to succeed, getcap prints nothing, and the
+  # launcher — correctly — falls back to sudo. That is why --setcap looked like it did nothing.
+  #
   # A file capability applies to ANY user who can execute the binary. build_venv left it
-  # world-executable (a+rX) so the service user could reach it; now that it bears a real
+  # world-executable (a+rX) so the service user could reach it; before it bears a real
   # capability, lock execution to root + the netmon group so it is NOT a host-wide
-  # unauthenticated raw-capture primitive. getcap for non-members then fails -> the
-  # launcher falls back to sudo for them, which is correct.
+  # unauthenticated raw-capture primitive. getcap for non-members then fails -> the launcher
+  # falls back to sudo for them, which is correct.
   chown "root:$SVC_USER" "$target"
   chmod 0750 "$target"
+  setcap cap_net_raw+eip "$target"
+
+  # Prove it stuck. A silent no-op here is precisely the bug above, and an installer that
+  # claims to have armed an interpreter it did not arm is worse than one that fails.
+  getcap "$target" 2>/dev/null | grep -q cap_net_raw \
+    || die "setcap reported success but the capability is not on $target (a filesystem with no xattr support, or an ownership change after the grant)"
+
   # A file capability puts the loader into secure-execution mode (AT_SECURE): $ORIGIN rpaths
   # and LD_LIBRARY_PATH are ignored, so an interpreter that finds its libpython that way stops
   # starting the moment it is armed. Prove it still runs, or hand the capability back — a
