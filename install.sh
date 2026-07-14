@@ -234,13 +234,21 @@ EOF
 BIN="$DIR/.venv/bin/netmon"
 PY="$DIR/.venv/bin/python3"
 
+# libcap2-bin installs getcap into /usr/sbin, and Debian does not put /usr/sbin on an
+# unprivileged user's PATH — so a bare `getcap` call fails for exactly the user this check
+# exists to serve. The failure was silent (2>/dev/null ate "command not found", grep matched
+# nothing) and indistinguishable from "no capability", so --setcap appeared to do nothing:
+# the interpreter was armed and the launcher sudo-prompted anyway. Look in the sbin dirs.
+find_getcap() { PATH="/usr/sbin:/sbin:$PATH" command -v getcap 2>/dev/null; }
+
 needs_root() {
   case "${1:-}" in update|service) return 0 ;; esac      # write install dir / drive systemctl
   for a in "$@"; do case "$a" in
     -h|--help|-r|--read|--read=*) return 1 ;;             # help + replay need no privilege
   esac; done
   # already armed via --setcap? then no sudo for live capture.
-  getcap "$(readlink -f "$PY")" 2>/dev/null | grep -q cap_net_raw && return 1
+  gc="$(find_getcap)" || return 0                         # no getcap => cannot prove it; sudo
+  "$gc" "$(readlink -f "$PY")" 2>/dev/null | grep -q cap_net_raw && return 1
   return 0
 }
 
