@@ -429,6 +429,92 @@ def printable(value: str) -> str:
     return value.translate(_UNRENDERABLE)
 
 
+# --- Event classification ----------------------------------------------------
+# Shared by the capture core, the dashboard's filter, and `netmon query`: three closed
+# vocabularies and the total projections onto them. "Total" is the point — scope and
+# direction used to be FlowEvent fields, so `query --scope internet` matched flows and
+# nothing else, even though the DNS query and the SNI *are* the disclosure. Every kind has
+# a peer at the other end, so every kind can be classified, and the filter predicate becomes
+# a plain product of three set memberships with no per-kind special cases.
+
+_CGNAT4 = ipaddress.ip_network("100.64.0.0/10")
+
+
+def remote_scope(addr: str) -> str:
+    # The reachability class of an address, finer than internet/lan so the feed can
+    # tell carrier-NAT and link-local apart from a real private LAN. `_endpoint_is_local`
+    # reads this to decide flow direction; the summary credits only `internet`.
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return "lan"
+    if ip.is_multicast:
+        return "multicast"
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_link_local:
+        return "linklocal"
+    if ip.version == 4 and ip in _CGNAT4:
+        return "cgnat"  # RFC 6598 carrier-grade NAT: neither your LAN nor the internet
+    return "internet" if ip.is_global else "lan"
+
+
+# The three vocabularies a filter is built from, and the order their checkboxes are drawn
+# in. KIND_VALUES is derived from KIND_TO_FILE rather than typed out again — a thirteenth
+# kind must never be filterable-but-invisible, or invisible-but-filterable.
+KIND_VALUES: tuple[str, ...] = tuple(sorted(KIND_TO_FILE))
+DIRECTION_VALUES: tuple[str, ...] = ("outbound", "inbound", "local", "transit")
+SCOPE_VALUES: tuple[str, ...] = ("internet", "cgnat", "lan", "linklocal", "loopback", "multicast")
+
+# Client-originated disclosures leave the host (→ what you leak); resolver replies come
+# back (←). Flows carry their own direction; link-scope frames are neither.
+_CLIENT_KINDS = frozenset({"dns_query", "tls_sni", "http", "dns_ecs", "llmnr", "nbns"})
+_SERVER_KINDS = frozenset({"dns_answer", "dns_response", "dns_https"})
+
+
+# Dispatch on event.kind (the stable string discriminator), never on class identity.
+# Running netmon.py as a script makes its Event classes `__main__.*`, while netmon_tui
+# imports the `netmon.*` copies — so isinstance / class-pattern matching silently misses
+# every event. Here that would not blank a cell, it would pass every event through every
+# filter: a filter that looks like it does nothing. cast is a runtime no-op, so it keeps
+# mypy's field typing without depending on which module copy built the event.
+def event_remote_addr(event: Event) -> str:
+    # The address of whoever is at the other end — the one authority for "who is not us".
+    # Total over KIND_TO_FILE; a coverage test pins that.
+    match event.kind:
+        case "dns_query" | "dns_ecs" | "llmnr" | "nbns" | "tls_sni" | "http":
+            return cast(DnsQueryEvent, event).dst  # every client kind shares `dst`
+        case "dns_answer" | "dns_response" | "dns_https":
+            return cast(DnsAnswerEvent, event).resolver
+        case "flow":
+            return cast(FlowEvent, event).remote_ip
+        case "arp":
+            return cast(ArpEvent, event).target_ip
+        case "icmp6_ra":
+            return cast(Icmp6RaEvent, event).router
+        case _:
+            return ""
+
+
+def event_scope(event: Event) -> str:
+    # Derived, never read off FlowEvent.scope: remote_scope() is the single authority, and a
+    # flow's recorded scope *is* remote_scope(remote_ip) by construction (_flow_event), so
+    # the two cannot disagree — a coherence test pins that. Deriving is what makes scope
+    # total across all twelve kinds instead of a field only one of them carries.
+    return remote_scope(event_remote_addr(event))
+
+
+def event_direction_name(event: Event) -> str:
+    if event.kind == "flow":
+        direction = cast(FlowEvent, event).direction
+        return direction if direction in DIRECTION_VALUES else "local"
+    if event.kind in _CLIENT_KINDS:
+        return "outbound"
+    if event.kind in _SERVER_KINDS:
+        return "inbound"
+    return "local"  # arp / icmp6_ra: link-scope frames, which is what the "·" glyph means
+
+
 # --- Live dashboard (--tui) presentation model -------------------------------
 # All of this is Textual-free so it unit-tests as plain Python; netmon_tui.py is
 # the only place that imports Textual. The rule matches the rest of the tool: one
@@ -452,26 +538,13 @@ KIND_STYLE: dict[str, str] = {
     "nbns": "red",
 }
 
-# Client-originated disclosures leave the host (→ what you leak); resolver replies
-# come back (←). Flows carry their own direction; link-scope frames get a dot.
-_CLIENT_KINDS = frozenset({"dns_query", "tls_sni", "http", "dns_ecs", "llmnr", "nbns"})
-_SERVER_KINDS = frozenset({"dns_answer", "dns_response", "dns_https"})
-_FLOW_GLYPH = {"outbound": "→", "inbound": "←", "transit": "↔", "local": "·"}
+_DIRECTION_GLYPH = {"outbound": "→", "inbound": "←", "transit": "↔", "local": "·"}
 
 
-# Dispatch on event.kind (the stable string discriminator), never on class identity.
-# Running netmon.py as a script makes its Event classes `__main__.*`, while netmon_tui
-# imports the `netmon.*` copies — so isinstance / class-pattern matching silently misses
-# every event and blanks the HOST/DETAIL cells. cast is a runtime no-op, so it keeps
-# mypy's field typing without depending on which module copy built the event.
 def event_direction(event: Event) -> str:
-    if event.kind == "flow":
-        return _FLOW_GLYPH.get(cast(FlowEvent, event).direction, "·")
-    if event.kind in _CLIENT_KINDS:
-        return "→"
-    if event.kind in _SERVER_KINDS:
-        return "←"
-    return "·"
+    # The glyph for the DIR cell. event_direction_name is the authority for *which* way;
+    # this only says how to draw it, so the feed and the filter can never disagree.
+    return _DIRECTION_GLYPH[event_direction_name(event)]
 
 
 _NAME_KINDS = frozenset(
@@ -1441,28 +1514,6 @@ def local_addresses() -> frozenset[str]:
             if value:
                 ips.add(value)
     return frozenset(ips)
-
-
-_CGNAT4 = ipaddress.ip_network("100.64.0.0/10")
-
-
-def remote_scope(addr: str) -> str:
-    # The reachability class of an address, finer than internet/lan so the feed can
-    # tell carrier-NAT and link-local apart from a real private LAN. `_endpoint_is_local`
-    # reads this to decide flow direction; the summary credits only `internet`.
-    try:
-        ip = ipaddress.ip_address(addr)
-    except ValueError:
-        return "lan"
-    if ip.is_multicast:
-        return "multicast"
-    if ip.is_loopback:
-        return "loopback"
-    if ip.is_link_local:
-        return "linklocal"
-    if ip.version == 4 and ip in _CGNAT4:
-        return "cgnat"  # RFC 6598 carrier-grade NAT: neither your LAN nor the internet
-    return "internet" if ip.is_global else "lan"
 
 
 FlowKey = tuple[str, int, str, int]

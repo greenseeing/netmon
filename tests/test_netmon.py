@@ -50,13 +50,16 @@ from scapy.packet import Packet
 from scapy.utils import rdpcap, wrpcap
 
 from netmon import (
+    DIRECTION_VALUES,
     EVENT_ADAPTER,
     KIND_STYLE,
     KIND_TO_FILE,
+    KIND_VALUES,
     MAX_CLIENT_HELLO,
     QUIC_V1,
     QUIC_V2,
     RA_RDNSS_NAME,
+    SCOPE_VALUES,
     ArpEvent,
     BoundedCounter,
     CaptureStats,
@@ -106,7 +109,10 @@ from netmon import (
     derive_initial_keys,
     event_detail,
     event_direction,
+    event_direction_name,
     event_host,
+    event_remote_addr,
+    event_scope,
     event_to_cells,
     event_to_detail,
     extract_certificate_sans,
@@ -204,6 +210,63 @@ def single_flow(events: list[Event]) -> FlowEvent:
     (flow,) = events
     assert isinstance(flow, FlowEvent)
     return flow
+
+
+def sample_events() -> list[Event]:
+    # One event of every emitted kind — the single authority for "an example of each", so a
+    # projection that must be total over KIND_TO_FILE (a cell row, a scope, a CSV line) is
+    # tested against the same twelve everywhere. A test below asserts it stays exhaustive.
+    return [
+        q("x"),
+        DnsAnswerEvent(ts=TS, resolver="10.0.0.1", qname="x", rtype="A", value="1.2.3.4", ttl=60),
+        DnsResponseEvent(ts=TS, resolver="10.0.0.1", qname="x", qtype="A", rcode="NXDOMAIN"),
+        DnsHttpsEvent(
+            ts=TS,
+            resolver="10.0.0.1",
+            qname="x",
+            rtype="HTTPS",
+            priority=1,
+            target=".",
+            alpn=["h3"],
+            ech=True,
+            ttl=60,
+        ),
+        DnsEcsEvent(ts=TS, src="10.0.0.5", dst="10.0.0.1", qname="x", client_subnet="1.2.3.0/24"),
+        TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="github.com", alpn=["h2"]),
+        HttpEvent(
+            ts=TS,
+            src="10.0.0.5",
+            dst="1.2.3.4",
+            dport=80,
+            method="GET",
+            host="x",
+            path="/",
+            user_agent=None,
+        ),
+        FlowEvent(
+            ts=TS,
+            proto="udp",
+            direction="outbound",
+            scope="lan",
+            birth="datagram",
+            local_ip="10.0.0.5",
+            local_port=5353,
+            remote_ip="224.0.0.251",
+            remote_port=5353,
+            service="mdns",
+            hostname=None,
+        ),
+        ArpEvent(
+            ts=TS,
+            op="who-has",
+            sender_ip="10.0.0.5",
+            sender_mac="aa:bb:cc:dd:ee:ff",
+            target_ip="10.0.0.1",
+        ),
+        Icmp6RaEvent(ts=TS, router="fe80::1", prefixes=["2001:db8::/64"], rdnss=["2001:db8::1"]),
+        LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="wpad", qtype="A"),
+        NbnsEvent(ts=TS, src="10.0.0.5", dst="10.0.0.255", qname="WORKGROUP"),
+    ]
 
 
 class TestHostname:
@@ -1325,9 +1388,7 @@ class TestCmdUpdate:
         # No uv on PATH and no pip in the venv: there is no way to rebuild this install, and
         # saying so beats pulling first and discovering it afterwards.
         monkeypatch.setattr(netmon, "_install_dir", lambda: tmp_path)
-        monkeypatch.setattr(
-            shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None
-        )
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
         assert cmd_update([]) == 1
         assert "cannot sync this install" in capsys.readouterr().err
 
@@ -1440,9 +1501,7 @@ class TestCmdUpdate:
 
         # An install that cannot be synced must not be left pulled-but-unbuilt.
         monkeypatch.setattr(netmon, "_install_dir", lambda: tmp_path)
-        monkeypatch.setattr(
-            shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None
-        )
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
         ran: list[list[str]] = []
 
         def fake_run(argv: list[str], **kw: Any) -> Any:
@@ -4652,10 +4711,8 @@ class TestDnsTcpVsTlsRouting:
 TS = "2025-07-02T23:46:40.123+00:00"
 
 
-def q(name: str = "example.com") -> DnsQueryEvent:
-    return DnsQueryEvent(
-        ts=TS, src="10.0.0.5", dst="10.0.0.1", transport="udp", qname=name, qtype="A"
-    )
+def q(name: str = "example.com", dst: str = "10.0.0.1") -> DnsQueryEvent:
+    return DnsQueryEvent(ts=TS, src="10.0.0.5", dst=dst, transport="udp", qname=name, qtype="A")
 
 
 class _Clock:
@@ -4935,68 +4992,7 @@ class TestEventToCells:
         assert event_detail(h) == "GET /"
 
     def test_every_event_kind_renders_without_error(self) -> None:
-        samples = [
-            q("x"),
-            DnsAnswerEvent(
-                ts=TS, resolver="10.0.0.1", qname="x", rtype="A", value="1.2.3.4", ttl=60
-            ),
-            DnsResponseEvent(ts=TS, resolver="10.0.0.1", qname="x", qtype="A", rcode="NXDOMAIN"),
-            DnsHttpsEvent(
-                ts=TS,
-                resolver="10.0.0.1",
-                qname="x",
-                rtype="HTTPS",
-                priority=1,
-                target=".",
-                alpn=["h3"],
-                ech=True,
-                ttl=60,
-            ),
-            DnsEcsEvent(
-                ts=TS, src="10.0.0.5", dst="10.0.0.1", qname="x", client_subnet="1.2.3.0/24"
-            ),
-            TlsSniEvent(
-                ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="github.com", alpn=["h2"]
-            ),
-            HttpEvent(
-                ts=TS,
-                src="10.0.0.5",
-                dst="1.2.3.4",
-                dport=80,
-                method="GET",
-                host="x",
-                path="/",
-                user_agent=None,
-            ),
-            FlowEvent(
-                ts=TS,
-                proto="udp",
-                direction="outbound",
-                scope="lan",
-                birth="datagram",
-                local_ip="10.0.0.5",
-                local_port=5353,
-                remote_ip="224.0.0.251",
-                remote_port=5353,
-                service="mdns",
-                hostname=None,
-            ),
-            ArpEvent(
-                ts=TS,
-                op="who-has",
-                sender_ip="10.0.0.5",
-                sender_mac="aa:bb:cc:dd:ee:ff",
-                target_ip="10.0.0.1",
-            ),
-            Icmp6RaEvent(
-                ts=TS, router="fe80::1", prefixes=["2001:db8::/64"], rdnss=["2001:db8::1"]
-            ),
-            LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="wpad", qtype="A"),
-            NbnsEvent(ts=TS, src="10.0.0.5", dst="10.0.0.255", qname="WORKGROUP"),
-        ]
-        seen = {e.kind for e in samples}
-        assert seen == set(KIND_TO_FILE)  # one sample per emitted kind
-        for e in samples:
+        for e in sample_events():
             cells = event_to_cells(e)
             assert len(cells) == 5
             assert all(isinstance(c, str) for c in cells)
@@ -5005,6 +5001,58 @@ class TestEventToCells:
 class TestKindStyle:
     def test_every_emitted_kind_has_a_color(self) -> None:
         assert set(KIND_TO_FILE) <= set(KIND_STYLE)
+
+
+class TestSampleEvents:
+    def test_covers_every_emitted_kind(self) -> None:
+        # The guard on the guard: the totality tests below are only as good as this list.
+        assert {e.kind for e in sample_events()} == set(KIND_TO_FILE)
+
+
+class TestEventProjectionsAreTotal:
+    # scope and direction used to exist only on FlowEvent, so `query --scope internet`
+    # silently matched flows alone -- even though the DNS query and the SNI *are* the
+    # disclosure. These projections are total over every kind, and this is the drift guard
+    # that keeps them that way when a thirteenth kind is added.
+    def test_every_kind_has_a_peer_address(self) -> None:
+        for e in sample_events():
+            assert event_remote_addr(e), f"{e.kind} has no peer address"
+
+    def test_every_kind_has_a_scope_from_the_vocabulary(self) -> None:
+        for e in sample_events():
+            assert event_scope(e) in SCOPE_VALUES, f"{e.kind} -> {event_scope(e)}"
+
+    def test_every_kind_has_a_direction_from_the_vocabulary(self) -> None:
+        for e in sample_events():
+            assert event_direction_name(e) in DIRECTION_VALUES, f"{e.kind}"
+
+    def test_kind_vocabulary_is_derived_from_the_file_map(self) -> None:
+        assert set(KIND_VALUES) == set(KIND_TO_FILE)
+
+
+class TestEventScope:
+    def test_dns_query_to_a_public_resolver_is_internet(self) -> None:
+        assert event_scope(q("x", dst="8.8.8.8")) == "internet"
+
+    def test_dns_query_to_the_router_is_lan(self) -> None:
+        assert event_scope(q("x", dst="192.168.1.1")) == "lan"
+
+    def test_llmnr_is_multicast(self) -> None:
+        e = LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="wpad", qtype="A")
+        assert event_scope(e) == "multicast"
+
+    def test_router_advertisement_is_link_local(self) -> None:
+        e = Icmp6RaEvent(ts=TS, router="fe80::1")
+        assert event_scope(e) == "linklocal"
+
+    def test_a_recorded_flow_scope_agrees_with_the_derived_one(
+        self, processor: PacketProcessor
+    ) -> None:
+        # remote_scope() is the one authority: a flow's recorded scope IS remote_scope of its
+        # remote_ip by construction, so deriving instead of reading the field cannot disagree.
+        # If this ever fails, the two authorities have forked and the filter is lying.
+        flow = single_flow(processor.process(make_syn("192.168.1.50", "93.184.216.34", 4000, 443)))
+        assert event_scope(flow) == flow.scope == "internet"
 
 
 class TestRenderHelpersAcrossModuleCopies:
@@ -5057,6 +5105,16 @@ class TestRenderHelpersAcrossModuleCopies:
         assert event_direction(flow) == "→"  # not the "·" fallback
         assert event_host(flow) == "github.com"
         assert event_to_cells(http)[3:] == ["127.0.0.1:43383", "GET /rest/system/error"]
+
+    def test_classification_projections_survive_foreign_event_classes(self) -> None:
+        # The filter and `query` are built on these three, so a class-identity dispatch here
+        # would silently pass every event through every filter — the failure would look like
+        # a filter that does nothing, not like a crash.
+        alt = self._alt_module()
+        sni = alt.TlsSniEvent(ts=TS, src="10.0.0.5", dst="93.184.216.34", dport=443, sni="e.com")
+        assert event_remote_addr(sni) == "93.184.216.34"
+        assert event_scope(sni) == "internet"
+        assert event_direction_name(sni) == "outbound"
 
 
 class TestRunTuiMode:
