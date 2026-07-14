@@ -60,6 +60,10 @@ from netmon import (
     QUIC_V2,
     RA_RDNSS_NAME,
     SCOPE_VALUES,
+    SERVICE_BY_PORT,
+    SERVICE_LEAK,
+    SERVICE_NOTES,
+    SEVERITY_RANK,
     ArpEvent,
     BoundedCounter,
     CaptureStats,
@@ -72,6 +76,8 @@ from netmon import (
     DnsTcpReassembler,
     Event,
     EventFilter,
+    Finding,
+    FindingLedger,
     FlowEvent,
     Hostname,
     HttpEvent,
@@ -88,8 +94,10 @@ from netmon import (
     QuicReassembler,
     RateBucketer,
     ReplayCapture,
+    Rule,
     Scan,
     Session,
+    Severity,
     StreamStart,
     TcpReassembler,
     TlsClientHello,
@@ -102,6 +110,7 @@ from netmon import (
     _run_parser,
     _server_stream_start,
     announce_start,
+    assess,
     build_session,
     check_capture_privileges,
     cmd_service,
@@ -5042,6 +5051,263 @@ class TestEventToCells:
 class TestKindStyle:
     def test_every_emitted_kind_has_a_color(self) -> None:
         assert set(KIND_TO_FILE) <= set(KIND_STYLE)
+
+
+def http_to(dst: str, method: str = "GET", host: str | None = None, **kw: Any) -> HttpEvent:
+    return HttpEvent(
+        ts=TS, src="192.168.1.50", dst=dst, dport=80, method=method, path="/", host=host, **kw
+    )
+
+
+def flow_to(service: str, remote_ip: str, port: int = 25) -> FlowEvent:
+    return FlowEvent(
+        ts=TS,
+        proto="tcp",
+        direction="outbound",
+        scope=remote_scope(remote_ip),
+        birth="observed",
+        local_ip="192.168.1.50",
+        local_port=50000,
+        remote_ip=remote_ip,
+        remote_port=port,
+        service=service,
+        note=SERVICE_NOTES.get(service),
+    )
+
+
+class TestLeakRules:
+    # Every rule with its NEGATIVE. The negatives ARE the design: a panel that cries wolf on
+    # ordinary traffic is a panel the operator stops reading — and then the real finding is
+    # invisible too.
+
+    def test_cleartext_post_to_the_internet_is_high(self) -> None:
+        f = assess(http_to("93.184.216.34", method="POST", host="neverssl.com"))
+        assert f is not None
+        assert (f.rule, f.severity) == (Rule.CLEARTEXT_HTTP, Severity.HIGH)
+        assert f.subject == "neverssl.com"
+        assert "POST" in f.leaked and "https" in f.advice
+
+    def test_a_plain_get_to_the_internet_is_medium(self) -> None:
+        f = assess(http_to("93.184.216.34", host="neverssl.com"))
+        assert f is not None and f.severity == Severity.MEDIUM
+
+    def test_http_to_loopback_is_not_a_leak(self) -> None:
+        # The most common HTTP event on a developer's machine is a REST call to their own
+        # daemon on 127.0.0.1 — this repo's own fixtures contain one. Flagging it would
+        # destroy trust in the panel on the very first run.
+        assert assess(http_to("127.0.0.1", method="POST", host="127.0.0.1:43383")) is None
+
+    def test_http_to_the_lan_is_demoted(self) -> None:
+        f = assess(http_to("192.168.1.9", method="POST", host="nas"))
+        assert f is not None and f.severity == Severity.MEDIUM  # HIGH demoted: never left home
+
+    def test_captive_portal_check_is_only_low(self) -> None:
+        f = assess(http_to("17.253.55.5", host="captive.apple.com", tag="captive-portal"))
+        assert f is not None and f.severity == Severity.LOW
+
+    def test_plaintext_dns_is_keyed_on_the_resolver_not_the_name(self) -> None:
+        # Otherwise a busy host produces thousands of rows and buries every other finding.
+        # One resolver, one row, a count.
+        a, b = assess(q("a.example", dst="8.8.8.8")), assess(q("b.example", dst="8.8.8.8"))
+        assert a is not None and b is not None
+        assert a.rule is Rule.CLEARTEXT_DNS and a.severity == Severity.MEDIUM
+        assert a.subject == b.subject == "8.8.8.8"
+
+    def test_dns_to_the_local_resolver_is_only_low(self) -> None:
+        f = assess(q("example.com", dst="192.168.1.1"))
+        assert f is not None and f.severity == Severity.LOW
+
+    def test_an_internal_name_sent_to_a_public_resolver_is_high(self) -> None:
+        for name in ("nas.local", "db01.internal", "printer", "host.home.arpa"):
+            f = assess(q(name, dst="8.8.8.8"))
+            assert f is not None, name
+            assert (f.rule, f.severity) == (Rule.INTERNAL_NAME_ESCAPED, Severity.HIGH), name
+
+    def test_the_same_internal_name_asked_of_the_local_resolver_is_not_escaping(self) -> None:
+        f = assess(q("nas.local", dst="192.168.1.1"))
+        assert f is not None and f.rule is Rule.CLEARTEXT_DNS
+
+    def test_a_public_name_is_not_mistaken_for_an_internal_one(self) -> None:
+        f = assess(q("example.com", dst="8.8.8.8"))
+        assert f is not None and f.rule is Rule.CLEARTEXT_DNS
+
+    def test_a_private_reverse_lookup_that_escapes_is_high(self) -> None:
+        f = assess(q("50.1.168.192.in-addr.arpa", dst="8.8.8.8"))
+        assert f is not None and f.rule is Rule.INTERNAL_NAME_ESCAPED
+
+    def test_a_public_reverse_lookup_is_not(self) -> None:
+        f = assess(q("34.216.184.93.in-addr.arpa", dst="8.8.8.8"))
+        assert f is not None and f.rule is Rule.CLEARTEXT_DNS
+
+    def test_mdns_is_low_and_keyed_on_the_device(self) -> None:
+        f = assess(q("nas.local", dst="224.0.0.251"))
+        assert f is not None
+        assert (f.rule, f.severity, f.subject) == (Rule.MDNS_BROADCAST, Severity.LOW, "10.0.0.5")
+
+    def test_llmnr_broadcast_is_medium(self) -> None:
+        e = LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="desktop", qtype="A")
+        f = assess(e)
+        assert f is not None and (f.rule, f.severity) == (Rule.LAN_NAME_BROADCAST, Severity.MEDIUM)
+
+    def test_a_wpad_broadcast_is_high(self) -> None:
+        # Whoever answers becomes this host's web proxy.
+        e = LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="wpad", qtype="A")
+        f = assess(e)
+        assert f is not None and (f.rule, f.severity) == (Rule.WPAD_BROADCAST, Severity.HIGH)
+
+    def test_ecs_with_a_real_prefix_is_a_leak(self) -> None:
+        e = DnsEcsEvent(
+            ts=TS, src="192.168.1.50", dst="8.8.8.8", qname="x", client_subnet="203.0.113.0/24"
+        )
+        f = assess(e)
+        assert f is not None and (f.rule, f.severity) == (Rule.ECS_SUBNET, Severity.MEDIUM)
+        assert f.subject == "203.0.113.0/24"
+
+    def test_ecs_with_a_zero_prefix_is_a_leak_prevented(self) -> None:
+        # A /0 is the resolver explicitly telling the authoritative side "do NOT use my
+        # client's subnet". Flagging it would invert the very truth the tool exists to report.
+        e = DnsEcsEvent(
+            ts=TS, src="192.168.1.50", dst="8.8.8.8", qname="x", client_subnet="0.0.0.0/0"
+        )
+        assert assess(e) is None
+
+    def test_ftp_is_high_and_mail_is_only_medium(self) -> None:
+        ftp = assess(flow_to("ftp", "93.184.216.34", port=21))
+        assert ftp is not None and ftp.severity == Severity.HIGH
+
+        smtp = assess(flow_to("smtp", "93.184.216.34", port=25))
+        assert smtp is not None
+        assert smtp.severity == Severity.MEDIUM  # not HIGH: netmon never reads the payload
+        # ...and the advice has to say exactly that, rather than claim a credential leak.
+        assert "STARTTLS" in smtp.advice and "cannot see whether it did" in smtp.advice
+
+    def test_an_encrypted_service_is_not_a_finding(self) -> None:
+        assert assess(flow_to("https", "93.184.216.34", port=443)) is None
+        assert assess(flow_to("ssh", "93.184.216.34", port=22)) is None
+
+    def test_plaintext_service_on_the_lan_is_demoted(self) -> None:
+        f = assess(flow_to("ftp", "192.168.1.9", port=21))
+        assert f is not None and f.severity == Severity.MEDIUM  # HIGH demoted; never left home
+
+
+class TestFindingRuleCoverage:
+    def test_every_rule_is_reachable_from_assess(self) -> None:
+        reached = [
+            assess(http_to("93.184.216.34", method="POST", host="x")),
+            assess(q("example.com", dst="8.8.8.8")),
+            assess(q("nas.local", dst="8.8.8.8")),
+            assess(q("nas.local", dst="224.0.0.251")),
+            assess(LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="pc", qtype="A")),
+            assess(LlmnrEvent(ts=TS, src="10.0.0.5", dst="224.0.0.252", qname="wpad", qtype="A")),
+            assess(
+                DnsEcsEvent(
+                    ts=TS, src="10.0.0.5", dst="8.8.8.8", qname="x", client_subnet="1.2.3.0/24"
+                )
+            ),
+            assess(flow_to("ftp", "93.184.216.34", port=21)),
+        ]
+        assert {f.rule for f in reached if f is not None} == set(Rule)
+
+    def test_service_tables_do_not_drift(self) -> None:
+        assert set(SERVICE_LEAK) <= set(SERVICE_BY_PORT.values()), "a severity for no known port"
+        assert set(SERVICE_NOTES) <= set(SERVICE_LEAK), "a noted service with no severity"
+
+    def test_severity_rank_covers_every_severity(self) -> None:
+        assert set(SEVERITY_RANK) == set(Severity)
+
+    def test_severity_must_be_ranked_not_compared_as_a_string(self) -> None:
+        # The trap SEVERITY_RANK exists to close: StrEnum compares LEXICALLY, so "high" is
+        # less than "low". A bare >= would silently mis-rank the entire panel.
+        assert Severity.HIGH < Severity.LOW  # as strings: nonsense, but true
+        assert SEVERITY_RANK[Severity.HIGH] > SEVERITY_RANK[Severity.LOW]  # as severities
+
+    def test_assess_is_total_over_every_kind(self) -> None:
+        for e in sample_events():
+            assess(e)  # must not raise on any kind, including the ones with no rule
+
+
+class TestFindingLedger:
+    def _finding(self, subject: str, severity: Severity = Severity.LOW) -> Finding:
+        return Finding(
+            rule=Rule.CLEARTEXT_DNS,
+            severity=severity,
+            subject=subject,
+            leaked="x",
+            to="y",
+            advice="z",
+        )
+
+    def test_aggregates_by_subject_with_a_count(self) -> None:
+        ledger = FindingLedger()
+        for _ in range(1432):
+            ledger.add(self._finding("8.8.8.8"))
+        assert len(ledger) == 1
+        assert ledger.top(10) == [(self._finding("8.8.8.8"), 1432)]
+
+    def test_first_sighting_is_reported(self) -> None:
+        ledger = FindingLedger()
+        assert ledger.add(self._finding("8.8.8.8")) is True
+        assert ledger.add(self._finding("8.8.8.8")) is False
+
+    def test_top_orders_by_severity_then_count(self) -> None:
+        ledger = FindingLedger()
+        for _ in range(50):
+            ledger.add(self._finding("noisy", Severity.LOW))
+        ledger.add(self._finding("quiet", Severity.HIGH))
+        assert [f.subject for f, _ in ledger.top(2)] == ["quiet", "noisy"]  # severity first
+
+    def test_overflow_is_bounded_counted_and_keeps_the_high(self) -> None:
+        # A bounded table owes the same honesty as every other one here: a clean log is not a
+        # silent gap. And a HIGH must never be evicted while a LOW survives.
+        ledger = FindingLedger(cap=10)
+        ledger.add(self._finding("keepme", Severity.HIGH))
+        for i in range(50):
+            ledger.add(self._finding(f"noise{i}", Severity.LOW))
+        assert len(ledger) == 10
+        assert ledger.evicted == 41
+        assert "keepme" in {f.subject for f, _ in ledger.top(10)}
+
+
+class TestFindingsReachTheSummary:
+    def test_a_leaky_run_reports_findings_and_ech_coverage(
+        self, processor: PacketProcessor
+    ) -> None:
+        # Driven through process(pkt) — the highest seam — so this proves the whole path from
+        # wire to summary, not just that assess() works in isolation.
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="8.8.8.8")
+            / UDP(sport=5300, dport=53)
+            / DNS(rd=1, qd=DNSQR(qname="example.com", qtype="A"))
+        )
+        pkt.time = PKT_TIME
+        processor.process(pkt)
+        findings = processor.summary()["findings"]
+        assert findings["by_severity"]["medium"] >= 1
+        assert findings["by_rule"]["cleartext-dns"] >= 1
+        assert findings["top"][0]["subject"] == "8.8.8.8"
+        assert "advice" in findings["top"][0]
+
+    def test_the_findings_ledger_reports_its_own_evictions_in_coverage(self) -> None:
+        proc = PacketProcessor(local_ips=frozenset(), finding_cap=2)
+        for i in range(20):
+            proc.findings.add(
+                Finding(
+                    rule=Rule.CLEARTEXT_DNS,
+                    severity=Severity.LOW,
+                    subject=f"r{i}",
+                    leaked="x",
+                    to="y",
+                    advice="z",
+                )
+            )
+        assert proc.summary()["coverage"]["evicted"]["findings"] == 18
+
+    def test_a_clean_run_has_an_empty_findings_block_not_a_missing_one(
+        self, processor: PacketProcessor
+    ) -> None:
+        findings = processor.summary()["findings"]
+        assert findings["by_severity"] == {} and findings["top"] == []
 
 
 class TestSampleEvents:

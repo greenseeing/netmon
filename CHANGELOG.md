@@ -8,6 +8,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **netmon now says what each event *discloses*.** It recorded `dns.jsonl`, `http.jsonl` and
+  `flows.jsonl` and left you to already know that a cleartext POST, or an EDNS Client-Subnet
+  record, is a leak. A deterministic assessment now rates every event and explains it: what
+  leaked, to whom, and what to do about it. `summary.json` carries the rollup — which is the
+  *only* surface the headless recorder has, since it has no dashboard.
+
+  These are **leak findings, not detections**. netmon has no baseline, no threat intel and no
+  notion of "unusual", and it is not growing one. The rule that governs every rule is: *a rule
+  may only claim what the event's own fields prove.* That bans the intrusion-detection shapes
+  outright — novelty, beaconing, rare ports, volume, none of which a single event can evidence
+  — and it equally bans over-claiming, which is the subtler failure: the mail-port rules are
+  MEDIUM rather than HIGH precisely because netmon never reads the payload and so cannot know
+  whether the client upgraded with STARTTLS. The advice says so, and points at `--pcap`.
+
+  The false-positive killers are the design, not a refinement of it. **Loopback is never a
+  leak** — the most common HTTP event on a developer's machine is a REST call to their own
+  daemon, and a panel that screams about it is a panel nobody reads twice. **An ECS record
+  advertising a `/0` prefix is a leak *prevented*** — the resolver is explicitly saying *do not
+  use my client's subnet* — and flagging it would invert the truth the tool exists to report.
+  And findings **aggregate by subject**, so plaintext DNS to one resolver is a single row
+  reading `×1,432` rather than 1,432 rows burying everything else.
+
+  Findings are never written per-event. The JSONL stays raw evidence and severity stays
+  recomputable interpretation, so improving a rule re-reads every run already on disk — including
+  runs recorded before this existed — with no schema change, no migration, and nothing that can
+  drift. An empty findings block means *no known-shape disclosure was recorded*, never that
+  nothing leaked.
+
+  Also: `tcp/23` is now recognised as `telnet` (a leak auditor with no telnet entry has a real
+  gap), and `summary.json` gained cleartext-SNI/ECH counters — the honest form of a fact that
+  would be worthless as a rule, since a cleartext-SNI rule would fire on nearly every flow.
+
 - **The dashboard filters with checkboxes instead of a one-at-a-time cycle.** `f` used to
   advance a single substring through `all → dns → tls → http → flow`; you could not ask for
   DNS *and* TLS, you could not ask for "only internet-bound", and four of the twelve recorded

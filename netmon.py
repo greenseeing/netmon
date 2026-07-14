@@ -66,6 +66,7 @@ log = structlog.get_logger()
 SERVICE_BY_PORT: dict[tuple[str, int], str] = {
     ("tcp", 21): "ftp",
     ("tcp", 22): "ssh",
+    ("tcp", 23): "telnet",
     ("tcp", 25): "smtp",
     ("tcp", 53): "dns-tcp",
     ("tcp", 80): "http",
@@ -513,6 +514,336 @@ def event_direction_name(event: Event) -> str:
     if event.kind in _SERVER_KINDS:
         return "inbound"
     return "local"  # arp / icmp6_ra: link-scope frames, which is what the "·" glyph means
+
+
+# --- Leak findings -----------------------------------------------------------
+# What each recorded event DISCLOSES, rated. Not alerts, not detections: netmon has no
+# baseline, no threat intel and no notion of "unusual", and the README says so. The one rule
+# that governs every rule below is:
+#
+#     A rule may only claim what the event's own fields prove.
+#
+# That bans the IDS shapes outright (novelty, beaconing, rare ports, volume — none of which
+# a single event can evidence) and it equally bans over-claiming, which is the subtler
+# failure: netmon never reads an SMTP payload, so it must not say credentials leaked.
+#
+# Findings are NEVER persisted per-event. assess() is a projection, like event_host — the
+# JSONL stays raw evidence and severity stays recomputable interpretation, so improving a
+# rule re-reads every run already on disk (including runs recorded before this existed) with
+# no schema change, no migration, and nothing that can drift.
+
+
+class Severity(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+# StrEnum compares LEXICALLY -- "high" < "low" < "medium" -- which is not severity order. A
+# bare `>=` between two Severity values is a silent bug that would quietly mis-rank the whole
+# panel, so every comparison goes through this map instead.
+SEVERITY_RANK: dict[Severity, int] = {Severity.LOW: 0, Severity.MEDIUM: 1, Severity.HIGH: 2}
+
+
+class Rule(StrEnum):
+    CLEARTEXT_HTTP = "cleartext-http"
+    CLEARTEXT_DNS = "cleartext-dns"
+    INTERNAL_NAME_ESCAPED = "internal-name-escaped"
+    MDNS_BROADCAST = "mdns-broadcast"
+    LAN_NAME_BROADCAST = "lan-name-broadcast"
+    WPAD_BROADCAST = "wpad-broadcast"
+    ECS_SUBNET = "ecs-subnet"
+    PLAINTEXT_SERVICE = "plaintext-service"
+
+
+class Finding(NamedTuple):
+    # A NamedTuple, not a pydantic model: pydantic is reserved for things that came off the
+    # wire. This is interpretation, and it never round-trips through a file.
+    #
+    # The diagnosis is three fields rather than one prose blob, because the panel wants the
+    # subject and the detail pane wants the explanation, and splitting them later would mean
+    # parsing our own sentences back apart.
+    rule: Rule
+    severity: Severity
+    subject: str  # the aggregation key: the resolver, the host, the name, the device
+    leaked: str  # what crossed the wire
+    to: str  # and to whom
+    advice: str  # what the operator can do about it
+
+
+# How much a flow to each cleartext-capable service costs you. SERVICE_NOTES stays the one
+# authority for the prose; this is the one authority for the severity, and a test pins that
+# neither grows a key the other -- or SERVICE_BY_PORT -- has never heard of.
+#
+# ftp is HIGH because the protocol puts USER/PASS on the wire by design. The mail ports are
+# MEDIUM, and the reason is the whole discipline in miniature: netmon does not read their
+# payload, so it cannot know whether the client upgraded with STARTTLS before authenticating.
+# Rating them HIGH would be claiming a credential leak nobody observed.
+#
+# `dns` is deliberately absent: the DnsQueryEvent is the authority for that disclosure, and
+# listing it here too would count every plaintext lookup twice, once as a flow and once as a
+# query.
+SERVICE_LEAK: dict[str, Severity] = {
+    "ftp": Severity.HIGH,
+    "telnet": Severity.HIGH,
+    "smtp": Severity.MEDIUM,
+    "smtp-submission": Severity.MEDIUM,
+    "imap": Severity.MEDIUM,
+    "pop3": Severity.MEDIUM,
+    "ntp": Severity.LOW,
+    "http": Severity.LOW,
+    "http-alt": Severity.LOW,
+}
+
+_STARTTLS_ADVICE = (
+    "this port carries auth in cleartext unless the client upgrades with STARTTLS, and "
+    "netmon cannot see whether it did — re-run with --pcap and open the flow in tshark to "
+    "settle it"
+)
+
+# A name that was only ever meant for your own network. Leaking one to a public resolver
+# hands over your internal topology — hostnames, naming scheme, sometimes the org chart.
+_INTERNAL_SUFFIXES = (".local", ".internal", ".home.arpa", ".lan", ".corp", ".home")
+_PRIVATE_PTR = ("in-addr.arpa", "ip6.arpa")
+
+# Off-LAN scopes: a disclosure that reaches one of these has left your network.
+_OFF_NET = frozenset({"internet", "cgnat"})
+
+_DEMOTE = {
+    Severity.HIGH: Severity.MEDIUM,
+    Severity.MEDIUM: Severity.LOW,
+    Severity.LOW: Severity.LOW,
+}
+
+
+def _is_internal_name(qname: str) -> bool:
+    name = qname.rstrip(".").casefold()
+    if not name:
+        return False
+    if name.endswith(_INTERNAL_SUFFIXES):
+        return True
+    if "." not in name:
+        return True  # a single label: a bare machine name, meaningless outside your LAN
+    if name.endswith(_PRIVATE_PTR):
+        # A reverse lookup only leaks topology if the address being resolved is private.
+        head = name.removesuffix(".in-addr.arpa").removesuffix(".ip6.arpa")
+        octets = head.split(".")[::-1]
+        with contextlib.suppress(ValueError):
+            return remote_scope(".".join(octets)) not in _OFF_NET
+    return False
+
+
+def _ecs_prefix_len(client_subnet: str) -> int:
+    # A resolver advertising a /0 is explicitly telling the authoritative side "do not use my
+    # client's subnet". That is a leak PREVENTED, and flagging it would invert the truth the
+    # tool exists to report.
+    _, _, plen = client_subnet.partition("/")
+    try:
+        return int(plen)
+    except ValueError:
+        return 0
+
+
+def assess(event: Event) -> Finding | None:
+    # The fourth projection, beside event_direction / event_host / event_detail — same
+    # dispatch on .kind, never isinstance, for the same reason (see event_remote_addr).
+    #
+    # At most ONE finding per event, never a list: the rule says what class of disclosure it
+    # is and the severity says what it cost, so one-per-event makes double-counting
+    # structurally impossible rather than a convention someone has to remember.
+    scope = event_scope(event)
+    if scope == "loopback":
+        # A host talking to itself discloses nothing to anyone. This is not a nicety: the
+        # single most common HTTP event on a developer's machine is a 127.0.0.1 REST call to
+        # their own daemon, and a panel that screams about it is a panel nobody reads twice.
+        return None
+
+    match event.kind:
+        case "http":
+            http = cast(HttpEvent, event)
+            host = http.host or http.dst
+            if http.tag == "captive-portal":
+                severity = Severity.LOW
+            elif http.method in ("POST", "PUT", "PATCH"):
+                severity = Severity.HIGH  # a body crossed the wire, in the clear
+            else:
+                severity = Severity.MEDIUM
+            if scope not in _OFF_NET:
+                severity = _DEMOTE[severity]
+            agent = f", and identified this client as {http.user_agent}" if http.user_agent else ""
+            return Finding(
+                rule=Rule.CLEARTEXT_HTTP,
+                severity=severity,
+                subject=host,
+                leaked=f"an unencrypted {http.method} for {host}{http.path}{agent}",
+                to=f"{http.dst} and every hop in between ({scope})",
+                advice="anyone on the path read this in full — prefer https for this host",
+            )
+
+        case "dns_query":
+            query = cast(DnsQueryEvent, event)
+            if scope == "multicast":
+                return Finding(
+                    rule=Rule.MDNS_BROADCAST,
+                    severity=Severity.LOW,
+                    subject=query.src,
+                    leaked=f"a multicast lookup for {query.qname}",
+                    to="every device on the local network",
+                    advice="normal for service discovery; it tells your LAN what this device "
+                    "is looking for",
+                )
+            if scope in _OFF_NET and _is_internal_name(query.qname):
+                return Finding(
+                    rule=Rule.INTERNAL_NAME_ESCAPED,
+                    severity=Severity.HIGH,
+                    subject=query.qname,
+                    leaked=f"the internal name {query.qname}, which only means something "
+                    "inside your network",
+                    to=f"the public resolver {query.dst}",
+                    advice="a search-domain or split-horizon DNS misconfiguration is leaking "
+                    "your internal topology — fix the resolver config",
+                )
+            return Finding(
+                rule=Rule.CLEARTEXT_DNS,
+                severity=Severity.MEDIUM if scope in _OFF_NET else Severity.LOW,
+                # The RESOLVER, not the name: one busy resolver is then one row with a count,
+                # instead of a thousand rows that bury every other finding.
+                subject=query.dst,
+                leaked=f"every name this host looks up, in cleartext (e.g. {query.qname})",
+                to=f"the resolver {query.dst} and every hop to it ({scope})",
+                advice="use encrypted DNS (DoH/DoT) so the names are not readable on the path",
+            )
+
+        case "llmnr" | "nbns":
+            name = cast(LlmnrEvent, event).qname
+            if name.casefold().startswith("wpad"):
+                return Finding(
+                    rule=Rule.WPAD_BROADCAST,
+                    severity=Severity.HIGH,
+                    subject=name,
+                    leaked="a broadcast asking the LAN who serves this host's proxy config",
+                    to="every device on the local network",
+                    advice="any device that answers becomes this host's web proxy — disable "
+                    "WPAD, and disable LLMNR/NBNS",
+                )
+            return Finding(
+                rule=Rule.LAN_NAME_BROADCAST,
+                severity=Severity.MEDIUM,
+                subject=name,
+                leaked=f"a legacy name broadcast for {name}, naming this host to the LAN",
+                to="every device on the local network",
+                advice="LLMNR/NBNS are spoofable and answer to anyone — disable them if you "
+                "do not need them",
+            )
+
+        case "dns_ecs":
+            ecs = cast(DnsEcsEvent, event)
+            if _ecs_prefix_len(ecs.client_subnet) == 0:
+                return None  # /0 = "do not use my client's subnet": a leak prevented
+            return Finding(
+                rule=Rule.ECS_SUBNET,
+                severity=Severity.MEDIUM,
+                subject=ecs.client_subnet,
+                leaked=f"your own network prefix {ecs.client_subnet}, inside the DNS lookup "
+                f"for {ecs.qname}",
+                to="the authoritative nameservers for every name you resolve",
+                advice="EDNS Client Subnet is coarse geolocation of you — a resolver that "
+                "sends /0 (or DoH to one that does) stops it",
+            )
+
+        case "flow":
+            flow = cast(FlowEvent, event)
+            severity = SERVICE_LEAK.get(flow.service, Severity.LOW)
+            if flow.service not in SERVICE_LEAK:
+                return None
+            if scope not in _OFF_NET:
+                severity = _DEMOTE[severity]
+            where = flow.hostname or flow.remote_ip
+            starttls = flow.service in ("smtp", "smtp-submission", "imap", "pop3")
+            return Finding(
+                rule=Rule.PLAINTEXT_SERVICE,
+                severity=severity,
+                subject=f"{flow.service} {where}",
+                leaked=SERVICE_NOTES.get(
+                    flow.service, f"a cleartext-capable {flow.service} channel was opened"
+                ),
+                to=f"{where}:{flow.remote_port} ({scope})",
+                advice=_STARTTLS_ADVICE
+                if starttls
+                else "this service carries its content in the clear — prefer its TLS port",
+            )
+
+    return None
+
+
+class FindingLedger:
+    # Bounded and honest about it, like every other table here. Aggregates by
+    # (rule, subject) with a count, which is what makes the highest-volume TRUE finding
+    # readable: plaintext DNS to one resolver is a single row reading x1432, not 1432 rows
+    # burying everything else.
+    def __init__(self, cap: int = 500) -> None:
+        self.cap = cap
+        self.evicted = 0
+        self._counts: dict[tuple[str, str], int] = {}
+        self._findings: dict[tuple[str, str], Finding] = {}
+
+    def add(self, finding: Finding) -> bool:
+        key = (str(finding.rule), finding.subject)
+        first = key not in self._counts
+        self._counts[key] = self._counts.get(key, 0) + 1
+        self._findings[key] = finding
+        if len(self._counts) > self.cap:
+            # Drop the lowest-severity, least-seen key — never a HIGH while a LOW survives.
+            victim = min(
+                self._counts,
+                key=lambda k: (SEVERITY_RANK[self._findings[k].severity], self._counts[k]),
+            )
+            del self._counts[victim]
+            del self._findings[victim]
+            self.evicted += 1
+        return first
+
+    def top(self, n: int) -> list[tuple[Finding, int]]:
+        rows = [(self._findings[k], c) for k, c in self._counts.items()]
+        rows.sort(key=lambda r: (-SEVERITY_RANK[r[0].severity], -r[1]))
+        return rows[:n]
+
+    def by_severity(self) -> dict[str, int]:
+        out: Counter[str] = Counter()
+        for key, count in self._counts.items():
+            out[str(self._findings[key].severity)] += count
+        return dict(out)
+
+    def summary(self, top: int = 30) -> dict[str, Any]:
+        return {
+            "by_severity": self.by_severity(),
+            "by_rule": dict(
+                Counter(
+                    {
+                        str(rule): sum(
+                            c for k, c in self._counts.items() if self._findings[k].rule == rule
+                        )
+                        for rule in {f.rule for f in self._findings.values()}
+                    }
+                )
+            ),
+            "top": [
+                {
+                    "rule": str(f.rule),
+                    "severity": str(f.severity),
+                    "subject": f.subject,
+                    "count": c,
+                    "leaked": f.leaked,
+                    "to": f.to,
+                    "advice": f.advice,
+                }
+                for f, c in self.top(top)
+            ],
+            "evicted": self.evicted,
+        }
+
+    def __len__(self) -> int:
+        return len(self._counts)
 
 
 # --- Live dashboard (--tui) presentation model -------------------------------
@@ -2020,6 +2351,7 @@ class PacketProcessor:
         counter_cap: int = 50_000,
         flow_cap: int = 200_000,
         discovery_cap: int = 65_536,
+        finding_cap: int = 500,
     ) -> None:
         self.redact_query = redact_query
         self.local_ips = local_ips
@@ -2036,6 +2368,9 @@ class PacketProcessor:
         self.sni_names = BoundedCounter(counter_cap)
         self.remote_hosts = BoundedCounter(counter_cap)
         self.event_counts: Counter[str] = Counter()
+        self.findings = FindingLedger(finding_cap)
+        self.tls_sni_cleartext = 0
+        self.tls_sni_ech = 0
         self.coverage = Coverage()
         self.dns_parse_failures = 0
         self._lo_recent: dict[int, float] = {}
@@ -2052,8 +2387,22 @@ class PacketProcessor:
         return last is not None and t - last < 0.05
 
     def _tally(self, events: list[Event], empty_fate: str) -> list[Event]:
+        # The single walk every emitted event already takes, so findings are tallied
+        # identically under the dashboard, headless, replay and the systemd recorder —
+        # the recorder being the one with no dashboard, and so the one that depends
+        # entirely on the summary. consume(), the writers and KIND_TO_FILE are untouched.
         for event in events:
             self.event_counts[event.kind] += 1
+            if event.kind == "tls_sni":
+                # Counters, not a rule: a cleartext-SNI *rule* would fire on nearly every
+                # flow, and an alert that always fires carries no information. The ratio is
+                # the useful form of the same fact — how much of this run was ECH-protected.
+                if cast(TlsSniEvent, event).ech:
+                    self.tls_sni_ech += 1
+                else:
+                    self.tls_sni_cleartext += 1
+            if (finding := assess(event)) is not None:
+                self.findings.add(finding)
         self.coverage.mark("event" if events else empty_fate)
         return events
 
@@ -2496,6 +2845,12 @@ class PacketProcessor:
             "top_dns_names": dict(self.dns_names.most_common(30)),
             "top_sni_names": dict(self.sni_names.most_common(30)),
             "top_internet_hosts": dict(self.remote_hosts.most_common(30)),
+            # The headless recorder has no dashboard, so this is the only surface its
+            # findings have. An empty block means no known-shape disclosure was recorded —
+            # never that nothing leaked (see the README's "does NOT show you").
+            "findings": self.findings.summary(),
+            "tls_sni_cleartext": self.tls_sni_cleartext,
+            "tls_sni_ech": self.tls_sni_ech,
             "coverage": self._coverage(),
         }
 
@@ -2515,6 +2870,7 @@ class PacketProcessor:
                 "dns_names": self.dns_names.flushed,
                 "sni_names": self.sni_names.flushed,
                 "internet_hosts": self.remote_hosts.flushed,
+                "findings": self.findings.evicted,
                 "tcp_streams": self.reassembler.cleared,
                 "cert_streams": self.certs.cleared,
                 "dns_tcp_streams": self.dns_tcp.cleared,
