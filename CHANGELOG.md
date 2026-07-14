@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The dashboard filters with checkboxes instead of a one-at-a-time cycle.** `f` used to
+  advance a single substring through `all → dns → tls → http → flow`; you could not ask for
+  DNS *and* TLS, you could not ask for "only internet-bound", and four of the twelve recorded
+  kinds — `arp`, `icmp6_ra`, `llmnr`, `nbns` — could not be selected **at all**. `f` now opens
+  a filter bar with a checkbox per kind, direction and scope: OR within a group, AND across
+  them. `a`/`n` tick or clear a group, `esc` closes it. Unticking everything empties the feed
+  and says *"no rows match the filter"* — a different fact from *"no events"*, and not one the
+  tool will quietly reinterpret. Any active filter is named in the feed's border, for the same
+  reason the paused state is: a feed that is hiding events must never read as a quiet network.
+
+  It is an in-place bar rather than a modal because Textual's `App.children` holds only the
+  active screen — with a modal pushed, the 10 Hz render loop could no longer find the feed and
+  would have stalled for the modal's whole life. `escape` is bound on the bar rather than the
+  app, so it closes the filter without also yanking a scrolled-back reader to the newest row.
+
+### Fixed
+
+- **The feed lost keyboard focus to an invisible widget.** Textual's default `AUTO_FOCUS`
+  claims the first focusable widget in the DOM, which became a `SelectionList` inside the
+  (hidden) filter bar — so `escape` opened the filter instead of following the feed, and the
+  arrow keys drove a bar nobody could see. Focus is now stated explicitly rather than left to
+  DOM order. Caught by driving the real app, not by a unit test.
+
 - **One filter, shared by the dashboard and `netmon query`.** There were two, agreeing on
   nothing but `event_host()`: the feed cycled a single lowercase substring, and `query` had
   its own flags and its own predicate. Both are now the same `EventFilter` over three closed

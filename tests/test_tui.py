@@ -10,11 +10,13 @@ from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import Ether
 from structlog.testing import capture_logs
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, SelectionList, Static
 
 import netmon_tui
 from netmon import (
+    DIRECTION_VALUES,
     KIND_VALUES,
+    SCOPE_VALUES,
     CaptureStats,
     DashboardModel,
     DnsQueryEvent,
@@ -25,7 +27,7 @@ from netmon import (
     TlsSniEvent,
     event_to_detail,
 )
-from netmon_tui import NetmonApp, run_dashboard
+from netmon_tui import FilterBar, NetmonApp, run_dashboard
 
 TS = "2025-07-02T23:46:40.123+00:00"
 PKT_TIME = 1751500000.123
@@ -254,7 +256,14 @@ class TestNetmonAppHardening:
             app._render()  # -> INSPECT
             await pilot.pause()
             model.add_event(q("arrived-while-scrolled.example.com"))
-            app.action_cycle_filter()  # -> "dns"; all match, but must use the snapshot
+            # Re-filtering must redraw the frozen SNAPSHOT, not the live tail — every dns
+            # kind still matches here, so a row that appears could only have come from the
+            # tail, which would yank the reader off their scroll position.
+            kinds = app.query_one("#f-kinds", SelectionList)
+            kinds.deselect_all()
+            for k in KIND_VALUES:
+                if k.startswith("dns_"):
+                    kinds.select(k)
             await pilot.pause()
             names = [str(table.get_row_at(i)[3]) for i in range(table.row_count)]
             assert "arrived-while-scrolled.example.com" not in names
@@ -296,21 +305,101 @@ class TestNetmonAppHardening:
             assert app.query_one("#feed", DataTable).row_count == 2
             await app.action_quit()
 
-    async def test_filter_cycles_and_rebuilds_feed(self, tmp_path: Path) -> None:
+    async def test_filter_bar_is_hidden_at_startup_and_passes_everything(
+        self, tmp_path: Path
+    ) -> None:
         model = DashboardModel()
         app = NetmonApp(make_session(tmp_path), model)
         async with app.run_test():
+            assert app.query_one("#filters", FilterBar).display is False
+            assert model.filter.is_unconstrained()
+            await app.action_quit()
+
+    async def test_the_feed_owns_focus_at_startup_not_the_hidden_filter_bar(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: Textual's default AUTO_FOCUS takes the first focusable widget, and the
+        # filter bar's first list now precedes the feed in the DOM. Focus landed on a
+        # SelectionList nobody could see — so `escape` opened the filter instead of following,
+        # and the arrow keys drove the hidden bar rather than the feed.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        async with app.run_test():
+            assert isinstance(app.focused, DataTable)
+            await app.action_quit()
+
+    async def test_f_opens_and_closes_the_bar(self, tmp_path: Path) -> None:
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            bar = app.query_one("#filters", FilterBar)
+            await pilot.press("f")
+            assert bar.display is True
+            assert isinstance(app.focused, SelectionList)
+            # SelectionList binds only `space`, so `f` still reaches the App and closes it.
+            await pilot.press("f")
+            assert bar.display is False
+            await app.action_quit()
+
+    async def test_escape_closes_the_bar_without_snapping_back_to_follow(
+        self, tmp_path: Path
+    ) -> None:
+        # `escape` is already the App's follow key. Binding it on the bar shadows the App's
+        # only while focus is inside the bar — so closing the filter must NOT also yank an
+        # inspecting reader back to the newest row.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test(size=(100, 20)) as pilot:
+            for i in range(40):
+                model.add_event(q(f"h{i}.example.com"))
+            app._render()
+            await pilot.pause()
+            app.query_one("#feed", DataTable).scroll_to(y=10, animate=False)
+            app._render()  # -> INSPECT
+            await pilot.pause()
+            assert app._following is False
+
+            await pilot.press("f")
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.query_one("#filters", FilterBar).display is False
+            assert app._following is False  # the App's escape->follow did NOT fire
+
+            await pilot.press("escape")  # focus is back on the feed: now it follows
+            await pilot.pause()
+            assert app._following is True
+            await app.action_quit()
+
+    async def test_ticking_kinds_rebuilds_the_feed(self, tmp_path: Path) -> None:
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
             model.add_event(q("example.com"))
             model.add_event(sni("github.com"))
             app._render()
-            app.action_cycle_filter()  # all -> the dns kinds
-            assert model.filter.kinds == {k for k in KIND_VALUES if k.startswith("dns_")}
-            assert app.query_one("#feed", DataTable).row_count == 1  # only the dns row
+            kinds = app.query_one("#f-kinds", SelectionList)
+            kinds.deselect_all()
+            kinds.select("dns_query")
+            await pilot.pause()
+            assert model.filter.kinds == {"dns_query"}
+            assert app.query_one("#feed", DataTable).row_count == 1
+            await app.action_quit()
+
+    async def test_dimensions_compose_with_and_semantics(self, tmp_path: Path) -> None:
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            model.add_event(sni("github.com"))  # dst 1.2.3.4 -> internet
+            app._render()
+            scopes = app.query_one("#f-scopes", SelectionList)
+            scopes.deselect_all()
+            scopes.select("lan")  # kind still passes, scope does not
+            await pilot.pause()
+            assert app.query_one("#feed", DataTable).row_count == 0
             await app.action_quit()
 
     async def test_filter_emptying_feed_clears_stale_detail(self, tmp_path: Path) -> None:
-        # A filter that hides every row must not leave the detail pane showing a
-        # now-hidden event.
+        # A filter that hides every row must not leave the detail pane showing a now-hidden
+        # event, and "nothing matched" must not read as "nothing happened".
         model = DashboardModel()
         app = NetmonApp(make_session(tmp_path), model)
         async with app.run_test() as pilot:
@@ -319,10 +408,41 @@ class TestNetmonAppHardening:
             app.query_one("#feed", DataTable).move_cursor(row=0)
             await pilot.pause()
             assert "github.com" in str(app.query_one("#detail", Static).render())
-            app.action_cycle_filter()  # -> "dns": hides the only (tls_sni) row
+            app.query_one("#f-kinds", SelectionList).deselect_all()  # zero kinds = zero rows
             await pilot.pause()
             assert app.query_one("#feed", DataTable).row_count == 0
-            assert "github.com" not in str(app.query_one("#detail", Static).render())
+            detail = str(app.query_one("#detail", Static).render())
+            assert "github.com" not in detail
+            assert "no rows match the filter" in detail
+            await app.action_quit()
+
+    async def test_lists_offer_exactly_the_closed_vocabularies(self, tmp_path: Path) -> None:
+        # A drift guard, and the proof that no wire-derived text can enter the filter widget.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test():
+            for wid, values in (
+                ("#f-kinds", KIND_VALUES),
+                ("#f-dirs", DIRECTION_VALUES),
+                ("#f-scopes", SCOPE_VALUES),
+            ):
+                lst = app.query_one(wid, SelectionList)
+                assert [s.value for s in lst._options] == list(values)
+            await app.action_quit()
+
+    async def test_a_constrained_filter_is_named_in_the_feed_border(self, tmp_path: Path) -> None:
+        # A feed that is hiding events must never be mistaken for a quiet network.
+        model = DashboardModel()
+        app = NetmonApp(make_session(tmp_path), model)
+        async with app.run_test() as pilot:
+            app._render()
+            assert "filter" not in str(app.query_one("#feed", DataTable).border_title)
+            kinds = app.query_one("#f-kinds", SelectionList)
+            kinds.deselect_all()
+            kinds.select("dns_query")
+            await pilot.pause()
+            app._render()
+            assert "filter: kind 1/12" in str(app.query_one("#feed", DataTable).border_title)
             await app.action_quit()
 
     async def test_follow_clears_pause(self, tmp_path: Path) -> None:

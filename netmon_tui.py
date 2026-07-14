@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import structlog
 from rich.text import Text
@@ -18,12 +18,15 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.widgets import DataTable, Footer, Sparkline, Static
+from textual.widgets import DataTable, Footer, SelectionList, Sparkline, Static
 from textual.widgets.data_table import RowDoesNotExist
+from textual.widgets.selection_list import Selection
 
 from netmon import (
+    DIRECTION_VALUES,
     KIND_STYLE,
     KIND_VALUES,
+    SCOPE_VALUES,
     CopyResult,
     DashboardModel,
     Event,
@@ -45,17 +48,14 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
-# `f` cycles the feed through these filters. Same five choices the substring cycle offered,
-# now expressed as EventFilter values over the closed kind vocabulary — so there is one
-# predicate underneath the feed and `netmon query`, not two that agree by coincidence.
-_DNS_KINDS = frozenset(k for k in KIND_VALUES if k.startswith("dns_"))
-_FILTERS: list[EventFilter] = [
-    EventFilter(),
-    EventFilter(kinds=_DNS_KINDS),
-    EventFilter(kinds=frozenset({"tls_sni"})),
-    EventFilter(kinds=frozenset({"http"})),
-    EventFilter(kinds=frozenset({"flow"})),
-]
+# The filter bar's three groups: (widget id, border title, the closed vocabulary). A test
+# asserts the lists offer exactly these values — which is also what proves no wire text can
+# ever reach the widget.
+_FILTER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("f-kinds", "kind", KIND_VALUES),
+    ("f-dirs", "direction", DIRECTION_VALUES),
+    ("f-scopes", "scope", SCOPE_VALUES),
+)
 
 _COLUMNS = ("TIME", "KIND", "DIR", "HOST / NAME", "DETAIL")
 
@@ -128,11 +128,57 @@ def _styled_cells(event: Event) -> list[Text]:
     ]
 
 
+class FilterBar(Horizontal):
+    # `escape` is bound HERE, not on the App. Textual resolves a key along the focused
+    # widget's ancestors before reaching the App (Screen._binding_chain), so this shadows the
+    # App's escape->follow only while focus is inside the bar, and nowhere else. The App
+    # binding is untouched and still follows the newest row when the bar is closed.
+    #
+    # Deliberately an in-place bar and not a ModalScreen: App.children is only the ACTIVE
+    # screen, so while a modal is pushed `query_one("#feed")` raises NoMatches — the 10 Hz
+    # _render would early-return for the modal's whole life, model._added would pile up
+    # behind it, and the rebuild would raise on close. The bar also changes the feed's
+    # HEIGHT, never its width, so column fitting is untouched.
+    BINDINGS: ClassVar = [
+        Binding("escape", "close_filter", "Close filter"),
+        Binding("a", "select_all", "All"),
+        Binding("n", "select_none", "None"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        for wid, title, values in _FILTER_GROUPS:
+            # Text(), not str: Selection's prompt is ContentText, so a str is parsed for
+            # console markup. These are netmon's own closed vocabularies — no wire text ever
+            # reaches this widget — and passing Text keeps that true by construction rather
+            # than by luck, in the same spirit as _paint's signature.
+            options = [Selection(Text(v), v, initial_state=True) for v in values]
+            lst: SelectionList[str] = SelectionList(*options, id=wid)
+            lst.border_title = title
+            yield lst
+
+    def _focused_list(self) -> SelectionList[str] | None:
+        focused = self.app.focused
+        return focused if isinstance(focused, SelectionList) else None
+
+    def action_select_all(self) -> None:
+        if (lst := self._focused_list()) is not None:
+            lst.select_all()
+
+    def action_select_none(self) -> None:
+        if (lst := self._focused_list()) is not None:
+            lst.deselect_all()
+
+    def action_close_filter(self) -> None:
+        cast("NetmonApp", self.app).action_toggle_filter()
+
+
 class NetmonApp(App[None]):
     CSS = """
     Screen { layout: horizontal; }
     #feed-col { width: 1fr; }
     #side { width: 30; }
+    #filters { display: none; height: auto; max-height: 16; }
+    #filters SelectionList { width: 1fr; border: round $accent; padding: 0 1; }
     #feed { height: 3fr; border: round $primary; }
     #feed.inspecting { border: round $warning; border-title-color: $warning; }
     #feed.paused { border: round $error; border-title-color: $error; }
@@ -141,6 +187,12 @@ class NetmonApp(App[None]):
     #eps { height: 5; border: round $accent; }
     """
 
+    # Name the widget that owns focus instead of letting DOM order decide it. Textual's
+    # default AUTO_FOCUS ("*") takes the first focusable widget, which is now a SelectionList
+    # inside the (hidden) filter bar — so `escape` would have opened the filter instead of
+    # following the feed, and the arrow keys would have driven a bar nobody could see.
+    AUTO_FOCUS = "#feed"
+
     BINDINGS: ClassVar = [
         Binding("q", "quit", "Quit"),
         # Textual clears the terminal ISIG flag, so keyboard Ctrl-C is otherwise a
@@ -148,7 +200,7 @@ class NetmonApp(App[None]):
         # kill -INT/-TERM is a real signal and still stops capture via run().)
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("space", "toggle_pause", "Pause"),
-        Binding("f", "cycle_filter", "Filter"),
+        Binding("f", "toggle_filter", "Filter"),
         Binding("g", "follow", "Follow"),
         Binding("escape", "follow", "Follow", show=False),
         Binding("y", "copy_detail", "Copy"),
@@ -169,7 +221,7 @@ class NetmonApp(App[None]):
         self._following = True  # True while pinned to the top, tracking the newest row
         self._frozen: list[tuple[str, Event]] | None = None  # snapshot shown while paused
         self._detail_event: Event | None = None  # event in the detail pane, for `y` copy
-        self._indicated_mode: str | None = None  # last mode painted onto the feed border
+        self._indicated_state: tuple[str, str] | None = None  # last (mode, filter) painted
 
     def compose(self) -> ComposeResult:
         # markup=False on every panel: this app renders data, never markup. _paint is
@@ -177,6 +229,7 @@ class NetmonApp(App[None]):
         # updated directly would slip past mypy, and this is what catches that.
         with Horizontal():
             with Vertical(id="feed-col"):
+                yield FilterBar(id="filters")
                 yield DataTable(id="feed")
                 yield Static("(select a row)", id="detail", markup=False)
             with Vertical(id="side"):
@@ -301,15 +354,24 @@ class NetmonApp(App[None]):
         return "PAUSED" if self.paused else ("FOLLOW" if self._following else "INSPECT")
 
     def _refresh_mode_indicator(self, mode: str) -> None:
-        # Paint the feed border + title to match the mode; only on a change so the 10 Hz
-        # tick doesn't refresh the border every frame.
-        if mode == self._indicated_mode:
+        # Paint the feed border + title to match the mode and the active filter; only on a
+        # change so the 10 Hz tick doesn't refresh the border every frame. The filter belongs
+        # here for the same reason the mode does: a feed that is hiding events must never be
+        # mistaken for a quiet network.
+        label = self.model.filter.label()
+        state = (mode, label)
+        if state == self._indicated_state:
             return
-        self._indicated_mode = mode
+        self._indicated_state = state
         feed = self.query_one("#feed", DataTable)
         feed.set_class(mode == "PAUSED", "paused")
         feed.set_class(mode == "INSPECT", "inspecting")
-        feed.border_title = _FEED_TITLE[mode]
+        title = _FEED_TITLE[mode]
+        # Text, not str: border_title runs a str through markup parsing, and label() can carry
+        # a host substring the operator typed.
+        feed.border_title = Text(
+            title if self.model.filter.is_unconstrained() else f"{title} · filter: {label}"
+        )
 
     def _render_panels(self) -> None:
         proc = self.session.processor
@@ -364,7 +426,14 @@ class NetmonApp(App[None]):
         # pane rather than let it show a stale event.
         if not self._displayed:
             self._selected_key = None
-            self._set_detail(None, "(no events)")
+            # "nothing matched" and "nothing happened" are different facts, and an operator
+            # who unticked every box must not read the second when the first is true.
+            empty = (
+                "(no events)"
+                if self.model.filter.is_unconstrained()
+                else ("(no rows match the filter)")
+            )
+            self._set_detail(None, empty)
         elif self._selected_key is None:
             pass
         elif self._selected_key in self._displayed:
@@ -403,13 +472,37 @@ class NetmonApp(App[None]):
             self._frozen = None
         self._rebuild_feed()
 
-    def action_cycle_filter(self) -> None:
-        # Re-filters the live tail while following, or the frozen snapshot while paused
-        # or inspecting — so filtering never yanks a reader off their scroll position.
-        self._filter_idx = (self._filter_idx + 1) % len(_FILTERS)
-        self.model.filter = _FILTERS[self._filter_idx]
+    def action_toggle_filter(self) -> None:
+        # `f` opens AND closes: SelectionList binds only `space`, so ordinary letter keys
+        # still reach the App while the bar has focus.
+        bar = self.query_one("#filters", FilterBar)
+        if bar.display:
+            self.query_one("#feed", DataTable).focus()  # focus out before hiding
+            bar.display = False
+        else:
+            bar.display = True
+            self.query_one("#f-kinds", SelectionList).focus()
+
+    def _selected_filter(self) -> EventFilter:
+        def chosen(wid: str) -> frozenset[str]:
+            return frozenset(self.query_one(wid, SelectionList).selected)
+
+        return EventFilter(
+            kinds=chosen("#f-kinds"),
+            directions=chosen("#f-dirs"),
+            scopes=chosen("#f-scopes"),
+            host=self.model.filter.host,
+        )
+
+    def on_selection_list_selected_changed(
+        self, _message: SelectionList.SelectedChanged[str]
+    ) -> None:
+        # One handler for all three lists: the filter is rebuilt from the three selections,
+        # so there is no per-list state to keep in sync. Re-filters the live tail while
+        # following, or the frozen snapshot while paused/inspecting — _rebuild_feed already
+        # draws from _frozen, so filtering never yanks a reader off their scroll position.
+        self.model.filter = self._selected_filter()
         self._rebuild_feed()
-        self.notify(f"filter: {self.model.filter.label()}")
 
     def action_follow(self) -> None:
         self._resume_follow()
