@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **NBNS is no longer mistaken for DNS.** netmon recognises DNS *by shape, on any port* — and
+  NBNS carries the very same 12-byte header, so name-service traffic on udp/137 was decoding
+  as DNS. A real run turned 480 NetBIOS name broadcasts into "cleartext DNS lookups sent to
+  the resolver 192.168.11.255", which is a claim that cannot be true: a subnet broadcast
+  address is not a resolver, and the "name" it reported (`FHEPFCELEHFCEPFFFACACACACACACABO`)
+  was raw first-level NetBIOS encoding for `WORKGROUP<1E>`. The old check looked for scapy's
+  `NBNSQueryRequest`, which only covers opcode 0x0 — refresh and release have no bound layer
+  at all and sailed straight past it. The gate is now the **port**, not a layer that happens
+  to be bound, and the name is decoded from first-level encoding ourselves for the opcodes
+  scapy leaves as raw bytes. An NBNS request we cannot name is now counted under
+  `parse_failed.nbns` rather than vanishing into `no_disclosure`.
+
+- **A finding no longer claims this host said something a neighbour said.** mDNS and NBNS
+  broadcasts from every device on the segment arrive at this NIC whether we asked for them or
+  not, and the LAN-name rules asserted "naming **this host** to the LAN" for all of them —
+  which one run cheerfully did three times over, for three *different* peer names. Client-kind
+  events now record `from_self` (was the source one of our own addresses?) and findings name
+  the actual discloser. Runs recorded before the field existed still audit correctly: they
+  cannot prove the packet was ours, so they no longer say it was.
+
+- **One cleartext HTTP connection, one finding.** A plaintext request was rated twice — once
+  as `cleartext-http` from the request itself, once as `plaintext-service` from its flow.
+  The flow is now rated only when netmon *could not* have seen the request: a connection
+  joined **mid-stream** has no request line left to read, so there the flow is the only
+  witness that a cleartext channel is open, and staying silent to avoid the double-count
+  would have hidden it entirely.
+
+- **NTP advice names NTS, not a port that does not exist.** Every non-STARTTLS service was
+  told to "prefer its TLS port". NTP has none. It now points at NTS (RFC 8915) and says which
+  daemons implement it; ftp and telnet get their own answers (sftp/ftps, ssh) instead of the
+  generic one.
+
 ### Added
 
 - **`audit` and `query` default to the newest run.** Both used to demand a run directory, so

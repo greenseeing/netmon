@@ -58,7 +58,7 @@ from scapy.layers.inet6 import (
 )
 from scapy.layers.l2 import ARP
 from scapy.layers.llmnr import LLMNRQuery
-from scapy.layers.netbios import NBNSQueryRequest
+from scapy.layers.netbios import NBNSHeader
 from scapy.packet import Packet, Padding, Raw
 from scapy.sendrecv import AsyncSniffer
 from scapy.utils import PcapReader, PcapWriter
@@ -202,6 +202,14 @@ class Event(BaseModel):
     kind: str
 
 
+# Did THIS host send it, or did we merely overhear it? Multicast and subnet-broadcast
+# frames from every device on the segment arrive at this NIC whether we asked for them or
+# not, so a name broadcast naming a PEER is not this host disclosing anything. Recorded on
+# the event, not derived at audit time, because the record is the evidence and the set of
+# our own addresses is not in it.
+FromSelf = Annotated[bool, Field(description="the capturing host sent this packet")]
+
+
 class DnsQueryEvent(Event):
     kind: Literal["dns_query"] = "dns_query"
     src: str
@@ -209,6 +217,7 @@ class DnsQueryEvent(Event):
     transport: str
     qname: str
     qtype: str
+    from_self: FromSelf = False
 
 
 class DnsAnswerEvent(Event):
@@ -340,6 +349,7 @@ class LlmnrEvent(Event):
     dst: str
     qname: str
     qtype: str
+    from_self: FromSelf = False
 
 
 class NbnsEvent(Event):
@@ -347,6 +357,7 @@ class NbnsEvent(Event):
     src: str
     dst: str
     qname: str
+    from_self: FromSelf = False
 
 
 # Parse a recorded JSONL line back into its concrete Event subclass, keyed on the
@@ -606,7 +617,7 @@ class Finding(NamedTuple):
 #
 # `dns` is deliberately absent: the DnsQueryEvent is the authority for that disclosure, and
 # listing it here too would count every plaintext lookup twice, once as a flow and once as a
-# query.
+# query. `http` cannot take that shortcut -- see _HTTP_SERVICES.
 SERVICE_LEAK: dict[str, Severity] = {
     "ftp": Severity.HIGH,
     "telnet": Severity.HIGH,
@@ -619,11 +630,37 @@ SERVICE_LEAK: dict[str, Severity] = {
     "http-alt": Severity.LOW,
 }
 
+# HTTP is the one service with TWO possible witnesses, so it is the one service where "which
+# event is the authority" depends on what we saw. A connection watched from its SYN yields an
+# HttpEvent, and rating the flow as well reported every request twice. A connection joined
+# MID-STREAM never yields one -- the request line crossed the wire before we were looking --
+# and there the flow is the only evidence a cleartext channel is open at all. Dropping it to
+# kill the double-count would make an ongoing plaintext connection invisible, which is the
+# opposite of the job.
+_HTTP_SERVICES = frozenset({"http", "http-alt"})
+
 _STARTTLS_ADVICE = (
     "this port carries auth in cleartext unless the client upgrades with STARTTLS, and "
     "netmon cannot see whether it did — re-run with --pcap and open the flow in tshark to "
     "settle it"
 )
+
+_DEFAULT_PLAINTEXT_ADVICE = "this service carries its content in the clear — prefer its TLS port"
+
+# Advice the operator can actually act on, per service. The fallback names a TLS port, which
+# is right for most cleartext services and WRONG for NTP -- there is no such port to prefer;
+# NTS (RFC 8915) is the answer, and telling someone to dial a port that does not exist is
+# worse than saying nothing. A key here must be a key in SERVICE_LEAK; a test pins that.
+SERVICE_ADVICE: dict[str, str] = {
+    "ftp": "FTP puts credentials and every file on the wire by design — use sftp/scp, or ftps",
+    "telnet": "telnet is a cleartext shell, credentials included — use ssh",
+    "ntp": "NTP has no TLS port to prefer: NTS (RFC 8915) is what authenticates it — chrony "
+    "and ntpsec support it, systemd-timesyncd does not",
+    "smtp": _STARTTLS_ADVICE,
+    "smtp-submission": _STARTTLS_ADVICE,
+    "imap": _STARTTLS_ADVICE,
+    "pop3": _STARTTLS_ADVICE,
+}
 
 # A name that was only ever meant for your own network. Leaking one to a public resolver
 # hands over your internal topology — hostnames, naming scheme, sometimes the org chart.
@@ -689,6 +726,13 @@ def _ecs_prefix_len(client_subnet: str) -> int:
         return 0
 
 
+def _discloser(from_self: bool, src: str) -> str:
+    # Who actually disclosed this. Naming the source address when it was not us is the
+    # whole point: a run that says "naming this host to the LAN" three times over three
+    # DIFFERENT peer names is telling the operator something that cannot be true.
+    return "this host" if from_self else src
+
+
 def assess(event: Event) -> Finding | None:
     # The fourth projection, beside event_direction / event_host / event_detail — same
     # dispatch on .kind, never isinstance, for the same reason (see event_remote_addr).
@@ -727,6 +771,7 @@ def assess(event: Event) -> Finding | None:
 
         case "dns_query":
             query = cast(DnsQueryEvent, event)
+            discloser = _discloser(query.from_self, query.src)
             if scope == "multicast":
                 return Finding(
                     rule=Rule.MDNS_BROADCAST,
@@ -734,7 +779,7 @@ def assess(event: Event) -> Finding | None:
                     subject=query.src,
                     leaked=f"a multicast lookup for {query.qname}",
                     to="every device on the local network",
-                    advice="normal for service discovery; it tells your LAN what this device "
+                    advice=f"normal for service discovery; it tells your LAN what {discloser} "
                     "is looking for",
                 )
             if scope in _OFF_NET and _is_internal_name(query.qname):
@@ -754,28 +799,32 @@ def assess(event: Event) -> Finding | None:
                 # The RESOLVER, not the name: one busy resolver is then one row with a count,
                 # instead of a thousand rows that bury every other finding.
                 subject=query.dst,
-                leaked=f"every name this host looks up, in cleartext (e.g. {query.qname})",
+                leaked=f"every name {discloser} looks up, in cleartext (e.g. {query.qname})",
                 to=f"the resolver {query.dst} and every hop to it ({scope})",
                 advice="use encrypted DNS (DoH/DoT) so the names are not readable on the path",
             )
 
         case "llmnr" | "nbns":
-            name = cast(LlmnrEvent, event).qname
+            # NbnsEvent carries no qtype, but every field read here is common to both.
+            broadcast = cast(LlmnrEvent, event)
+            name = broadcast.qname
+            discloser = _discloser(broadcast.from_self, broadcast.src)
             if name.casefold().startswith("wpad"):
                 return Finding(
                     rule=Rule.WPAD_BROADCAST,
                     severity=Severity.HIGH,
                     subject=name,
-                    leaked="a broadcast asking the LAN who serves this host's proxy config",
+                    leaked=f"a broadcast asking the LAN who serves the proxy config for "
+                    f"{discloser}",
                     to="every device on the local network",
-                    advice="any device that answers becomes this host's web proxy — disable "
-                    "WPAD, and disable LLMNR/NBNS",
+                    advice=f"any device that answers becomes the web proxy for {discloser} — "
+                    "disable WPAD, and disable LLMNR/NBNS",
                 )
             return Finding(
                 rule=Rule.LAN_NAME_BROADCAST,
                 severity=Severity.MEDIUM,
                 subject=name,
-                leaked=f"a legacy name broadcast for {name}, naming this host to the LAN",
+                leaked=f"a legacy name broadcast for {name}, naming {discloser} to the LAN",
                 to="every device on the local network",
                 advice="LLMNR/NBNS are spoofable and answer to anyone — disable them if you "
                 "do not need them",
@@ -801,10 +850,11 @@ def assess(event: Event) -> Finding | None:
             severity = SERVICE_LEAK.get(flow.service, Severity.LOW)
             if flow.service not in SERVICE_LEAK:
                 return None
+            if flow.service in _HTTP_SERVICES and flow.birth != "pre-existing":
+                return None  # its HttpEvent said it already
             if scope not in _OFF_NET:
                 severity = _DEMOTE[severity]
             where = flow.hostname or flow.remote_ip
-            starttls = flow.service in ("smtp", "smtp-submission", "imap", "pop3")
             return Finding(
                 rule=Rule.PLAINTEXT_SERVICE,
                 severity=severity,
@@ -813,9 +863,7 @@ def assess(event: Event) -> Finding | None:
                     flow.service, f"a cleartext-capable {flow.service} channel was opened"
                 ),
                 to=f"{where}:{flow.remote_port} ({scope})",
-                advice=_STARTTLS_ADVICE
-                if starttls
-                else "this service carries its content in the clear — prefer its TLS port",
+                advice=SERVICE_ADVICE.get(flow.service, _DEFAULT_PLAINTEXT_ADVICE),
             )
 
     return None
@@ -1909,6 +1957,46 @@ def decode_nbns_name(value: Any) -> str:
     return str(value).strip().rstrip("\x00").strip()
 
 
+# NetBIOS name service (137) and datagram service (138). Only 137 carries the DNS-shaped
+# header that fools the shape gate; 138 is a different layout entirely and could never be
+# mistaken for DNS. Both are listed anyway so that ALL NetBIOS traffic leaves by one door
+# rather than two — see _process.
+NETBIOS_PORTS = frozenset({137, 138})
+
+_NBNS_L1_LEN = 32  # 16 name bytes, one nibble per character
+_NBNS_L1_BASE = 0x41  # each nibble is offset by 'A'
+
+
+def decode_nbns_level1(raw: bytes) -> str:
+    # NBNS puts the name on the wire in FIRST-LEVEL ENCODING: a 0x20 length byte, then
+    # 32 characters that are the 16 name bytes split into nibbles and offset by 'A' --
+    # which is why an undecoded one reads as FHEPFCELEHFCEPFFFACACACACACACABO. scapy
+    # unpacks this only for the opcodes it binds a layer to (query 0x0, registration
+    # 0x5); refresh and release are bound to nothing, so decode those ourselves rather
+    # than let a Raw payload fall through to a parser that will call it DNS.
+    if len(raw) < _NBNS_L1_LEN + 1 or raw[0] != 0x20:
+        return ""
+    decoded = bytearray()
+    encoded = raw[1 : _NBNS_L1_LEN + 1]
+    for high, low in zip(encoded[0::2], encoded[1::2], strict=True):
+        if not (_NBNS_L1_BASE <= high <= 0x50 and _NBNS_L1_BASE <= low <= 0x50):
+            return ""
+        decoded.append(((high - _NBNS_L1_BASE) << 4) | (low - _NBNS_L1_BASE))
+    # The 16th byte is the suffix (0x1E = browser election, 0x00 = workstation): it
+    # types the name, it is not part of it.
+    return decoded[:15].decode("ascii", "replace").strip()
+
+
+def nbns_query_name(header: Any) -> str:
+    # The name a request announces, whichever opcode carried it. A bound layer hands us
+    # QUESTION_NAME already unpacked; an unbound one leaves a Raw payload to decode.
+    body = header.payload
+    name = getattr(body, "QUESTION_NAME", None)
+    if name is not None:
+        return decode_nbns_name(name)
+    return decode_nbns_level1(bytes(body))
+
+
 DNS_TYPE_SOA = 6
 
 
@@ -2477,6 +2565,7 @@ class PacketProcessor:
         self.tls_sni_ech = 0
         self.coverage = Coverage()
         self.dns_parse_failures = 0
+        self.nbns_parse_failures = 0
         self._lo_recent: dict[int, float] = {}
 
     def _is_loopback_duplicate(self, pkt: Packet, t: float) -> bool:
@@ -2630,8 +2719,14 @@ class PacketProcessor:
                 datagram = bytes(udp.payload)
                 if pkt.haslayer(LLMNRQuery):
                     events.extend(self._llmnr_events(ts, net, pkt[LLMNRQuery]))
-                elif pkt.haslayer(NBNSQueryRequest):
-                    events.extend(self._nbns_events(ts, net, pkt[NBNSQueryRequest]))
+                elif udp.sport in NETBIOS_PORTS or udp.dport in NETBIOS_PORTS:
+                    # Gate on the PORT, not on a layer scapy happened to bind. NBNS shares
+                    # DNS's 12-byte header, so anything here that reaches parse_dns_message
+                    # comes back out as a "DNS lookup" whose resolver is the subnet
+                    # broadcast address -- a resolver that cannot exist. Only opcodes 0x0
+                    # and 0x5 have bound layers; refresh and release have none, and a
+                    # haslayer() check silently missed exactly those.
+                    events.extend(self._nbns_events(ts, net, pkt))
                 else:
                     # Recognise DNS by shape on every port, never by scapy's port
                     # binding alone: 53/5353 attract non-DNS noise (BitTorrent DHT,
@@ -2698,6 +2793,7 @@ class PacketProcessor:
                         transport=transport,
                         qname=qname,
                         qtype=dnsqtypes.get(q.qtype, str(q.qtype)),
+                        from_self=self._sent_by_us(net.src),
                     )
                 )
         else:
@@ -2828,6 +2924,14 @@ class PacketProcessor:
             self.names.observe_if_absent(addr, RA_RDNSS_NAME)
         return [Icmp6RaEvent(ts=ts, router=router, prefixes=prefixes, rdnss=rdnss)]
 
+    def _sent_by_us(self, ip: str) -> bool:
+        # Strictly one of THIS host's addresses -- deliberately not _endpoint_is_local,
+        # which also calls any private address local. A broadcast or multicast frame from
+        # every device on the segment reaches this NIC, so "on my LAN" and "mine" are
+        # different questions, and a finding may only claim the disclosure as ours when
+        # the answer is the second one.
+        return ip in self.local_ips
+
     def _llmnr_events(self, ts: str, net: Any, llmnr: Any) -> list[Event]:
         if int(llmnr.qr) != 0:
             return []
@@ -2837,14 +2941,42 @@ class PacketProcessor:
             qtype = dnsqtypes.get(q.qtype, str(q.qtype))
             if not self.name_query_seen.add(("llmnr", net.src, qname, qtype)):
                 continue
-            events.append(LlmnrEvent(ts=ts, src=net.src, dst=net.dst, qname=qname, qtype=qtype))
+            events.append(
+                LlmnrEvent(
+                    ts=ts,
+                    src=net.src,
+                    dst=net.dst,
+                    qname=qname,
+                    qtype=qtype,
+                    from_self=self._sent_by_us(net.src),
+                )
+            )
         return events
 
-    def _nbns_events(self, ts: str, net: Any, nbns: Any) -> list[Event]:
-        qname = decode_nbns_name(nbns.QUESTION_NAME)
+    def _nbns_events(self, ts: str, net: Any, pkt: Any) -> list[Event]:
+        header = pkt.getlayer(NBNSHeader)
+        if header is None or int(header.RESPONSE) != 0:
+            # A response answers somebody else's question; only a request announces a name.
+            # The datagram service (138) carries no NBNSHeader at all and lands here too.
+            return []
+        qname = nbns_query_name(header)
+        if not qname:
+            # A request we could not name is a disclosure we failed to read, not one that did
+            # not happen. Count it where the DNS side counts its own, rather than let it fall
+            # into no_disclosure and read as a quiet network.
+            self.nbns_parse_failures += 1
+            return []
         if not self.name_query_seen.add(("nbns", net.src, qname)):
             return []
-        return [NbnsEvent(ts=ts, src=net.src, dst=net.dst, qname=qname)]
+        return [
+            NbnsEvent(
+                ts=ts,
+                src=net.src,
+                dst=net.dst,
+                qname=qname,
+                from_self=self._sent_by_us(net.src),
+            )
+        ]
 
     def refresh_local_ips(self, ips: frozenset[str]) -> None:
         # Address rotation (RFC 4941 privacy addresses, a DHCP renewal) adds own
@@ -2983,6 +3115,7 @@ class PacketProcessor:
             "parse_failed": {
                 "quic_initial": self.quic.decrypt_failures,
                 "dns": self.dns_parse_failures,
+                "nbns": self.nbns_parse_failures,
                 "packet": self.coverage.fate["parse_error"],
             },
         }

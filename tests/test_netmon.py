@@ -46,8 +46,8 @@ from scapy.layers.inet6 import (
 )
 from scapy.layers.l2 import ARP, CookedLinux, Ether
 from scapy.layers.llmnr import LLMNRQuery
-from scapy.layers.netbios import NBNSHeader, NBNSQueryRequest
-from scapy.packet import Packet
+from scapy.layers.netbios import NBNSHeader, NBNSQueryRequest, NBNSRegistrationRequest
+from scapy.packet import Packet, Raw
 from scapy.utils import rdpcap, wrpcap
 
 from netmon import (
@@ -62,6 +62,7 @@ from netmon import (
     QUIC_V2,
     RA_RDNSS_NAME,
     SCOPE_VALUES,
+    SERVICE_ADVICE,
     SERVICE_BY_PORT,
     SERVICE_LEAK,
     SERVICE_NOTES,
@@ -69,6 +70,7 @@ from netmon import (
     SEVERITY_RANK,
     SEVERITY_STYLE,
     ArpEvent,
+    Birth,
     BoundedCounter,
     CaptureStats,
     DashboardModel,
@@ -4138,6 +4140,50 @@ def nbns_query(
     return reparsed
 
 
+def nbns_level1(name: str, suffix: int) -> bytes:
+    # NetBIOS first-level encoding: pad to 15 chars + a 1-byte suffix, then split every
+    # byte into two nibbles and add 'A'. This is what makes an NBNS name look like
+    # FHEPFCELEHFCEPFFFACACACACACACABO on the wire.
+    padded = name.ljust(15)[:15].encode("ascii") + bytes([suffix])
+    encoded = bytearray()
+    for byte in padded:
+        encoded.append(0x41 + (byte >> 4))
+        encoded.append(0x41 + (byte & 0x0F))
+    return bytes([0x20]) + bytes(encoded) + b"\x00"
+
+
+def nbns_refresh(
+    name: str = "WORKGROUP",
+    suffix: int = 0x1E,
+    src: str = "192.168.11.22",
+    dst: str = "192.168.11.255",
+    opcode: int = 0x8,
+) -> Packet:
+    # Refresh (0x8) and release (0x6) have no bound layer in scapy at all, so the payload
+    # decodes as Raw — the exact reason a QueryRequest-only check missed them.
+    body = nbns_level1(name, suffix) + b"\x00\x20\x00\x01"
+    header = bytes(NBNSHeader(NAME_TRN_ID=0x8001, OPCODE=opcode, NM_FLAGS=0x11, QDCOUNT=1))
+    pkt = Ether() / IP(src=src, dst=dst) / UDP(sport=137, dport=137) / Raw(header + body)
+    reparsed = Ether(bytes(pkt))
+    reparsed.time = PKT_TIME
+    return reparsed
+
+
+def nbns_registration(
+    name: str = "MX", src: str = "192.168.11.22", dst: str = "192.168.11.255"
+) -> Packet:
+    pkt = (
+        Ether()
+        / IP(src=src, dst=dst)
+        / UDP(sport=137, dport=137)
+        / NBNSHeader(OPCODE=0x5, NM_FLAGS=0x11, QDCOUNT=1, ARCOUNT=1)
+        / NBNSRegistrationRequest(QUESTION_NAME=name)
+    )
+    reparsed = Ether(bytes(pkt))
+    reparsed.time = PKT_TIME
+    return reparsed
+
+
 class TestLlmnrNbns:
     def test_llmnr_query_emits_event_with_name(self) -> None:
         proc = local_processor("192.168.1.50")
@@ -5066,13 +5112,13 @@ def http_to(dst: str, method: str = "GET", host: str | None = None, **kw: Any) -
     )
 
 
-def flow_to(service: str, remote_ip: str, port: int = 25) -> FlowEvent:
+def flow_to(service: str, remote_ip: str, port: int = 25, birth: Birth = "observed") -> FlowEvent:
     return FlowEvent(
         ts=TS,
         proto="tcp",
         direction="outbound",
         scope=remote_scope(remote_ip),
-        birth="observed",
+        birth=birth,
         local_ip="192.168.1.50",
         local_port=50000,
         remote_ip=remote_ip,
@@ -5080,6 +5126,155 @@ def flow_to(service: str, remote_ip: str, port: int = 25) -> FlowEvent:
         service=service,
         note=SERVICE_NOTES.get(service),
     )
+
+
+class TestNbnsIsNeverMistakenForDns:
+    # NBNS shares DNS's 12-byte header, so a shape-gated DNS parser will happily decode it.
+    # A real capture turned 480 name-refresh broadcasts into "cleartext DNS lookups sent to
+    # the resolver 192.168.11.255" — a subnet broadcast is never a resolver, and the "name"
+    # was raw level-1 NetBIOS encoding. Only opcode 0x0 and 0x5 are bound layers in scapy;
+    # refresh/release are not, which is why checking for NBNSQueryRequest alone missed them.
+
+    def test_a_name_refresh_broadcast_is_a_name_broadcast_not_a_dns_lookup(self) -> None:
+        proc = local_processor("192.168.11.22")
+        events = proc.process(nbns_refresh("WORKGROUP", suffix=0x1E))
+        assert not [e for e in events if isinstance(e, DnsQueryEvent)]
+        nbns = [e for e in events if isinstance(e, NbnsEvent)]
+        assert len(nbns) == 1
+        assert nbns[0].qname == "WORKGROUP"
+
+    def test_a_name_registration_is_a_name_broadcast_not_a_dns_lookup(self) -> None:
+        proc = local_processor("192.168.11.22")
+        events = proc.process(nbns_registration("MX"))
+        assert not [e for e in events if isinstance(e, DnsQueryEvent)]
+        nbns = [e for e in events if isinstance(e, NbnsEvent)]
+        assert len(nbns) == 1 and nbns[0].qname == "MX"
+
+    def test_the_refresh_rates_as_a_lan_name_broadcast(self) -> None:
+        proc = local_processor("192.168.11.22")
+        nbns = [
+            e for e in proc.process(nbns_refresh("WORKGROUP", 0x1E)) if isinstance(e, NbnsEvent)
+        ]
+        f = assess(nbns[0])
+        assert f is not None and f.rule is Rule.LAN_NAME_BROADCAST
+        assert f.subject == "WORKGROUP"
+
+    def test_no_udp_137_datagram_ever_becomes_a_dns_query(self) -> None:
+        # The gate is the port, not the opcode: an opcode netmon has never heard of must
+        # still never reach the DNS parser.
+        proc = local_processor("192.168.11.22")
+        for opcode in (0x0, 0x5, 0x6, 0x8, 0x9, 0xF):
+            events = proc.process(nbns_refresh("WORKGROUP", 0x1E, opcode=opcode))
+            assert not [e for e in events if isinstance(e, DnsQueryEvent)], opcode
+
+    def test_a_plain_nbns_query_still_works(self) -> None:
+        proc = local_processor("192.168.1.50")
+        nbns = [e for e in proc.process(nbns_query("WORKGROUP")) if isinstance(e, NbnsEvent)]
+        assert len(nbns) == 1 and nbns[0].qname == "WORKGROUP"
+
+    def test_an_unreadable_name_is_counted_not_swallowed(self) -> None:
+        # A request we cannot name is a disclosure we failed to read, not one that did not
+        # happen — the whole bug being fixed here was traffic quietly landing in the wrong
+        # bucket, so it must not quietly land in no_disclosure either.
+        proc = local_processor("192.168.11.22")
+        header = bytes(NBNSHeader(OPCODE=0x8, NM_FLAGS=0x11, QDCOUNT=1))
+        pkt = (
+            Ether()
+            / IP(src="192.168.11.22", dst="192.168.11.255")
+            / UDP(sport=137, dport=137)
+            / Raw(header + b"\x20" + b"!" * 32 + b"\x00")  # not level-1 encoding
+        )
+        pkt = Ether(bytes(pkt))
+        pkt.time = PKT_TIME
+        events = proc.process(pkt)
+        assert not [e for e in events if isinstance(e, (NbnsEvent, DnsQueryEvent))]
+        assert proc.nbns_parse_failures == 1
+
+
+class TestMidStreamHttpStaysVisible:
+    def test_a_port_80_connection_joined_mid_stream_still_yields_a_finding(self) -> None:
+        # No SYN, no request line — netmon started listening after this connection opened,
+        # so no HttpEvent can ever exist for it. The flow is the only witness.
+        proc = local_processor("192.168.1.50")
+        pkt = (
+            Ether()
+            / IP(src="192.168.1.50", dst="93.184.216.34")
+            / TCP(sport=51000, dport=80, flags="A", seq=5000)
+            / Raw(b"continued body bytes, not a request line")
+        )
+        pkt.time = PKT_TIME
+        flows = [e for e in proc.process(pkt) if isinstance(e, FlowEvent)]
+        assert len(flows) == 1 and flows[0].birth == "pre-existing"
+        f = assess(flows[0])
+        assert f is not None and f.rule is Rule.PLAINTEXT_SERVICE
+
+
+class TestOverheardTrafficIsNotAttributedToThisHost:
+    # mDNS and NBNS broadcasts from every device on the switch reach this NIC. Claiming
+    # they name THIS host is a falsehood the operator can check — the real capture asserted
+    # "naming this host" for three peers (oo-01, oplx-1, oplx-2) at once.
+
+    def test_a_broadcast_this_host_sent_is_marked_as_its_own(self) -> None:
+        proc = local_processor("192.168.11.22")
+        nbns = [
+            e
+            for e in proc.process(nbns_refresh("MX", 0x00, src="192.168.11.22"))
+            if isinstance(e, NbnsEvent)
+        ]
+        assert nbns[0].from_self is True
+
+    def test_a_peers_broadcast_is_not_marked_as_this_hosts(self) -> None:
+        proc = local_processor("192.168.11.22")
+        nbns = [
+            e
+            for e in proc.process(nbns_refresh("OPLX-1", 0x00, src="192.168.11.31"))
+            if isinstance(e, NbnsEvent)
+        ]
+        assert nbns[0].from_self is False
+
+    def test_this_hosts_own_name_broadcast_still_says_this_host(self) -> None:
+        e = NbnsEvent(ts=TS, src="192.168.11.22", dst="192.168.11.255", qname="MX", from_self=True)
+        f = assess(e)
+        assert f is not None and "this host" in f.leaked
+
+    def test_a_peers_name_broadcast_names_the_peer_not_this_host(self) -> None:
+        e = NbnsEvent(
+            ts=TS, src="192.168.11.31", dst="192.168.11.255", qname="OPLX-1", from_self=False
+        )
+        f = assess(e)
+        assert f is not None
+        assert "this host" not in f.leaked
+        assert "192.168.11.31" in f.leaked
+
+    def test_a_record_written_before_from_self_existed_still_parses(self) -> None:
+        # `netmon audit` re-reads runs captured before this field existed. Such a record
+        # cannot prove the packet was ours, so the finding must not say it was.
+        old = {
+            "ts": TS,
+            "kind": "nbns",
+            "src": "192.168.11.31",
+            "dst": "192.168.11.255",
+            "qname": "OPLX-1",
+        }
+        f = assess(EVENT_ADAPTER.validate_python(old))
+        assert f is not None
+        assert "this host" not in f.leaked
+        assert "192.168.11.31" in f.leaked
+
+    def test_a_peers_cleartext_dns_is_not_this_hosts_lookups(self) -> None:
+        e = DnsQueryEvent(
+            ts=TS,
+            src="192.168.11.31",
+            dst="192.168.11.1",
+            transport="udp",
+            qname="example.com",
+            qtype="A",
+            from_self=False,
+        )
+        f = assess(e)
+        assert f is not None and f.rule is Rule.CLEARTEXT_DNS
+        assert "this host" not in f.leaked
+        assert "192.168.11.31" in f.leaked
 
 
 class TestLeakRules:
@@ -5196,6 +5391,38 @@ class TestLeakRules:
         f = assess(flow_to("ftp", "192.168.1.9", port=21))
         assert f is not None and f.severity == Severity.MEDIUM  # HIGH demoted; never left home
 
+    def test_an_http_connection_is_counted_once_not_twice(self) -> None:
+        # The HttpEvent is the authority for a cleartext HTTP disclosure, exactly as the
+        # DnsQueryEvent is for a lookup. Rating the port-80 flow TOO reported every request
+        # twice — once as cleartext-http, once as plaintext-service.
+        assert assess(flow_to("http", "93.184.216.34", port=80)) is None
+        assert assess(flow_to("http-alt", "93.184.216.34", port=8080)) is None
+
+    def test_an_http_connection_joined_mid_stream_is_still_reported(self) -> None:
+        # ...but only because we WATCHED it open. Join mid-stream and the request line is
+        # already gone, so no HttpEvent can ever exist for it. Staying silent here to avoid
+        # a double-count would hide an ongoing cleartext connection completely — the flow is
+        # the only witness left.
+        f = assess(flow_to("http", "93.184.216.34", port=80, birth="pre-existing"))
+        assert f is not None
+        assert (f.rule, f.severity) == (Rule.PLAINTEXT_SERVICE, Severity.LOW)
+
+    def test_the_http_disclosure_itself_is_still_rated(self) -> None:
+        f = assess(http_to("93.184.216.34", method="POST", host="neverssl.com"))
+        assert f is not None and f.rule is Rule.CLEARTEXT_HTTP
+
+    def test_ntp_advice_points_at_nts_not_a_tls_port_that_does_not_exist(self) -> None:
+        # NTP has no TLS port. The answer is NTS (RFC 8915) — advice naming a port that
+        # cannot be dialled is advice the operator cannot act on.
+        f = assess(flow_to("ntp", "129.150.55.241", port=123))
+        assert f is not None and f.severity == Severity.LOW
+        assert "prefer its TLS port" not in f.advice  # the port it would name does not exist
+        assert "NTS" in f.advice and "RFC 8915" in f.advice
+
+    def test_telnet_advice_names_ssh(self) -> None:
+        f = assess(flow_to("telnet", "93.184.216.34", port=23))
+        assert f is not None and "ssh" in f.advice.lower()
+
 
 class TestFindingRuleCoverage:
     def test_every_rule_is_reachable_from_assess(self) -> None:
@@ -5218,6 +5445,7 @@ class TestFindingRuleCoverage:
     def test_service_tables_do_not_drift(self) -> None:
         assert set(SERVICE_LEAK) <= set(SERVICE_BY_PORT.values()), "a severity for no known port"
         assert set(SERVICE_NOTES) <= set(SERVICE_LEAK), "a noted service with no severity"
+        assert set(SERVICE_ADVICE) <= set(SERVICE_LEAK), "advice for a service never rated"
 
     def test_severity_rank_covers_every_severity(self) -> None:
         assert set(SEVERITY_RANK) == set(Severity)
