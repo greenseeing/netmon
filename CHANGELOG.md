@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`netmon update` no longer demands uv.** It refused to run unless both `git` and
+  `uv` were on PATH, so a pip-built install would have been stranded forever on the
+  version it was installed at — which is why this lands before the installer grows a pip
+  path, not after. The builder is now read off the venv itself rather than a marker file
+  that would need keeping honest: `uv sync` never seeds pip into the venv it creates, so
+  a `pip` in `.venv/bin` is an authoritative "the pip path built this". Using the *same*
+  builder matters beyond tidiness — re-syncing a pip-built venv with uv would rebuild it
+  around a different interpreter and silently drop the `cap_net_raw` grant on the current
+  one, turning passwordless capture off with nothing said. The update plan is resolved
+  *before* the pull, so an install with no usable builder fails while it is still
+  consistent instead of being left pulled-but-unbuilt; the editable reinstall now runs
+  only when `pyproject.toml` actually moved, since otherwise every no-op update would
+  reach out to PyPI for the build backend — a real regression against `uv sync`'s no-op.
+  A diff that cannot be computed reinstalls anyway: a skipped rebuild is a silently stale
+  entry point, a redundant one merely costs time.
+
 - **netmon can be installed with nothing but Python and pip.** The install path
   required uv, and got it by piping `astral.sh/uv/install.sh` into `sh` as root — a
   step install.sh's own header calls an unchecksummed trust boundary. A user running

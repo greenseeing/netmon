@@ -3164,13 +3164,66 @@ def _install_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+class SyncPlan(NamedTuple):
+    # How this install rebuilds itself. `uv sync` installs the project along with its
+    # dependencies, so it needs no second step; the pip path installs the two separately.
+    builder: str
+    deps: list[str]
+    project: list[str] | None
+
+
+def _sync_plan(dir_: Path) -> SyncPlan | None:
+    # Which builder made this install — read off the venv itself, not a marker file we would
+    # then have to keep honest: `uv sync` does not seed pip into the venv it creates, so a pip
+    # in there means the pip/requirements.txt path built this. Updating with the *other*
+    # builder would rebuild the venv around a different interpreter and silently drop the
+    # cap_net_raw grant sitting on the current one — passwordless capture would simply stop,
+    # with nothing said.
+    venv = dir_ / ".venv"
+    if (venv / "bin" / "pip").exists():
+        pip = [str(venv / "bin" / "python3"), "-m", "pip", "install", "--disable-pip-version-check"]
+        return SyncPlan(
+            builder="pip",
+            deps=[*pip, "--require-hashes", "-r", str(dir_ / "requirements.txt")],
+            project=[*pip, "--no-deps", "-e", str(dir_)],
+        )
+    uv = shutil.which("uv")
+    if uv:
+        return SyncPlan(builder="uv", deps=[uv, "sync", "--extra", "tui", "--no-dev"], project=None)
+    return None
+
+
+def _pyproject_moved(
+    git_: Callable[..., subprocess.CompletedProcess[str]], old: str, new: str
+) -> bool:
+    # Reinstalling the project on every update would reach out to PyPI for the build backend
+    # even when nothing changed — a real regression against `uv sync`, which does nothing when
+    # nothing moved. Only pyproject can change the *installed* metadata (entry points, deps);
+    # the code itself is editable, so the pull alone is enough. A diff we cannot compute means
+    # reinstall: a skipped rebuild is a silently stale entry point, a redundant one costs time.
+    if old == new:
+        return False
+    diff = git_("diff", "--name-only", f"{old}..{new}")
+    return diff.returncode != 0 or "pyproject.toml" in diff.stdout.split()
+
+
 def cmd_update(argv: list[str]) -> int:
-    # git pull + uv sync against this checkout. No raw socket, so no privileges needed
-    # for the git/uv work itself (restarting the service does need root — see below).
+    # git pull + rebuild this checkout. No raw socket, so no privileges needed for the git and
+    # build work itself (restarting the service does need root — see below).
     dir_ = _install_dir()
-    git, uv = shutil.which("git"), shutil.which("uv")
-    if not git or not uv:
-        print("netmon update needs both git and uv on PATH", file=sys.stderr)
+    git = shutil.which("git")
+    if not git:
+        print("netmon update needs git on PATH", file=sys.stderr)
+        return 1
+    # Resolve how we will rebuild BEFORE touching the checkout: an install with no usable
+    # builder must fail while it is still consistent, not be left pulled-but-unbuilt.
+    plan = _sync_plan(dir_)
+    if plan is None:
+        print(
+            f"netmon update cannot sync this install: no uv on PATH and no pip in {dir_}/.venv"
+            " — reinstall via install.sh",
+            file=sys.stderr,
+        )
         return 1
 
     def git_(*a: str) -> subprocess.CompletedProcess[str]:
@@ -3192,13 +3245,16 @@ def cmd_update(argv: list[str]) -> int:
     if pull.returncode != 0:
         print(pull.stderr.strip() or "git pull failed", file=sys.stderr)
         return 1
-    sync = subprocess.run(
-        [uv, "sync", "--extra", "tui", "--no-dev"], cwd=dir_, text=True, check=False
-    )
-    if sync.returncode != 0:
-        print("uv sync failed", file=sys.stderr)
-        return 1
     new = git_("rev-parse", "--short", "HEAD").stdout.strip()
+    sync = subprocess.run(plan.deps, cwd=dir_, text=True, check=False)
+    if sync.returncode != 0:
+        print(f"{plan.builder} dependency sync failed", file=sys.stderr)
+        return 1
+    if plan.project is not None and _pyproject_moved(git_, old, new):
+        project = subprocess.run(plan.project, cwd=dir_, text=True, check=False)
+        if project.returncode != 0:
+            print(f"{plan.builder} project install failed", file=sys.stderr)
+            return 1
     systemctl = shutil.which("systemctl")
     if (
         systemctl

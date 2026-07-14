@@ -1299,12 +1299,160 @@ class TestCmdUpdate:
     def _which(self, *, systemctl: bool = True) -> Any:
         return lambda name: None if (name == "systemctl" and not systemctl) else f"/usr/bin/{name}"
 
-    def test_refuses_when_git_or_uv_missing(
+    def _pip_install(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        import netmon
+
+        # A venv with a pip in it is, authoritatively, one the pip/requirements.txt path
+        # built: `uv sync` never seeds pip into the venv it creates.
+        (tmp_path / ".venv" / "bin").mkdir(parents=True)
+        (tmp_path / ".venv" / "bin" / "pip").touch()
+        (tmp_path / "requirements.txt").touch()
+        monkeypatch.setattr(netmon, "_install_dir", lambda: tmp_path)
+        return tmp_path
+
+    def test_refuses_when_git_is_missing(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         monkeypatch.setattr(shutil, "which", lambda name: None)
         assert cmd_update([]) == 1
-        assert "needs both git and uv" in capsys.readouterr().err
+        assert "needs git" in capsys.readouterr().err
+
+    def test_refuses_when_no_builder_can_be_found(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import netmon
+
+        # No uv on PATH and no pip in the venv: there is no way to rebuild this install, and
+        # saying so beats pulling first and discovering it afterwards.
+        monkeypatch.setattr(netmon, "_install_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None
+        )
+        assert cmd_update([]) == 1
+        assert "cannot sync this install" in capsys.readouterr().err
+
+    def test_a_pip_built_install_updates_with_pip_not_uv(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Re-syncing a pip-built venv with uv would rebuild it around a different interpreter
+        # and silently drop any --setcap grant on the current one -- passwordless capture would
+        # just stop working, with nothing said.
+        dir_ = self._pip_install(tmp_path, monkeypatch)
+        monkeypatch.setattr(shutil, "which", self._which())
+        ran: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            ran.append(argv)
+            if "--short" in argv:
+                return _completed(argv, 0, out="aaa1111\n")
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            if "--name-only" in argv:
+                return _completed(argv, 0, out="netmon.py\n")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        pip_py = str(dir_ / ".venv" / "bin" / "python3")
+        deps = [a for a in ran if a[:3] == [pip_py, "-m", "pip"]]
+        assert deps, "a pip-built install must be updated with its own pip"
+        assert "--require-hashes" in deps[0]  # an update must not pull an unpinned dependency
+        assert str(dir_ / "requirements.txt") in deps[0]
+        assert not [a for a in ran if a[0] == "/usr/bin/uv"]  # uv is never used here
+
+    def test_a_uv_built_install_still_updates_with_uv_sync(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which())
+        ran: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            ran.append(argv)
+            if "--short" in argv:
+                return _completed(argv, 0, out="aaa1111\n")
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        assert [a for a in ran if a[:2] == ["/usr/bin/uv", "sync"]]
+
+    def test_pip_reinstalls_the_project_only_when_pyproject_changed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # An unconditional editable reinstall reaches PyPI for the build backend on every
+        # no-op update -- a real regression against `uv sync`, which does nothing when
+        # nothing changed. Only pyproject can change the installed metadata; the code is
+        # editable and takes effect from the pull alone.
+        dir_ = self._pip_install(tmp_path, monkeypatch)
+        monkeypatch.setattr(shutil, "which", self._which())
+        changed: list[str] = ["netmon.py\n"]
+        ran: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            ran.append(argv)
+            if "--short" in argv:
+                return _completed(argv, 0, out=("aaa1111\n" if len(ran) < 4 else "bbb2222\n"))
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            if "--name-only" in argv:
+                return _completed(argv, 0, out=changed[0])
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        assert not [a for a in ran if "-e" in a], "no pyproject change => no editable reinstall"
+
+        ran.clear()
+        changed[0] = "pyproject.toml\nnetmon.py\n"
+        assert cmd_update([]) == 0
+        editable = [a for a in ran if "-e" in a]
+        assert editable and str(dir_) in editable[0]
+
+    def test_an_unreadable_diff_reinstalls_rather_than_skipping(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Fail safe: if we cannot tell whether pyproject moved, rebuild. A skipped reinstall
+        # is a silently stale entry point; a redundant one merely costs time.
+        self._pip_install(tmp_path, monkeypatch)
+        monkeypatch.setattr(shutil, "which", self._which())
+        ran: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            ran.append(argv)
+            if "--name-only" in argv:
+                return _completed(argv, 128, err="fatal: bad revision")
+            if "--short" in argv:
+                return _completed(argv, 0, out=("aaa1111\n" if len(ran) < 4 else "bbb2222\n"))
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        assert [a for a in ran if "-e" in a]
+
+    def test_resolves_the_sync_plan_before_pulling(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import netmon
+
+        # An install that cannot be synced must not be left pulled-but-unbuilt.
+        monkeypatch.setattr(netmon, "_install_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None
+        )
+        ran: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            ran.append(argv)
+            return _completed(argv, 0, out="true")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 1
+        assert not [a for a in ran if "pull" in a]
+        assert "cannot sync this install" in capsys.readouterr().err
 
     def test_refuses_outside_a_git_checkout(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1363,7 +1511,7 @@ class TestCmdUpdate:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         assert cmd_update([]) == 1
-        assert "uv sync failed" in capsys.readouterr().err
+        assert "uv dependency sync failed" in capsys.readouterr().err
 
     def test_restarts_an_active_service_and_reports_revisions(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
