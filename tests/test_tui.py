@@ -315,6 +315,16 @@ class TestNetmonAppHardening:
             assert model.filter.is_unconstrained()
             await app.action_quit()
 
+    async def test_a_render_tick_that_races_teardown_is_a_no_op(self, tmp_path: Path) -> None:
+        # A pre-existing flake, failing about one run in six: the 10 Hz timer fires while the
+        # app is tearing down, and _render_panels raises NoMatches on #hosts. The old guard
+        # covered only the first lookup (#feed) — but the widget tree can go away between any
+        # two of the five. Calling _render with no screen must simply do nothing.
+        app = NetmonApp(make_session(tmp_path), DashboardModel())
+        async with app.run_test():
+            await app.action_quit()
+        app._render()  # after teardown: must not raise
+
     async def test_the_feed_owns_focus_at_startup_not_the_hidden_filter_bar(
         self, tmp_path: Path
     ) -> None:

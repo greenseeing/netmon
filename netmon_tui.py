@@ -282,10 +282,20 @@ class NetmonApp(App[None]):
     # be read without it snapping back — until the user presses `g` to follow again.
     # The mode is explicit, so a redraw resetting the scroll offset can't flip it.
     def _render(self) -> None:
+        # A tick that races shutdown must do nothing at all. The guard has to wrap the WHOLE
+        # tick, not just the first lookup: _render_panels goes on to query #hosts, #kinds,
+        # #eps and #health, and the widget tree can vanish between any two of them. Guarding
+        # only #feed left a window that failed roughly one run in six — and since pytest is
+        # this project's only gate, a flaky gate is a broken one.
+        if not self.is_running:
+            return
         try:
-            table = self.query_one("#feed", DataTable)
+            self._render_tick()
         except NoMatches:
-            return  # a scheduled tick raced app shutdown; the widget tree is gone
+            return  # teardown began mid-tick; the widget tree is going away
+
+    def _render_tick(self) -> None:
+        table = self.query_one("#feed", DataTable)
         added, evicted = self.model.drain_new()  # always drain so deltas don't pile up
         if self._following and table.scroll_offset.y != 0:
             self._enter_inspect()  # scrolled away from the top (wheel / page keys)
