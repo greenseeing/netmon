@@ -24,7 +24,15 @@ less install.sh                       # inspect
 sudo bash install.sh                  # add --enable-service and/or --setcap
 ```
 
-It clones to `/opt/netmon`, builds an isolated uv-managed venv, and installs a `netmon` launcher on your PATH. Options: `--enable-service` also installs and starts a hardened systemd recorder; `--setcap` grants `CAP_NET_RAW` to the private interpreter so the interactive TUI runs without sudo — scoped to the `netmon` group (you're added automatically), not every local user. Remove everything with `sudo bash install.sh --uninstall`.
+It clones to `/opt/netmon`, builds an isolated venv, and installs a `netmon` launcher on your PATH. Options: `--enable-service` also installs and starts a hardened systemd recorder; `--setcap` grants `CAP_NET_RAW` to the private interpreter so the interactive TUI runs without sudo — scoped to the `netmon` group (you're added automatically), not every local user. Remove everything with `sudo bash install.sh --uninstall`.
+
+**uv is optional.** The installer uses it when it is already there, and otherwise builds the venv with your system `python3` and the checked-in, hash-pinned `requirements.txt` — no toolchain download, and `pip install --require-hashes` gives the same integrity guarantee `uv sync` does. It only falls back to fetching uv (`curl https://astral.sh/uv/install.sh | sh`, unchecksummed, as root) when the host has **no** Python ≥ 3.13 at all, since only uv can then provide one. Pass `--pip` to refuse that fallback outright:
+
+```sh
+sudo bash install.sh --pip            # never fetches a toolchain; needs python3 >= 3.13
+```
+
+If your Python is too old *and* you don't want the uv bootstrap, install one first — `apt install python3.13 python3.13-venv` — and re-run with `--pip`. The installer tells you exactly this if it gets stuck.
 
 If you'd rather have a single command and accept the risk of running unreviewed code as root, the pipe form is equivalent to the three steps above:
 

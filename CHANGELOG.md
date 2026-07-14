@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The installer no longer demands uv, and no longer reaches astral.sh by default.**
+  `install.sh` could only build a venv with uv, and could only get uv by piping an
+  unchecksummed script into a root shell — so the documented one-liner simply failed on a
+  host without the Astral toolchain. It now *picks* a builder: uv when it is already
+  present (that path is byte-for-byte what it was), otherwise the system `python3` plus
+  the hash-pinned `requirements.txt`, and it fetches uv only when the host has no Python
+  ≥ 3.13 at all — the one case where uv is the only thing that can *provide* an
+  interpreter. `--pip` refuses that fallback outright. When nothing works it now dies with
+  a message naming what it found on the host and both remedies, instead of a bare
+  `curl: command not found` or a `SyntaxError` three steps later.
+
+  Two details that are load-bearing rather than incidental. The pip venv is built with
+  `--copies`: a default venv's `bin/python3` resolves out to `/usr/bin/python3.x`, and
+  `maybe_setcap` rightly refuses to arm *that* — so without the copy the pip path would
+  have silently lost passwordless capture. And an interpreter is only accepted if it can
+  actually `import venv, ensurepip`, because Debian ships those separately: a host can
+  have a perfectly new Python that cannot seed a venv, and the failure otherwise surfaces
+  as an inscrutable `No module named pip` long after the decision that caused it.
+  `maybe_setcap` also swaps its `/usr/*` blocklist for a `$NETMON_DIR/*` allowlist — the
+  actual invariant is "the capability lands on a binary we own" — and now smoke-tests the
+  armed interpreter, revoking the grant rather than leaving a netmon that cannot start
+  (a file capability puts the loader into secure-execution mode, where an interpreter that
+  finds libpython via an `$ORIGIN` rpath stops working the moment it is armed).
+
 - **`netmon update` no longer demands uv.** It refused to run unless both `git` and
   `uv` were on PATH, so a pip-built install would have been stranded forever on the
   version it was installed at — which is why this lands before the installer grows a pip

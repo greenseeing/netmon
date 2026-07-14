@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 REQUIREMENTS = ROOT / "requirements.txt"
 PYPROJECT = ROOT / "pyproject.toml"
+INSTALLER = ROOT / "install.sh"
 
 needs_uv = pytest.mark.skipif(
     shutil.which("uv") is None,
@@ -77,6 +79,21 @@ class TestRequirementsTxt:
         )
         assert done.returncode == 0, (
             f"uv.lock has drifted from pyproject.toml:\n{done.stderr}\nRun: uv lock"
+        )
+
+
+class TestInstallerFloor:
+    def test_python_floor_matches_requires_python(self) -> None:
+        # The installer decides whether the host's own python3 is usable. If its floor and
+        # pyproject's disagree it either rejects a perfectly good interpreter, or builds a
+        # venv that cannot run netmon -- and that second failure surfaces far from its cause.
+        with PYPROJECT.open("rb") as f:
+            requires = tomllib.load(f)["project"]["requires-python"]
+        declared = requires.removeprefix(">=").strip()
+        match = re.search(r"^PY_MIN=(\S+)", INSTALLER.read_text(encoding="utf-8"), re.MULTILINE)
+        assert match, "install.sh has no PY_MIN"
+        assert match.group(1) == declared, (
+            f"install.sh PY_MIN={match.group(1)} but pyproject requires-python is {requires}"
         )
 
 

@@ -5,14 +5,17 @@ How to deploy, run, verify, and read the passive network monitor on any Linux ho
 ## 1. Requirements
 
 - Linux (uses `AF_PACKET` raw sockets; macOS/Windows not supported)
-- Python ≥ 3.13 and [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **Either** Python ≥ 3.13 with its `venv` module (`apt install python3.13 python3.13-venv`)
+  **or** [uv](https://docs.astral.sh/uv/). The installer uses whichever it finds, and only
+  fetches uv when the host has no usable Python at all. If it finds neither it says so, names
+  what it found, and gives you both remedies.
 - `tcpdump` binary — only needed if you pass `--bpf` (scapy shells out to it to compile the filter)
 - Root or `CAP_NET_RAW` (section 3)
 
 ## 2. Install
 
-**Recommended — the installer** (clones to `/opt/netmon`, builds an isolated
-uv-managed venv, installs a `netmon` launcher, and optionally the systemd recorder):
+**Recommended — the installer** (clones to `/opt/netmon`, builds an isolated venv,
+installs a `netmon` launcher, and optionally the systemd recorder):
 
 ```sh
 curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh
@@ -24,16 +27,39 @@ sudo bash install.sh                     # + --enable-service and/or --setcap
 `CAP_NET_RAW` to the private interpreter (needs `libcap2-bin`); `--uninstall`
 reverses everything. It clones over **HTTPS** so `netmon update` (`git pull`) works
 without an SSH key. Thereafter: `netmon update` pulls the latest revision and
-re-syncs; it refuses if the working tree has local edits (`git stash` first).
+rebuilds with whichever builder made the install; it refuses if the working tree has
+local edits (`git stash` first).
+
+**Which builder?** uv if it is on PATH; otherwise your system `python3` plus the
+checked-in, hash-pinned `requirements.txt`; and only if there is no Python ≥ 3.13 at
+all does it fetch uv (unchecksummed, as root — see the script's header). `--pip` forces
+the pip path and never fetches a toolchain:
+
+```sh
+sudo bash install.sh --pip
+```
+
+Both paths build the venv with a **private** interpreter under `/opt/netmon`, which is
+what lets `--setcap` (section 3B) arm netmon's own copy rather than a shared `/usr`
+interpreter — the pip path uses `venv --copies` precisely so that stays true.
 
 **Manual** (a dev checkout, or no installer):
 
 ```sh
-rsync -a netmon.py netmon_tui.py pyproject.toml uv.lock README.md docs/ host:/opt/netmon/
+rsync -a netmon.py netmon_tui.py pyproject.toml uv.lock requirements.txt README.md docs/ host:/opt/netmon/
 ssh host && cd /opt/netmon && uv sync --no-dev
 ```
 
-Without uv: `python3.13 -m venv .venv && .venv/bin/pip install scapy pydantic structlog cryptography`, then substitute `.venv/bin/python netmon.py` for `uv run netmon.py` everywhere below.
+Without uv, install the same pinned tree pip understands — do **not** hand-list the
+dependencies (you will omit `textual`, and `netmon run` is the dashboard):
+
+```sh
+python3.13 -m venv --copies .venv
+.venv/bin/pip install --require-hashes -r requirements.txt
+.venv/bin/pip install --no-deps -e .
+```
+
+Then substitute `.venv/bin/netmon` for `uv run netmon.py` everywhere below.
 
 > **After moving or renaming the project directory, re-run `uv sync`.** The venv's console-script shebangs (`.venv/bin/mypy`, etc.) are absolute paths baked in at creation; a move leaves them pointing at the old path, so `.venv/bin/<tool>` fails with `bad interpreter` until `uv sync` regenerates them. `uv run …` is unaffected (it re-resolves the interpreter), but a dir move also invalidates the `setcap` grant from section 3B — re-apply it.
 
@@ -225,6 +251,9 @@ find /var/log/netmon -maxdepth 1 -name 'run-*' -mtime +30 -exec rm -r {} +
 | `netmon run` prompts for a sudo password | Expected without `--setcap`: the launcher re-execs under sudo to get `CAP_NET_RAW`. Run `sudo bash install.sh --setcap` for a passwordless TUI, or use the systemd recorder for unattended capture. |
 | `netmon update` refuses: "working tree has local changes" | You edited files under `/opt/netmon`. `sudo git -C /opt/netmon stash` (or discard) then retry; update does a `--ff-only` pull and won't clobber local edits. |
 | `sudo: uv: command not found` | Use `sudo $(command -v uv) run netmon.py`, or the `netmon` launcher (which execs the venv directly, no uv on PATH needed). |
+| `python -m venv` fails, or `No module named pip` | Debian ships `venv`/`ensurepip` separately: `apt install python3-venv` (or `python3.13-venv`). The installer checks for this up front and refuses such an interpreter by name rather than failing here — if you hit it, you built the venv by hand. |
+| install.sh: "no usable Python, no uv, and no curl" | The host cannot run netmon (needs ≥ 3.13) and offers no way to get an interpreter. Install either: `apt install python3.13 python3.13-venv` then re-run with `--pip`, or `apt install uv` / `pipx install uv`. |
+| Passwordless TUI stopped working after a distro Python upgrade | The pip path copies the interpreter into `/opt/netmon/.venv`, so a system upgrade leaves that copy — and its `--setcap` grant — stale. Re-run `sudo bash install.sh --setcap`. |
 | Starts, but zero packets in `stats` | Wrong `-i` name (check `ip link`); or a too-narrow `--bpf` expression. |
 | `--bpf` raises an error | `tcpdump` not installed — scapy needs it to compile the filter. |
 | `userspace_dropped` > 0 in stats | Consumer can't keep up (very busy link). Narrow with `--bpf` or `-i`, and use `-q`. |

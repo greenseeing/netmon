@@ -13,6 +13,9 @@
 #                      `netmon` group (the interpreter is chmod 0750 root:netmon), so
 #                      only group members get passwordless capture — NOT every local
 #                      user. Refused if it would land on a shared /usr python.
+#   --pip              build the venv from the system python3 + the checked-in, hash-pinned
+#                      requirements.txt, and never fetch a toolchain. Use this to refuse the
+#                      uv bootstrap's trust boundary outright.
 #   --uninstall        remove everything this script installs
 #
 # Security model: live capture needs CAP_NET_RAW. The background recorder gets it from
@@ -20,11 +23,18 @@
 # The interactive `netmon run` re-execs under sudo on demand unless you opt into --setcap.
 #
 # Trust boundaries you accept by running this:
-#   * If uv is absent it is bootstrapped via `curl https://astral.sh/uv/install.sh | sh`
-#     as root, with no checksum — pre-install uv (apt/pipx) to skip that step.
-#   * `netmon update` runs `git pull` + `uv sync` as root, so whoever controls the git
-#     repo or its pinned dependency tree can reach root on every host that updates.
+#   * uv is used when it is already present, and the system python3 when it is not. The
+#     `curl https://astral.sh/uv/install.sh | sh` bootstrap — as root, with no checksum — is
+#     now the LAST resort, taken only when the host has no Python new enough to run netmon,
+#     since only uv can then provide one. `--pip` refuses it outright.
+#   * `netmon update` runs `git pull` + a rebuild as root, so whoever controls the git repo
+#     or its pinned dependency tree can reach root on every host that updates.
 set -euo pipefail
+
+# Must equal requires-python in pyproject.toml — tests/test_packaging.py asserts it. netmon
+# will not run below this, and the installer's whole job here is to say so early and clearly
+# rather than hand someone a venv that dies with a SyntaxError three steps later.
+PY_MIN=3.13
 
 # NETMON_REPO/NETMON_REF let a fork (or a pre-merge branch test) override the source and
 # branch/tag; default to upstream main. Note `netmon update` always tracks origin main.
@@ -60,10 +70,90 @@ require_root() {
   [ "$(id -u)" -eq 0 ] || die "run me with sudo (I create a system user, a unit, and $LOG_DIR)"
 }
 
-ensure_tools() {
+ensure_git() {
   command -v git >/dev/null || die "git not found — install it first (apt install git)"
+}
+
+py_ok() {
+  # Usable means: new enough to run netmon, AND able to build a venv with pip in it. Debian
+  # ships venv/ensurepip in a separate python3-venv package, so a host can have a perfectly
+  # new interpreter that cannot seed a venv — check that here, not three steps later when
+  # `python -m venv` fails with "No module named pip".
+  "$1" -c "import sys, venv, ensurepip
+sys.exit(0 if sys.version_info >= tuple(int(p) for p in '$PY_MIN'.split('.')) else 1)" \
+    2>/dev/null
+}
+
+find_python() {
+  local candidate path
+  for candidate in "python$PY_MIN" python3 python3.14; do
+    path="$(command -v "$candidate" 2>/dev/null)" || continue
+    if py_ok "$path"; then echo "$path"; return 0; fi
+  done
+  return 1
+}
+
+py_report() {
+  # What we found, so the failure names the host's actual state instead of a generic demand.
+  local candidate path version
+  for candidate in "python$PY_MIN" python3; do
+    if path="$(command -v "$candidate" 2>/dev/null)"; then
+      version="$("$path" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '?')"
+      if py_ok "$path"; then echo "    $candidate -> $version (usable)"
+      elif "$path" -c 'import venv, ensurepip' 2>/dev/null; then echo "    $candidate -> $version (too old; need >= $PY_MIN)"
+      else echo "    $candidate -> $version (no venv/ensurepip module — apt install python3-venv)"
+      fi
+    else
+      echo "    $candidate -> not installed"
+    fi
+  done
+  command -v uv >/dev/null && echo "    uv -> $(uv --version)" || echo "    uv -> not installed"
+}
+
+# select_builder sets these. It must assign globals rather than echo a result: $(...) runs in
+# a subshell, so an echoed SYS_PY would be lost the moment the subshell exits.
+BUILDER=""
+SYS_PY=""
+
+select_builder() {
+  local want_pip="$1"
+
+  if [ "$want_pip" -eq 1 ]; then
+    SYS_PY="$(find_python)" || die "$(printf '%s\n%s\n%s\n' \
+      "--pip needs a system Python >= $PY_MIN that can build a venv, and there is none." \
+      "Found:" "$(py_report)")"
+    BUILDER=pip
+    return
+  fi
+
+  # uv already here: today's path, untouched — including every host a previous install.sh
+  # bootstrapped (it symlinks /usr/local/bin/uv).
+  if command -v uv >/dev/null; then BUILDER=uv; return; fi
+
+  # No uv, but the host can already run netmon. Use what is here rather than piping an
+  # unchecksummed installer into a root shell to obtain a second copy of it.
+  if SYS_PY="$(find_python)"; then BUILDER=pip; return; fi
+
+  # No uv and nothing new enough. Only uv can *provide* an interpreter, so this is the one
+  # case where the bootstrap is genuinely the sole option rather than a default.
+  if command -v curl >/dev/null; then BUILDER=uv; return; fi
+
+  die "$(printf '%s\n%s\n%s\n%s\n' \
+    "no usable Python, no uv, and no curl to fetch one. netmon needs Python >= $PY_MIN." \
+    "Found:" "$(py_report)" \
+    "  Install a system Python and re-run with --pip:
+      apt install python$PY_MIN python$PY_MIN-venv
+  ...or install uv, which provisions a private $PY_MIN under $NETMON_DIR/pythons:
+      apt install uv        # Debian 13+ / Ubuntu 24.10+
+      pipx install uv")"
+}
+
+ensure_uv() {
   if ! command -v uv >/dev/null; then
-    echo "==> installing uv"
+    # Guard the fetch itself: without this, a host with no curl dies on `set -e` with a bare
+    # "curl: command not found" instead of a message that says what netmon actually needs.
+    command -v curl >/dev/null || die "curl not found, and it is needed to bootstrap uv"
+    echo "==> installing uv (unchecksummed download from astral.sh — see the header)"
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
   fi
@@ -83,17 +173,49 @@ clone_or_pull() {
   fi
 }
 
-build_venv() {
+build_venv_uv() {
   echo "==> building isolated venv (uv-managed private Python)"
   # Keep the managed interpreter under $NETMON_DIR (world-readable), NOT under /root,
   # so the unprivileged service user can exec it; and so --setcap targets a private
   # binary, never the shared /usr python.
   export UV_PYTHON_INSTALL_DIR="$NETMON_DIR/pythons"
   export UV_PYTHON_PREFERENCE=only-managed
-  ( cd "$NETMON_DIR" && uv python install 3.13 && uv sync --extra tui --no-dev )
+  ( cd "$NETMON_DIR" && uv python install "$PY_MIN" && uv sync --extra tui --no-dev )
   # Code/venv is not secret (the sensitive data lives in $LOG_DIR), and the service user
   # must traverse+exec the interpreter. If --setcap is later applied, maybe_setcap
   # re-locks that one now-capability-bearing binary to root + the netmon group.
+  chmod -R a+rX "$NETMON_DIR"
+}
+
+build_venv_pip() {
+  local py="$1"
+  echo "==> building isolated venv (system $("$py" -V 2>&1), pip + requirements.txt)"
+  [ -f "$NETMON_DIR/requirements.txt" ] || die "requirements.txt missing from this checkout"
+  # Reuse a venv this path built (so a --setcap grant on its interpreter survives an
+  # upgrade); replace one the other builder made. A uv venv has no pip in it — the same
+  # discriminator `netmon update` uses, and it needs no marker file to stay honest.
+  if [ -d "$NETMON_DIR/.venv" ] && [ ! -x "$NETMON_DIR/.venv/bin/pip" ]; then
+    rm -rf "$NETMON_DIR/.venv"
+  fi
+  # --copies, not the default symlink. A symlinked venv's bin/python3 resolves (readlink -f)
+  # out to /usr/bin/python3.x, and setcap on THAT would arm raw sockets for every venv on the
+  # host — maybe_setcap refuses it, correctly, which would silently cost this path its
+  # passwordless TUI. The copy keeps the capability scoped to netmon's own interpreter,
+  # exactly as the uv-managed one is. Only the launcher binary is copied; the stdlib still
+  # comes from /usr via pyvenv.cfg, so distro security updates still land.
+  [ -d "$NETMON_DIR/.venv" ] || "$py" -m venv --copies "$NETMON_DIR/.venv" \
+    || die "python -m venv failed — install the venv module (apt install python3-venv)"
+  # Hash-pinned and fully transitive, exported from uv.lock: pip installs nothing that is not
+  # listed and nothing whose sha256 does not match — the same integrity guarantee uv sync
+  # gives, which is the point for whoever took this path to avoid an unchecked download.
+  "$VENV_PY" -m pip install --quiet --disable-pip-version-check --require-hashes \
+      -r "$NETMON_DIR/requirements.txt" || die "dependency install failed"
+  # The project itself, editable: the launcher and the unit exec $NETMON_DIR/.venv/bin/netmon,
+  # and `netmon update`'s git pull must take effect without a reinstall. Build isolation
+  # fetches the build backend from PyPI unhashed — uv sync does exactly the same (hatchling is
+  # not in uv.lock), so this is parity, not a new trust boundary.
+  "$VENV_PY" -m pip install --quiet --disable-pip-version-check --no-deps -e "$NETMON_DIR" \
+      || die "netmon install failed"
   chmod -R a+rX "$NETMON_DIR"
 }
 
@@ -187,8 +309,13 @@ EOF
 
 maybe_setcap() {
   local target; target="$(readlink -f "$VENV_PY")"
+  # Allowlist, not a /usr/* blocklist: the invariant is "the capability lands on a binary we
+  # own", and that stays true however the venv was built, whereas a blocklist only names the
+  # one wrong place we happened to think of. NETMON_DIR is already validated by
+  # validate_prefix, so it holds no spaces or shell metacharacters.
   case "$target" in
-    /usr/*) die "refusing --setcap: $target is a shared interpreter (would arm raw sockets host-wide)" ;;
+    "$NETMON_DIR"/*) : ;;
+    *) die "refusing --setcap: $target is outside $NETMON_DIR — a shared interpreter (would arm raw sockets host-wide)" ;;
   esac
   command -v setcap >/dev/null || die "setcap not found (apt install libcap2-bin)"
   getent group "$SVC_USER" >/dev/null || groupadd --system "$SVC_USER"
@@ -201,6 +328,14 @@ maybe_setcap() {
   # launcher falls back to sudo for them, which is correct.
   chown "root:$SVC_USER" "$target"
   chmod 0750 "$target"
+  # A file capability puts the loader into secure-execution mode (AT_SECURE): $ORIGIN rpaths
+  # and LD_LIBRARY_PATH are ignored, so an interpreter that finds its libpython that way stops
+  # starting the moment it is armed. Prove it still runs, or hand the capability back — a
+  # broken netmon is worse than one that asks for sudo.
+  if ! "$VENV_PY" -c pass 2>/dev/null; then
+    setcap -r "$target" || true
+    die "the armed interpreter will not start (secure-execution mode); capability revoked"
+  fi
   getcap "$target"
   if [ -n "${SUDO_USER:-}" ]; then
     usermod -aG "$SVC_USER" "$SUDO_USER"
@@ -215,16 +350,25 @@ do_install() {
   require_linux
   require_root
   validate_prefix
-  local enable_service=0 want_setcap=0
+  local enable_service=0 want_setcap=0 want_pip=0
   for a in "$@"; do case "$a" in
     --enable-service) enable_service=1 ;;
     --setcap) want_setcap=1 ;;
+    --pip) want_pip=1 ;;
     *) die "unknown flag: $a" ;;
   esac; done
 
-  ensure_tools
+  ensure_git
+  # The clone comes before the builder runs: the pip path installs from the checkout's own
+  # requirements.txt, so the tree has to be on disk before we can build against it.
   clone_or_pull
-  build_venv
+  select_builder "$want_pip"
+  if [ "$BUILDER" = pip ]; then
+    build_venv_pip "$SYS_PY"
+  else
+    ensure_uv
+    build_venv_uv
+  fi
   install_launcher
   install_service
   [ "$want_setcap" -eq 1 ] && maybe_setcap || true
