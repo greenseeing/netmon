@@ -23,9 +23,11 @@ from textual.widgets.data_table import RowDoesNotExist
 
 from netmon import (
     KIND_STYLE,
+    KIND_VALUES,
     CopyResult,
     DashboardModel,
     Event,
+    EventFilter,
     Session,
     announce_start,
     configure_logging,
@@ -43,9 +45,17 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
-# `f` cycles the feed through these substring filters (matched against kind / host /
-# detail by DashboardModel.passes); None shows everything.
-_FILTERS: list[str | None] = [None, "dns", "tls", "http", "flow"]
+# `f` cycles the feed through these filters. Same five choices the substring cycle offered,
+# now expressed as EventFilter values over the closed kind vocabulary — so there is one
+# predicate underneath the feed and `netmon query`, not two that agree by coincidence.
+_DNS_KINDS = frozenset(k for k in KIND_VALUES if k.startswith("dns_"))
+_FILTERS: list[EventFilter] = [
+    EventFilter(),
+    EventFilter(kinds=_DNS_KINDS),
+    EventFilter(kinds=frozenset({"tls_sni"})),
+    EventFilter(kinds=frozenset({"http"})),
+    EventFilter(kinds=frozenset({"flow"})),
+]
 
 _COLUMNS = ("TIME", "KIND", "DIR", "HOST / NAME", "DETAIL")
 
@@ -399,7 +409,7 @@ class NetmonApp(App[None]):
         self._filter_idx = (self._filter_idx + 1) % len(_FILTERS)
         self.model.filter = _FILTERS[self._filter_idx]
         self._rebuild_feed()
-        self.notify(f"filter: {self.model.filter or 'all'}")
+        self.notify(f"filter: {self.model.filter.label()}")
 
     def action_follow(self) -> None:
         self._resume_follow()

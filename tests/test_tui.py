@@ -14,6 +14,7 @@ from textual.widgets import DataTable, Static
 
 import netmon_tui
 from netmon import (
+    KIND_VALUES,
     CaptureStats,
     DashboardModel,
     DnsQueryEvent,
@@ -302,8 +303,8 @@ class TestNetmonAppHardening:
             model.add_event(q("example.com"))
             model.add_event(sni("github.com"))
             app._render()
-            app.action_cycle_filter()  # None -> "dns"
-            assert model.filter == "dns"
+            app.action_cycle_filter()  # all -> the dns kinds
+            assert model.filter.kinds == {k for k in KIND_VALUES if k.startswith("dns_")}
             assert app.query_one("#feed", DataTable).row_count == 1  # only the dns row
             await app.action_quit()
 

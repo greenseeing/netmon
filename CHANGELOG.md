@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **One filter, shared by the dashboard and `netmon query`.** There were two, agreeing on
+  nothing but `event_host()`: the feed cycled a single lowercase substring, and `query` had
+  its own flags and its own predicate. Both are now the same `EventFilter` over three closed
+  vocabularies — kind, direction, scope — with OR *within* a dimension and AND *across* them.
+  `--kind`, `--direction` and `--scope` are repeatable and validated against their vocabulary.
+
+### Changed
+
+- **`netmon query --scope` now classifies the peer of *any* event, not just a flow's.**
+  Previously the predicate read `FlowEvent.scope` with `getattr`, so `--scope internet`
+  silently matched flows alone — even though the DNS query that named the host and the SNI
+  that announced it *are* the disclosure you asked for. It now matches all three. **This is a
+  behaviour change**: expect more rows than before, and the right ones.
+- **`netmon query --scope local` is now rejected** with the list of valid scopes. `local` is a
+  *direction*, not a scope — `remote_scope()` can never return it. The old free-string flag
+  accepted it and quietly returned whatever happened to match. (The repo's own query fixture
+  had been recording a flow with `scope: "local"`, a value no real capture could produce; the
+  closed vocabulary surfaced the lie.)
+
 - **The installer no longer demands uv, and no longer reaches astral.sh by default.**
   `install.sh` could only build a venv with uv, and could only get uv by piping an
   unchecksummed script into a root shell — so the documented one-liner simply failed on a

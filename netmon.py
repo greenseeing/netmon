@@ -658,6 +658,60 @@ def event_to_detail(event: Event) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True, slots=True)
+class EventFilter:
+    # The one filter, shared by the live feed and `netmon query` — there used to be two, with
+    # different vocabularies and different semantics, agreeing on nothing but event_host().
+    #
+    # Each dimension holds THE SET OF VALUES THAT PASS: OR within a dimension, AND across
+    # them. The defaults are the full vocabularies, so "unset" needs no special case in the
+    # predicate and a checkbox group maps 1:1 onto a set — including the empty set, which
+    # passes nothing. That is what "I ticked zero kinds" says, and reinterpreting it as "all"
+    # would be the tool quietly overruling the operator. `host` is likewise the identity when
+    # empty, since "" is a substring of everything.
+    #
+    # Display-only, on the TUI side: nothing here reaches the Writer or the pcap sink, and
+    # add_event never drops, so re-ticking a box re-reveals events already captured.
+    kinds: frozenset[str] = frozenset(KIND_VALUES)
+    directions: frozenset[str] = frozenset(DIRECTION_VALUES)
+    scopes: frozenset[str] = frozenset(SCOPE_VALUES)
+    host: str = ""
+
+    def matches(self, event: Event) -> bool:
+        return (
+            event.kind in self.kinds
+            and event_direction_name(event) in self.directions
+            and event_scope(event) in self.scopes
+            and self.host.casefold() in event_host(event).casefold()
+        )
+
+    def is_unconstrained(self) -> bool:
+        return (
+            len(self.kinds) == len(KIND_VALUES)
+            and len(self.directions) == len(DIRECTION_VALUES)
+            and len(self.scopes) == len(SCOPE_VALUES)
+            and not self.host
+        )
+
+    def label(self) -> str:
+        # For the feed's border. A filtered feed must never be mistaken for a quiet network,
+        # so this says what is hidden — counts only, to fit: "kind 3/12 · scope 1/6".
+        if self.is_unconstrained():
+            return "all"
+        parts = [
+            f"{name} {len(chosen)}/{len(whole)}"
+            for name, chosen, whole in (
+                ("kind", self.kinds, KIND_VALUES),
+                ("dir", self.directions, DIRECTION_VALUES),
+                ("scope", self.scopes, SCOPE_VALUES),
+            )
+            if len(chosen) != len(whole)
+        ]
+        if self.host:
+            parts.append(f"host~{printable(self.host)}")
+        return " · ".join(parts)
+
+
 class RateBucketer:
     # Events-per-second over a sliding window, for the feed's rate sparkline — the
     # processor has counts but no time axis. Buckets are keyed by integer second
@@ -684,15 +738,15 @@ class DashboardModel:
     # most recent events (whole Event retained so the detail pane can show every
     # field) plus the events/sec bucketer. Per-kind counts, top hosts and coverage
     # are read straight off the PacketProcessor at render time — never duplicated
-    # here. The substring `filter` is a view: add_event never drops, so toggling a
-    # filter re-reveals events already in the ring.
+    # here. The `filter` is a view: add_event never drops, so toggling a filter
+    # re-reveals events already in the ring.
     def __init__(
         self, cap: int = 1000, rate_window: int = 60, clock: Callable[[], float] = time.time
     ) -> None:
         self.cap = cap
         self._clock = clock
         self.rate = RateBucketer(rate_window)
-        self.filter: str | None = None
+        self.filter: EventFilter = EventFilter()
         self._recent: OrderedDict[str, Event] = OrderedDict()
         self._seq = 0
         self._added: list[tuple[str, Event]] = []
@@ -728,14 +782,7 @@ class DashboardModel:
         return self.rate.series(self._clock())
 
     def passes(self, event: Event) -> bool:
-        if not self.filter:
-            return True
-        needle = self.filter.lower()
-        return (
-            needle in event.kind
-            or needle in event_host(event).lower()
-            or needle in event_detail(event).lower()
-        )
+        return self.filter.matches(event)
 
 
 EXT_SERVER_NAME = 0x0000
@@ -3342,21 +3389,47 @@ def cmd_service(argv: list[str]) -> int:
 def _query_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="netmon query",
-        description="filter a recorded run's JSONL by kind/host/scope (read-only; no capture)",
+        description="filter a recorded run's JSONL by kind/direction/scope/host "
+        "(read-only; no capture)",
     )
     p.add_argument("run_dir", help="a logs/run-* directory to read")
-    p.add_argument("--kind", choices=sorted(KIND_TO_FILE), help="only this event kind")
-    p.add_argument("--host", help="substring match on the event's host / SNI / qname")
-    p.add_argument("--scope", help="only flows in this scope (e.g. internet, local)")
+    p.add_argument(
+        "--kind", action="append", choices=KIND_VALUES, help="only these kinds (repeatable)"
+    )
+    p.add_argument(
+        "--direction",
+        action="append",
+        choices=DIRECTION_VALUES,
+        help="only these directions (repeatable)",
+    )
+    p.add_argument(
+        "--scope",
+        action="append",
+        choices=SCOPE_VALUES,
+        help="only events whose peer is in these scopes (repeatable)",
+    )
+    p.add_argument("--host", default="", help="substring match on the event's host / SNI / qname")
     return p
 
 
-def _load_run_events(run_dir: Path, kind: str | None) -> Iterator[Event]:
-    # Read only the file(s) the requested kind lives in — all of them when unfiltered —
+def _filter_from_args(args: argparse.Namespace) -> EventFilter:
+    # The one place the CLI's "flag absent means every value" convention is written down.
+    # EventFilter itself has no such rule — an empty set there means an empty result, which is
+    # what an operator who unticked every box actually asked for.
+    return EventFilter(
+        kinds=frozenset(args.kind or KIND_VALUES),
+        directions=frozenset(args.direction or DIRECTION_VALUES),
+        scopes=frozenset(args.scope or SCOPE_VALUES),
+        host=args.host,
+    )
+
+
+def _load_run_events(run_dir: Path, kinds: frozenset[str]) -> Iterator[Event]:
+    # Read only the file(s) the requested kinds live in — all of them when unfiltered —
     # skipping any a partial run never wrote. A line that will not parse (a truncated
     # tail, a hand-edited file) is skipped, not fatal: a query is a read-only view and
     # must never crash on the record it is inspecting.
-    names = {KIND_TO_FILE[kind]} if kind else set(KIND_TO_FILE.values())
+    names = {KIND_TO_FILE[k] for k in kinds}
     for name in sorted(names):
         # Rotation (--rotate-mb) rolls a kind's overflow into numbered archives
         # beside the active file; the query reads them all as one record. Reads
@@ -3388,16 +3461,6 @@ def _event_time(ev: Event) -> datetime:
     return dt if dt.tzinfo is not None else dt.astimezone()
 
 
-def _event_matches(ev: Event, kind: str | None, host: str | None, scope: str | None) -> bool:
-    # AND semantics: an unset filter is a pass. `scope` reads the FlowEvent-only field,
-    # so scoping a non-flow kind excludes it (only flows carry a scope).
-    if kind is not None and ev.kind != kind:
-        return False
-    if host is not None and host.lower() not in event_host(ev).lower():
-        return False
-    return scope is None or getattr(ev, "scope", None) == scope
-
-
 def cmd_query(argv: list[str]) -> int:
     args = _query_parser().parse_args(argv)
     run_dir = Path(args.run_dir)
@@ -3410,11 +3473,8 @@ def cmd_query(argv: list[str]) -> int:
     if not any((run_dir / name).exists() for name in run_files):
         print(f"netmon query: not a netmon run directory: {run_dir}", file=sys.stderr)
         return 1
-    events = [
-        ev
-        for ev in _load_run_events(run_dir, args.kind)
-        if _event_matches(ev, args.kind, args.host, args.scope)
-    ]
+    selection = _filter_from_args(args)
+    events = [ev for ev in _load_run_events(run_dir, selection.kinds) if selection.matches(ev)]
     events.sort(key=_event_time)  # one timeline across per-kind files
     for ev in events:
         print(ev.model_dump_json(exclude_none=True))

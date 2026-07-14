@@ -71,6 +71,7 @@ from netmon import (
     DnsResponseEvent,
     DnsTcpReassembler,
     Event,
+    EventFilter,
     FlowEvent,
     Hostname,
     HttpEvent,
@@ -1273,7 +1274,7 @@ class TestOutputRotation:
         writer.close()
         from netmon import _load_run_events
 
-        read = list(_load_run_events(tmp_path / "run", None))
+        read = list(_load_run_events(tmp_path / "run", frozenset(KIND_VALUES)))
         assert len(read) == len(events)  # nothing lost across the roll
 
     def test_pcap_sink_rolls_and_bounds_the_ring(self, tmp_path: Path) -> None:
@@ -4784,28 +4785,68 @@ class TestDashboardModelRing:
         assert series[-2] == 3.0
 
 
+def sni_to(host: str, dst: str = "1.2.3.4") -> TlsSniEvent:
+    return TlsSniEvent(ts=TS, src="10.0.0.5", dst=dst, dport=443, sni=host)
+
+
+class TestEventFilter:
+    def test_default_passes_every_kind(self) -> None:
+        f = EventFilter()
+        assert all(f.matches(e) for e in sample_events())
+        assert f.is_unconstrained()
+        assert f.label() == "all"
+
+    def test_or_within_a_dimension(self) -> None:
+        f = EventFilter(kinds=frozenset({"dns_query", "tls_sni"}))
+        assert f.matches(q("x")) and f.matches(sni_to("github.com"))
+        assert not f.matches(
+            HttpEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=80, method="GET", path="/")
+        )
+
+    def test_and_across_dimensions(self) -> None:
+        # An internet-bound SNI is excluded by a LAN-only scope even though its kind passes.
+        f = EventFilter(kinds=frozenset({"tls_sni"}), scopes=frozenset({"lan"}))
+        assert not f.matches(sni_to("github.com", dst="93.184.216.34"))
+        assert f.matches(sni_to("nas.local", dst="192.168.1.9"))
+
+    def test_scope_now_reaches_kinds_that_never_carried_one(self) -> None:
+        # The whole point of the total projections: "show me only what left my network" must
+        # include the DNS query and the SNI, which ARE the disclosure — not just the flow.
+        f = EventFilter(scopes=frozenset({"internet"}))
+        assert f.matches(q("x", dst="8.8.8.8"))
+        assert not f.matches(q("x", dst="192.168.1.1"))
+
+    def test_an_empty_dimension_passes_nothing(self) -> None:
+        # "I ticked zero kinds" means zero kinds. Silently reinterpreting it as "all" would be
+        # the tool overruling the operator, and the empty feed is signposted instead.
+        f = EventFilter(kinds=frozenset())
+        assert not any(f.matches(e) for e in sample_events())
+        assert not f.is_unconstrained()
+
+    def test_host_substring_is_case_insensitive_and_empty_matches_all(self) -> None:
+        assert EventFilter(host="GITHUB").matches(sni_to("api.github.com"))
+        assert EventFilter(host="").matches(q("x"))
+
+    def test_label_names_what_is_hidden(self) -> None:
+        f = EventFilter(kinds=frozenset({"tls_sni"}), scopes=frozenset({"internet"}))
+        assert f.label() == "kind 1/12 · scope 1/6"
+
+
 class TestDashboardModelFilter:
     def test_no_filter_passes_all(self) -> None:
         m = DashboardModel()
         assert m.passes(q("x")) is True
 
-    def test_filter_matches_kind(self) -> None:
+    def test_filter_selects_kinds(self) -> None:
         m = DashboardModel()
-        m.filter = "tls"
-        sni = TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="github.com")
-        assert m.passes(sni) is True
+        m.filter = EventFilter(kinds=frozenset({"tls_sni"}))
+        assert m.passes(sni_to("github.com")) is True
         assert m.passes(q("x")) is False
-
-    def test_filter_matches_host_substring(self) -> None:
-        m = DashboardModel()
-        m.filter = "github"
-        sni = TlsSniEvent(ts=TS, src="10.0.0.5", dst="1.2.3.4", dport=443, sni="api.github.com")
-        assert m.passes(sni) is True
 
     def test_filter_never_drops_from_ring(self) -> None:
         m = DashboardModel(cap=100)
-        m.filter = "nomatch"
-        m.add_event(q("a"))  # filter is a view; ring keeps everything
+        m.filter = EventFilter(kinds=frozenset({"http"}))
+        m.add_event(q("a"))  # filter is a view; the ring keeps everything
         assert len(m.recent(1000)) == 1
 
 
@@ -5208,7 +5249,10 @@ def write_query_fixture(run_dir: Path) -> None:
             ts="2025-07-02T10:00:04.000+00:00",
             proto="tcp",
             direction="inbound",
-            scope="local",
+            # "lan", not "local": remote_scope(192.168.1.1) can only ever return "lan", so a
+            # recorded scope of "local" was a value no real run could produce. `local` is a
+            # DIRECTION. The old free-string --scope hid the lie; the closed vocabulary does not.
+            scope="lan",
             birth="observed",
             local_ip="192.168.1.50",
             local_port=50000,
@@ -5297,14 +5341,40 @@ class TestNetmonQuery:
         assert {r["kind"] for r in rows} == {"dns_query", "tls_sni", "flow"}
         assert len(rows) == 3
 
-    def test_scope_filter_selects_matching_flows(
+    def test_scope_matches_every_kind_not_just_flows(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # Was: flows only, because the predicate read FlowEvent.scope with getattr. "What left
+        # my network" has to include the lookup that named the host and the SNI that announced
+        # it — those ARE the disclosure. The LAN flow to 192.168.1.1 is correctly excluded.
         run = tmp_path / "run-x"
         write_query_fixture(run)
         rows = query_lines(capsys, str(run), "--scope", "internet")
-        assert [r["kind"] for r in rows] == ["flow"]
-        assert rows[0]["scope"] == "internet"
+        assert {r["kind"] for r in rows} == {"dns_query", "tls_sni", "flow"}
+
+    def test_kind_is_repeatable(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--kind", "dns_query", "--kind", "tls_sni")
+        assert {r["kind"] for r in rows} == {"dns_query", "tls_sni"}
+
+    def test_direction_filter(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        rows = query_lines(capsys, str(run), "--kind", "flow", "--direction", "inbound")
+        assert [r["remote_ip"] for r in rows] == ["192.168.1.1"]
+
+    def test_local_is_rejected_as_a_scope_and_the_choices_are_shown(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `local` is a direction, not a scope. The old free-string flag accepted it silently
+        # and returned whatever happened to match; now the user is told, and told what is valid.
+        run = tmp_path / "run-x"
+        write_query_fixture(run)
+        with pytest.raises(SystemExit) as exc:
+            main(["query", str(run), "--scope", "local"])
+        assert exc.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
 
     def test_filters_compose_with_and_semantics(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -5324,7 +5394,7 @@ class TestNetmonQuery:
         # drop it for failing to re-validate a "required" field.
         run = tmp_path / "run-x"
         write_query_fixture(run)
-        rows = query_lines(capsys, str(run), "--scope", "local")
+        rows = query_lines(capsys, str(run), "--kind", "flow", "--scope", "lan")
         assert len(rows) == 1
         assert rows[0]["remote_ip"] == "192.168.1.1"
         assert "hostname" not in rows[0]  # stayed absent, did not resurrect as null

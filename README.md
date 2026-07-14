@@ -93,13 +93,16 @@ jq -r 'select(.kind=="dns_query") | .qname' logs/run-*/dns.jsonl | sort -u
 jq -r 'select(.scope=="internet") | .hostname // .remote_ip' logs/run-*/flows.jsonl | sort | uniq -c | sort -rn
 ```
 
-Or skip the `jq` plumbing with the built-in display filter — `netmon query` reads a run directory's JSONL and applies a filter by `--kind`, `--host` (a substring of the SNI / qname / hostname), and `--scope`, printing the matching records as one chronological stream across the per-kind files. It is read-only over what was already recorded — never a new capture:
+Or skip the `jq` plumbing with the built-in display filter — `netmon query` reads a run directory's JSONL and applies a filter by `--kind`, `--direction`, `--scope` (all repeatable) and `--host` (a substring of the SNI / qname / hostname), printing the matching records as one chronological stream across the per-kind files. It is read-only over what was already recorded — never a new capture:
 
 ```sh
 netmon query logs/run-20250702-100000                              # every event, in order
 netmon query logs/run-20250702-100000 --kind tls_sni --host example.com  # one site's TLS handshakes
-netmon query logs/run-20250702-100000 --scope internet             # only flows that left the LAN
+netmon query logs/run-20250702-100000 --scope internet             # everything that left the LAN
+netmon query logs/run-20250702-100000 --kind dns_query --kind tls_sni  # repeatable: either kind
 ```
+
+Repeat a flag to widen a dimension (`--kind a --kind b` = either); combine flags to narrow (kind **and** scope **and** host). `--scope` classifies the peer at the other end of *any* event, so `--scope internet` includes the DNS query that named the host and the SNI that announced it — not just the flow. The same three vocabularies drive the dashboard's filter, so what you learn here transfers there.
 
 Operations: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
