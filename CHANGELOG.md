@@ -18,7 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at all and sailed straight past it. The gate is now the **port**, not a layer that happens
   to be bound, and the name is decoded from first-level encoding ourselves for the opcodes
   scapy leaves as raw bytes. An NBNS request we cannot name is now counted under
-  `parse_failed.nbns` rather than vanishing into `no_disclosure`.
+  `parse_failed.nbns` rather than vanishing into `no_disclosure`. An all-NUL name (every
+  first-level nibble `A`) is empty, not a name made of NULs, and now reads as unreadable —
+  counted, not recorded as a `qname` that only looks present.
 
 - **A finding no longer claims this host said something a neighbour said.** mDNS and NBNS
   broadcasts from every device on the segment arrive at this NIC whether we asked for them or

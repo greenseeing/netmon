@@ -1983,8 +1983,10 @@ def decode_nbns_level1(raw: bytes) -> str:
             return ""
         decoded.append(((high - _NBNS_L1_BASE) << 4) | (low - _NBNS_L1_BASE))
     # The 16th byte is the suffix (0x1E = browser election, 0x00 = workstation): it
-    # types the name, it is not part of it.
-    return decoded[:15].decode("ascii", "replace").strip()
+    # types the name, it is not part of it. Normalise through the same trim the
+    # QUESTION_NAME path uses so an all-NUL name (every nibble 'A') reads as unreadable,
+    # not as a string of NULs that only looks present.
+    return decode_nbns_name(decoded[:15].decode("ascii", "replace"))
 
 
 def nbns_query_name(header: Any) -> str:

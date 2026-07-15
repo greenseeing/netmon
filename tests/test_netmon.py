@@ -5190,6 +5190,41 @@ class TestNbnsIsNeverMistakenForDns:
         assert not [e for e in events if isinstance(e, (NbnsEvent, DnsQueryEvent))]
         assert proc.nbns_parse_failures == 1
 
+    def test_an_all_nul_name_is_unreadable_not_a_nul_string(self) -> None:
+        # Every nibble 'A' (0x41) is in range but decodes to 16 NUL bytes: an EMPTY name,
+        # not a name made of NULs. It must be counted as unreadable like any other name we
+        # could not read, not recorded as a qname that only looks present.
+        proc = local_processor("192.168.11.22")
+        header = bytes(NBNSHeader(OPCODE=0x8, NM_FLAGS=0x11, QDCOUNT=1))
+        pkt = (
+            Ether()
+            / IP(src="192.168.11.22", dst="192.168.11.255")
+            / UDP(sport=137, dport=137)
+            / Raw(header + b"\x20" + b"A" * 32 + b"\x00")  # in-range nibbles, all decode to NUL
+        )
+        pkt = Ether(bytes(pkt))
+        pkt.time = PKT_TIME
+        events = proc.process(pkt)
+        assert not [e for e in events if isinstance(e, (NbnsEvent, DnsQueryEvent))]
+        assert proc.nbns_parse_failures == 1
+
+    def test_a_datagram_service_packet_on_138_names_nothing_and_counts_nothing(self) -> None:
+        # udp/138 is the NetBIOS DATAGRAM service — a different layout with no NBNSHeader.
+        # It is gated to the NBNS door so it can never reach the DNS parser, but it carries
+        # no name field this path reads, so it must emit nothing and count nothing.
+        proc = local_processor("192.168.11.22")
+        pkt = (
+            Ether()
+            / IP(src="192.168.11.22", dst="192.168.11.255")
+            / UDP(sport=138, dport=138)
+            / Raw(b"\x11\x02" + b"\x00" * 48)
+        )
+        pkt = Ether(bytes(pkt))
+        pkt.time = PKT_TIME
+        events = proc.process(pkt)
+        assert not [e for e in events if isinstance(e, (NbnsEvent, DnsQueryEvent))]
+        assert proc.nbns_parse_failures == 0
+
 
 class TestMidStreamHttpStaysVisible:
     def test_a_port_80_connection_joined_mid_stream_still_yields_a_finding(self) -> None:
