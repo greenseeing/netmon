@@ -29,7 +29,7 @@ sudo apt install git python3-venv libcap2-bin
 installs a `netmon` launcher, and optionally the systemd recorder):
 
 ```sh
-curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/greenseeing/netmon/main/install.sh
 less install.sh                          # read before running
 sudo bash install.sh                     # + --enable-service and/or --setcap
 ```

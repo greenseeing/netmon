@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **netmon now lives at [github.com/greenseeing/netmon](https://github.com/greenseeing/netmon).**
+  git.disroot.org put the Anubis anti-bot wall in front of its HTTP endpoints, and it
+  challenges git itself: `git pull` and `git clone` receive an HTML page instead of the git
+  protocol, which broke `netmon update` and fresh installs everywhere. Codeberg was the
+  obvious refuge and is ruled out by its July 2026 Terms of Use, which disallow projects
+  mostly written with generative-AI tools — and this project's commit trailers say exactly
+  that. The install one-liners and the installer's default clone URL now point at GitHub.
+  Existing installs re-point once with
+  `git -C /opt/netmon remote set-url origin https://github.com/greenseeing/netmon.git`.
+
 ### Fixed
 
 - **NBNS is no longer mistaken for DNS.** netmon recognises DNS *by shape, on any port* — and

@@ -30,7 +30,7 @@ needed for `--setcap`.
 Then one command — but read it before you run it (never pipe a script you haven't seen):
 
 ```sh
-curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/greenseeing/netmon/main/install.sh
 less install.sh                       # inspect
 sudo bash install.sh                  # add --enable-service and/or --setcap
 ```
@@ -48,7 +48,7 @@ If your Python is too old *and* you don't want the uv bootstrap, install one fir
 If you'd rather have a single command and accept the risk of running unreviewed code as root, the pipe form is equivalent to the three steps above:
 
 ```sh
-curl -fsSL https://git.disroot.org/afk/netmon/raw/branch/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/greenseeing/netmon/main/install.sh | sudo bash
 ```
 
 ## Run

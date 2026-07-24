@@ -2,7 +2,7 @@
 # netmon installer — clone, build an isolated venv, install a `netmon` launcher,
 # and (optionally) a hardened systemd recorder. Designed to be *read before run*:
 #
-#     curl -fsSLO https://git.disroot.org/afk/netmon/raw/branch/main/install.sh
+#     curl -fsSLO https://raw.githubusercontent.com/greenseeing/netmon/main/install.sh
 #     less install.sh          # inspect it — never pipe a script you haven't read
 #     sudo bash install.sh     # add --enable-service and/or --setcap as desired
 #
@@ -38,7 +38,7 @@ PY_MIN=3.13
 
 # NETMON_REPO/NETMON_REF let a fork (or a pre-merge branch test) override the source and
 # branch/tag; default to upstream main. Note `netmon update` always tracks origin main.
-REPO_HTTPS="${NETMON_REPO:-https://git.disroot.org/afk/netmon.git}"
+REPO_HTTPS="${NETMON_REPO:-https://github.com/greenseeing/netmon.git}"
 NETMON_REF="${NETMON_REF:-main}"
 NETMON_DIR="${NETMON_PREFIX:-/opt/netmon}"
 LAUNCHER="/usr/local/bin/netmon"
