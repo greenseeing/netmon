@@ -6,55 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
+## [0.1.0] - 2026-07-28
 
-- **netmon now lives at [github.com/greenseeing/netmon](https://github.com/greenseeing/netmon).**
-  git.disroot.org put the Anubis anti-bot wall in front of its HTTP endpoints, and it
-  challenges git itself: `git pull` and `git clone` receive an HTML page instead of the git
-  protocol, which broke `netmon update` and fresh installs everywhere. Codeberg was the
-  obvious refuge and is ruled out by its July 2026 Terms of Use, which disallow projects
-  mostly written with generative-AI tools — and this project's commit trailers say exactly
-  that. The install one-liners and the installer's default clone URL now point at GitHub.
-  Existing installs re-point once with
-  `git -C /opt/netmon remote set-url origin https://github.com/greenseeing/netmon.git`.
+Initial public release.
 
-### Fixed
+Passive network monitor that logs, as timestamped JSONL, what a host discloses on
+the wire:
 
-- **NBNS is no longer mistaken for DNS.** netmon recognises DNS *by shape, on any port* — and
-  NBNS carries the very same 12-byte header, so name-service traffic on udp/137 was decoding
-  as DNS. A real run turned 480 NetBIOS name broadcasts into "cleartext DNS lookups sent to
-  the resolver 192.168.11.255", which is a claim that cannot be true: a subnet broadcast
-  address is not a resolver, and the "name" it reported (`FHEPFCELEHFCEPFFFACACACACACACABO`)
-  was raw first-level NetBIOS encoding for `WORKGROUP<1E>`. The old check looked for scapy's
-  `NBNSQueryRequest`, which only covers opcode 0x0 — refresh and release have no bound layer
-  at all and sailed straight past it. The gate is now the **port**, not a layer that happens
-  to be bound, and the name is decoded from first-level encoding ourselves for the opcodes
-  scapy leaves as raw bytes. An NBNS request we cannot name is now counted under
-  `parse_failed.nbns` rather than vanishing into `no_disclosure`. An all-NUL name (every
-  first-level nibble `A`) is empty, not a name made of NULs, and now reads as unreadable —
-  counted, not recorded as a `qname` that only looks present.
-
-- **A finding no longer claims this host said something a neighbour said.** mDNS and NBNS
-  broadcasts from every device on the segment arrive at this NIC whether we asked for them or
-  not, and the LAN-name rules asserted "naming **this host** to the LAN" for all of them —
-  which one run cheerfully did three times over, for three *different* peer names. Client-kind
-  events now record `from_self` (was the source one of our own addresses?) and findings name
-  the actual discloser. Runs recorded before the field existed still audit correctly: they
-  cannot prove the packet was ours, so they no longer say it was.
-
-- **One cleartext HTTP connection, one finding.** A plaintext request was rated twice — once
-  as `cleartext-http` from the request itself, once as `plaintext-service` from its flow.
-  The flow is now rated only when netmon *could not* have seen the request: a connection
-  joined **mid-stream** has no request line left to read, so there the flow is the only
-  witness that a cleartext channel is open, and staying silent to avoid the double-count
-  would have hidden it entirely.
-
-- **NTP advice names NTS, not a port that does not exist.** Every non-STARTTLS service was
-  told to "prefer its TLS port". NTP has none. It now points at NTS (RFC 8915) and says which
-  daemons implement it; ftp and telnet get their own answers (sftp/ftps, ssh) instead of the
-  generic one.
+- **DNS** — queries and answers (A/AAAA/CNAME/…), HTTPS/SVCB records with
+  SvcParams, response outcomes (NXDOMAIN/NODATA/SERVFAIL/REFUSED), authority and
+  additional sections, EDNS Client Subnet, and DNS-over-TCP reassembly. Plaintext
+  DNS is recognised by message shape, not just port 53.
+- **TLS** — SNI and ALPN from the ClientHello of every HTTPS connection, over both
+  TCP and decrypted QUIC Initials (v1 and v2), with ECH cover-name flagging.
+- **HTTP** — plaintext method/path/Host/User-Agent, with captive-portal probe
+  tagging.
+- **Flows** — every connection with protocol, direction, endpoints, service guess,
+  reverse-mapped hostname, scope, and disclosure notes; pre-existing connections
+  are inventoried on first sight.
+- **LAN & non-IP** — LLMNR/NBNS, ICMPv6 Router Advertisements (RDNSS), and ARP.
+- **Coverage ledger** — every packet is accounted under exactly one fate, and each
+  bounded structure reports what it dropped, so the monitor is honest about its own
+  blind spots.
 
 ### Added
+
+- **Versioned releases.** `netmon --version` says which netmon you are running. A
+  `v*` tag publishes a GitHub release whose notes are that version's CHANGELOG
+  section (`scripts/release.sh` cuts one), CI runs the full test gate on every
+  push, `install.sh` installs the newest published release rather than whatever
+  `main` holds that day (an explicit `NETMON_REF` still wins), and `netmon update`
+  moves an existing install to the newest release — tracking `main` only while no
+  release exists.
 
 - **`audit` and `query` default to the newest run.** Both used to demand a run directory, so
   `netmon audit` on its own answered with an argparse usage error — which tells a first-time
@@ -130,125 +113,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   would have stalled for the modal's whole life. `escape` is bound on the bar rather than the
   app, so it closes the filter without also yanking a scrolled-back reader to the newest row.
 
-### Fixed
-
-- **The feed lost keyboard focus to an invisible widget.** Textual's default `AUTO_FOCUS`
-  claims the first focusable widget in the DOM, which became a `SelectionList` inside the
-  (hidden) filter bar — so `escape` opened the filter instead of following the feed, and the
-  arrow keys drove a bar nobody could see. Focus is now stated explicitly rather than left to
-  DOM order. Caught by driving the real app, not by a unit test.
-
-- **One filter, shared by the dashboard and `netmon query`.** There were two, agreeing on
-  nothing but `event_host()`: the feed cycled a single lowercase substring, and `query` had
-  its own flags and its own predicate. Both are now the same `EventFilter` over three closed
-  vocabularies — kind, direction, scope — with OR *within* a dimension and AND *across* them.
-  `--kind`, `--direction` and `--scope` are repeatable and validated against their vocabulary.
-
-### Changed
-
-- **`netmon query --scope` now classifies the peer of *any* event, not just a flow's.**
-  Previously the predicate read `FlowEvent.scope` with `getattr`, so `--scope internet`
-  silently matched flows alone — even though the DNS query that named the host and the SNI
-  that announced it *are* the disclosure you asked for. It now matches all three. **This is a
-  behaviour change**: expect more rows than before, and the right ones.
-- **`netmon query --scope local` is now rejected** with the list of valid scopes. `local` is a
-  *direction*, not a scope — `remote_scope()` can never return it. The old free-string flag
-  accepted it and quietly returned whatever happened to match. (The repo's own query fixture
-  had been recording a flow with `scope: "local"`, a value no real capture could produce; the
-  closed vocabulary surfaced the lie.)
-
-- **The installer no longer demands uv, and no longer reaches astral.sh by default.**
-  `install.sh` could only build a venv with uv, and could only get uv by piping an
-  unchecksummed script into a root shell — so the documented one-liner simply failed on a
-  host without the Astral toolchain. It now *picks* a builder: uv when it is already
-  present (that path is byte-for-byte what it was), otherwise the system `python3` plus
-  the hash-pinned `requirements.txt`, and it fetches uv only when the host has no Python
-  ≥ 3.13 at all — the one case where uv is the only thing that can *provide* an
-  interpreter. `--pip` refuses that fallback outright. When nothing works it now dies with
-  a message naming what it found on the host and both remedies, instead of a bare
-  `curl: command not found` or a `SyntaxError` three steps later.
-
-  Two details that are load-bearing rather than incidental. The pip venv is built with
-  `--copies`: a default venv's `bin/python3` resolves out to `/usr/bin/python3.x`, and
-  `maybe_setcap` rightly refuses to arm *that* — so without the copy the pip path would
-  have silently lost passwordless capture. And an interpreter is only accepted if it can
-  actually `import venv, ensurepip`, because Debian ships those separately: a host can
-  have a perfectly new Python that cannot seed a venv, and the failure otherwise surfaces
-  as an inscrutable `No module named pip` long after the decision that caused it.
-  `maybe_setcap` also swaps its `/usr/*` blocklist for a `$NETMON_DIR/*` allowlist — the
-  actual invariant is "the capability lands on a binary we own" — and now smoke-tests the
-  armed interpreter, revoking the grant rather than leaving a netmon that cannot start
-  (a file capability puts the loader into secure-execution mode, where an interpreter that
-  finds libpython via an `$ORIGIN` rpath stops working the moment it is armed).
-
-- **`netmon update` no longer demands uv.** It refused to run unless both `git` and
-  `uv` were on PATH, so a pip-built install would have been stranded forever on the
-  version it was installed at — which is why this lands before the installer grows a pip
-  path, not after. The builder is now read off the venv itself rather than a marker file
-  that would need keeping honest: `uv sync` never seeds pip into the venv it creates, so
-  a `pip` in `.venv/bin` is an authoritative "the pip path built this". Using the *same*
-  builder matters beyond tidiness — re-syncing a pip-built venv with uv would rebuild it
-  around a different interpreter and silently drop the `cap_net_raw` grant on the current
-  one, turning passwordless capture off with nothing said. The update plan is resolved
-  *before* the pull, so an install with no usable builder fails while it is still
-  consistent instead of being left pulled-but-unbuilt; the editable reinstall now runs
-  only when `pyproject.toml` actually moved, since otherwise every no-op update would
-  reach out to PyPI for the build backend — a real regression against `uv sync`'s no-op.
-  A diff that cannot be computed reinstalls anyway: a skipped rebuild is a silently stale
-  entry point, a redundant one merely costs time.
-
-- **netmon can be installed with nothing but Python and pip.** The install path
-  required uv, and got it by piping `astral.sh/uv/install.sh` into `sh` as root — a
-  step install.sh's own header calls an unchecksummed trust boundary. A user running
-  the documented one-liner on a machine without the Astral toolchain could not install
-  netmon at all. A generated `requirements.txt` is now checked in, exported from
-  `uv.lock` with the `tui` extra and full `--hash` pins, so
-  `pip install --require-hashes -r requirements.txt` gives the same integrity guarantee
-  `uv sync` does — which matters most to the person who declined the unchecked download
-  in the first place. The file is never hand-edited: `uv export` writes its own
-  invocation into the header, and `tests/test_packaging.py` reads that command back out
-  and re-runs it, so the artifact documents how it is made and the test executes that
-  documentation. There is no CI here, so every generated artifact gets a test that fails
-  when it drifts.
-
-### Fixed
-
-- **A junk SNI could be read out of encrypted bytes, and then crash the TUI.** An
-  overnight run emitted a `tls_sni` event for a DNS-over-TLS flow whose `sni` held
-  ~200 bytes of ciphertext, which then killed the dashboard with a `MarkupError`.
-  Three defects composed, each now closed independently:
-  - The `server_name` extension walk never read the `name_type` byte and bounded the
-    host name by the whole handshake message instead of the extension's own length, so
-    a coincidental `0x0000` extension in ciphertext yielded a 200-byte "SNI". The walk
-    now follows RFC 6066 §3 and is bounded by `elen`, exactly as `_parse_alpn` already
-    was, and every name passes a new `Hostname` value type — an allowlist grammar
-    (strict-ASCII, LDH + underscore, label ≤63, name ≤253) shared with certificate SAN
-    dNSNames. A name netmon cannot prove is a hostname is no longer a name. Validation
-    only: case and IP literals reach `tls.jsonl` as sent.
-  - A mid-stream TCP segment could false-anchor the reassembler, which then never gave
-    up on the flow — re-parsing a growing 64 KB buffer on every segment until FIN, and
-    squatting on the LRU budget that genuine pending ClientHellos need. The anchor gate
-    is now tri-state (`StreamStart`): a prefix too short to settle the question anchors
-    provisionally and is *confirmed* once the bytes arrive, so an evasive three-byte
-    first segment still anchors (the HTTP side gains the same resistance) while a
-    disconfirmed guess gives the flow back. `parse_client_hello` is likewise tri-state
-    (`Scan`): a stream that provably can never be a ClientHello is abandoned, not
-    buffered. The TLS record header is validated once, in one place, with a legacy-version
-    and 2^14 length bound.
-  - Wire text reached the terminal as *markup*, and — separately and more quietly — as
-    raw control bytes. Rich and Textual strip only BEL/BS/VT/FF/CR, so an `ESC` in an
-    HTTP path already drove the operator's cursor through the feed's DETAIL column, and
-    a `\n` in a User-Agent could forge a line in the detail pane and in the `y` clipboard
-    yank. Every wire-derived leaf now passes through `printable()` (control characters,
-    C1, and bidi/zero-width marks become one-cell Control Pictures — mapped, never
-    dropped, so the auditor still sees the byte was there), every panel is
-    `markup=False`, and a single `Text`-typed `_paint` funnel makes a raw `str` at a
-    panel a mypy error rather than an overnight crash. The JSONL record is unchanged:
-    JSON already escapes control bytes losslessly.
-- **Top-SNI counts no longer split on case.** `sni_names` keys on the case-folded name
-  (DNS is case-insensitive, RFC 4343); the event keeps the bytes as sent.
-
-### Added
 
 - **Operator-path test coverage** — the trust-critical CLI and capture paths a
   regression could silently break now have focused tests: `LiveCapture`'s
@@ -356,6 +220,83 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **netmon now lives at [github.com/greenseeing/netmon](https://github.com/greenseeing/netmon).**
+  git.disroot.org put the Anubis anti-bot wall in front of its HTTP endpoints, and it
+  challenges git itself: `git pull` and `git clone` receive an HTML page instead of the git
+  protocol, which broke `netmon update` and fresh installs everywhere. Codeberg was the
+  obvious refuge and is ruled out by its July 2026 Terms of Use, which disallow projects
+  mostly written with generative-AI tools — and this project's commit trailers say exactly
+  that. The install one-liners and the installer's default clone URL now point at GitHub.
+  Existing installs re-point once with
+  `git -C /opt/netmon remote set-url origin https://github.com/greenseeing/netmon.git`.
+
+
+- **`netmon query --scope` now classifies the peer of *any* event, not just a flow's.**
+  Previously the predicate read `FlowEvent.scope` with `getattr`, so `--scope internet`
+  silently matched flows alone — even though the DNS query that named the host and the SNI
+  that announced it *are* the disclosure you asked for. It now matches all three. **This is a
+  behaviour change**: expect more rows than before, and the right ones.
+- **`netmon query --scope local` is now rejected** with the list of valid scopes. `local` is a
+  *direction*, not a scope — `remote_scope()` can never return it. The old free-string flag
+  accepted it and quietly returned whatever happened to match. (The repo's own query fixture
+  had been recording a flow with `scope: "local"`, a value no real capture could produce; the
+  closed vocabulary surfaced the lie.)
+
+- **The installer no longer demands uv, and no longer reaches astral.sh by default.**
+  `install.sh` could only build a venv with uv, and could only get uv by piping an
+  unchecksummed script into a root shell — so the documented one-liner simply failed on a
+  host without the Astral toolchain. It now *picks* a builder: uv when it is already
+  present (that path is byte-for-byte what it was), otherwise the system `python3` plus
+  the hash-pinned `requirements.txt`, and it fetches uv only when the host has no Python
+  ≥ 3.13 at all — the one case where uv is the only thing that can *provide* an
+  interpreter. `--pip` refuses that fallback outright. When nothing works it now dies with
+  a message naming what it found on the host and both remedies, instead of a bare
+  `curl: command not found` or a `SyntaxError` three steps later.
+
+  Two details that are load-bearing rather than incidental. The pip venv is built with
+  `--copies`: a default venv's `bin/python3` resolves out to `/usr/bin/python3.x`, and
+  `maybe_setcap` rightly refuses to arm *that* — so without the copy the pip path would
+  have silently lost passwordless capture. And an interpreter is only accepted if it can
+  actually `import venv, ensurepip`, because Debian ships those separately: a host can
+  have a perfectly new Python that cannot seed a venv, and the failure otherwise surfaces
+  as an inscrutable `No module named pip` long after the decision that caused it.
+  `maybe_setcap` also swaps its `/usr/*` blocklist for a `$NETMON_DIR/*` allowlist — the
+  actual invariant is "the capability lands on a binary we own" — and now smoke-tests the
+  armed interpreter, revoking the grant rather than leaving a netmon that cannot start
+  (a file capability puts the loader into secure-execution mode, where an interpreter that
+  finds libpython via an `$ORIGIN` rpath stops working the moment it is armed).
+
+- **`netmon update` no longer demands uv.** It refused to run unless both `git` and
+  `uv` were on PATH, so a pip-built install would have been stranded forever on the
+  version it was installed at — which is why this lands before the installer grows a pip
+  path, not after. The builder is now read off the venv itself rather than a marker file
+  that would need keeping honest: `uv sync` never seeds pip into the venv it creates, so
+  a `pip` in `.venv/bin` is an authoritative "the pip path built this". Using the *same*
+  builder matters beyond tidiness — re-syncing a pip-built venv with uv would rebuild it
+  around a different interpreter and silently drop the `cap_net_raw` grant on the current
+  one, turning passwordless capture off with nothing said. The update plan is resolved
+  *before* the pull, so an install with no usable builder fails while it is still
+  consistent instead of being left pulled-but-unbuilt; the editable reinstall now runs
+  only when `pyproject.toml` actually moved, since otherwise every no-op update would
+  reach out to PyPI for the build backend — a real regression against `uv sync`'s no-op.
+  A diff that cannot be computed reinstalls anyway: a skipped rebuild is a silently stale
+  entry point, a redundant one merely costs time.
+
+- **netmon can be installed with nothing but Python and pip.** The install path
+  required uv, and got it by piping `astral.sh/uv/install.sh` into `sh` as root — a
+  step install.sh's own header calls an unchecksummed trust boundary. A user running
+  the documented one-liner on a machine without the Astral toolchain could not install
+  netmon at all. A generated `requirements.txt` is now checked in, exported from
+  `uv.lock` with the `tui` extra and full `--hash` pins, so
+  `pip install --require-hashes -r requirements.txt` gives the same integrity guarantee
+  `uv sync` does — which matters most to the person who declined the unchecked download
+  in the first place. The file is never hand-edited: `uv export` writes its own
+  invocation into the header, and `tests/test_packaging.py` reads that command back out
+  and re-runs it, so the artifact documents how it is made and the test executes that
+  documentation. There is no CI here, so every generated artifact gets a test that fails
+  when it drifts.
+
+
 - **`netmon run` is ephemeral unless `--log`.** Persisting your DNS/TLS/HTTP
   history to disk is now an explicit opt-in for the new `run` subcommand — bare
   `netmon run` writes nothing. The legacy `python netmon.py`/`--tui` form still
@@ -374,6 +315,90 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and need no Textual installed.
 
 ### Fixed
+
+- **NBNS is no longer mistaken for DNS.** netmon recognises DNS *by shape, on any port* — and
+  NBNS carries the very same 12-byte header, so name-service traffic on udp/137 was decoding
+  as DNS. A real run turned 480 NetBIOS name broadcasts into "cleartext DNS lookups sent to
+  the resolver 192.168.11.255", which is a claim that cannot be true: a subnet broadcast
+  address is not a resolver, and the "name" it reported (`FHEPFCELEHFCEPFFFACACACACACACABO`)
+  was raw first-level NetBIOS encoding for `WORKGROUP<1E>`. The old check looked for scapy's
+  `NBNSQueryRequest`, which only covers opcode 0x0 — refresh and release have no bound layer
+  at all and sailed straight past it. The gate is now the **port**, not a layer that happens
+  to be bound, and the name is decoded from first-level encoding ourselves for the opcodes
+  scapy leaves as raw bytes. An NBNS request we cannot name is now counted under
+  `parse_failed.nbns` rather than vanishing into `no_disclosure`. An all-NUL name (every
+  first-level nibble `A`) is empty, not a name made of NULs, and now reads as unreadable —
+  counted, not recorded as a `qname` that only looks present.
+
+- **A finding no longer claims this host said something a neighbour said.** mDNS and NBNS
+  broadcasts from every device on the segment arrive at this NIC whether we asked for them or
+  not, and the LAN-name rules asserted "naming **this host** to the LAN" for all of them —
+  which one run cheerfully did three times over, for three *different* peer names. Client-kind
+  events now record `from_self` (was the source one of our own addresses?) and findings name
+  the actual discloser. Runs recorded before the field existed still audit correctly: they
+  cannot prove the packet was ours, so they no longer say it was.
+
+- **One cleartext HTTP connection, one finding.** A plaintext request was rated twice — once
+  as `cleartext-http` from the request itself, once as `plaintext-service` from its flow.
+  The flow is now rated only when netmon *could not* have seen the request: a connection
+  joined **mid-stream** has no request line left to read, so there the flow is the only
+  witness that a cleartext channel is open, and staying silent to avoid the double-count
+  would have hidden it entirely.
+
+- **NTP advice names NTS, not a port that does not exist.** Every non-STARTTLS service was
+  told to "prefer its TLS port". NTP has none. It now points at NTS (RFC 8915) and says which
+  daemons implement it; ftp and telnet get their own answers (sftp/ftps, ssh) instead of the
+  generic one.
+
+
+- **The feed lost keyboard focus to an invisible widget.** Textual's default `AUTO_FOCUS`
+  claims the first focusable widget in the DOM, which became a `SelectionList` inside the
+  (hidden) filter bar — so `escape` opened the filter instead of following the feed, and the
+  arrow keys drove a bar nobody could see. Focus is now stated explicitly rather than left to
+  DOM order. Caught by driving the real app, not by a unit test.
+
+- **One filter, shared by the dashboard and `netmon query`.** There were two, agreeing on
+  nothing but `event_host()`: the feed cycled a single lowercase substring, and `query` had
+  its own flags and its own predicate. Both are now the same `EventFilter` over three closed
+  vocabularies — kind, direction, scope — with OR *within* a dimension and AND *across* them.
+  `--kind`, `--direction` and `--scope` are repeatable and validated against their vocabulary.
+
+
+- **A junk SNI could be read out of encrypted bytes, and then crash the TUI.** An
+  overnight run emitted a `tls_sni` event for a DNS-over-TLS flow whose `sni` held
+  ~200 bytes of ciphertext, which then killed the dashboard with a `MarkupError`.
+  Three defects composed, each now closed independently:
+  - The `server_name` extension walk never read the `name_type` byte and bounded the
+    host name by the whole handshake message instead of the extension's own length, so
+    a coincidental `0x0000` extension in ciphertext yielded a 200-byte "SNI". The walk
+    now follows RFC 6066 §3 and is bounded by `elen`, exactly as `_parse_alpn` already
+    was, and every name passes a new `Hostname` value type — an allowlist grammar
+    (strict-ASCII, LDH + underscore, label ≤63, name ≤253) shared with certificate SAN
+    dNSNames. A name netmon cannot prove is a hostname is no longer a name. Validation
+    only: case and IP literals reach `tls.jsonl` as sent.
+  - A mid-stream TCP segment could false-anchor the reassembler, which then never gave
+    up on the flow — re-parsing a growing 64 KB buffer on every segment until FIN, and
+    squatting on the LRU budget that genuine pending ClientHellos need. The anchor gate
+    is now tri-state (`StreamStart`): a prefix too short to settle the question anchors
+    provisionally and is *confirmed* once the bytes arrive, so an evasive three-byte
+    first segment still anchors (the HTTP side gains the same resistance) while a
+    disconfirmed guess gives the flow back. `parse_client_hello` is likewise tri-state
+    (`Scan`): a stream that provably can never be a ClientHello is abandoned, not
+    buffered. The TLS record header is validated once, in one place, with a legacy-version
+    and 2^14 length bound.
+  - Wire text reached the terminal as *markup*, and — separately and more quietly — as
+    raw control bytes. Rich and Textual strip only BEL/BS/VT/FF/CR, so an `ESC` in an
+    HTTP path already drove the operator's cursor through the feed's DETAIL column, and
+    a `\n` in a User-Agent could forge a line in the detail pane and in the `y` clipboard
+    yank. Every wire-derived leaf now passes through `printable()` (control characters,
+    C1, and bidi/zero-width marks become one-cell Control Pictures — mapped, never
+    dropped, so the auditor still sees the byte was there), every panel is
+    `markup=False`, and a single `Text`-typed `_paint` funnel makes a raw `str` at a
+    panel a mypy error rather than an overnight crash. The JSONL record is unchanged:
+    JSON already escapes control bytes losslessly.
+- **Top-SNI counts no longer split on case.** `sni_names` keys on the case-folded name
+  (DNS is case-insensitive, RFC 4343); the event keeps the bytes as sent.
+
 
 - **Shutdown no longer silently loses the last packets.** A packet handed over by
   the sniffer thread while shutdown blocked in `join()` scheduled its enqueue too
@@ -512,23 +537,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   packet can no longer stop monitoring. DNS/LLMNR question parsing was
   additionally hardened to never mistake a resource record for a question.
 
-## [0.1.0] – Initial public release
-
-Passive network monitor that logs, as timestamped JSONL, what a host discloses on
-the wire:
-
-- **DNS** — queries and answers (A/AAAA/CNAME/…), HTTPS/SVCB records with
-  SvcParams, response outcomes (NXDOMAIN/NODATA/SERVFAIL/REFUSED), authority and
-  additional sections, EDNS Client Subnet, and DNS-over-TCP reassembly. Plaintext
-  DNS is recognised by message shape, not just port 53.
-- **TLS** — SNI and ALPN from the ClientHello of every HTTPS connection, over both
-  TCP and decrypted QUIC Initials (v1 and v2), with ECH cover-name flagging.
-- **HTTP** — plaintext method/path/Host/User-Agent, with captive-portal probe
-  tagging.
-- **Flows** — every connection with protocol, direction, endpoints, service guess,
-  reverse-mapped hostname, scope, and disclosure notes; pre-existing connections
-  are inventoried on first sight.
-- **LAN & non-IP** — LLMNR/NBNS, ICMPv6 Router Advertisements (RDNSS), and ARP.
-- **Coverage ledger** — every packet is accounted under exactly one fate, and each
-  bounded structure reports what it dropped, so the monitor is honest about its own
-  blind spots.
+[Unreleased]: https://github.com/greenseeing/netmon/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/greenseeing/netmon/releases/tag/v0.1.0

@@ -27,8 +27,9 @@
 #     `curl https://astral.sh/uv/install.sh | sh` bootstrap — as root, with no checksum — is
 #     now the LAST resort, taken only when the host has no Python new enough to run netmon,
 #     since only uv can then provide one. `--pip` refuses it outright.
-#   * `netmon update` runs `git pull` + a rebuild as root, so whoever controls the git repo
-#     or its pinned dependency tree can reach root on every host that updates.
+#   * `netmon update` moves the checkout to the newest release tag + rebuilds as root, so
+#     whoever can tag the git repo or control its pinned dependency tree can reach root on
+#     every host that updates.
 set -euo pipefail
 
 # Must equal requires-python in pyproject.toml — tests/test_packaging.py asserts it. netmon
@@ -37,8 +38,87 @@ set -euo pipefail
 PY_MIN=3.13
 
 # NETMON_REPO/NETMON_REF let a fork (or a pre-merge branch test) override the source and
-# branch/tag; default to upstream main. Note `netmon update` always tracks origin main.
+# branch/tag. By default the newest published release is installed, falling back to main
+# when none exists or the API is unreachable; `netmon update` later resolves the same fact
+# via `git ls-remote` and moves the checkout to it.
 REPO_HTTPS="${NETMON_REPO:-https://github.com/greenseeing/netmon.git}"
+API="https://api.github.com/repos/greenseeing/netmon"
+
+# First string value of key $2 in the JSON $1. Fails when the key is absent.
+# Pure-builtin scrape so this curl-piped script needs nothing on PATH but a
+# shell, git, and curl.
+_scrape() {
+  key="\"$2\""         # quoted separately: a bare $2 would match as a glob
+  case "$1" in
+    *"$key"*) ;;
+    *) return 1 ;;
+  esac
+  v="${1#*"$key"}"     # drop up to the first occurrence of the key
+  v="${v#*:}"          # drop up to the colon
+  v="${v#*\"}"         # drop up to the opening quote of the value
+  v="${v%%\"*}"        # keep up to the closing quote
+  printf '%s' "$v"
+}
+
+# Strict allowlist before the ref is ever spliced into root-run git commands:
+# v?X.Y.Z, exactly three segments of digits. This rejects every shell
+# metacharacter, and it rejects a pre-release suffix — the tags API has no
+# notion of "prerelease", so an -rc tag is merely the newest tag and would
+# otherwise be served to every user as the latest version. Anything else falls
+# back to the no-ref main path rather than being re-parsed as shell.
+#
+# scripts/release.sh applies the same rule to the version it cuts, and
+# netmon.py's `_release_version` to the tags `netmon update` moves to; the
+# three are pinned together by tests/test_packaging.py.
+_valid_ref() {
+  bare="${1#v}"
+  [ "${#bare}" -le 32 ] || return 1
+  case "$bare" in
+    *[!0-9.]*) return 1 ;;   # digits and dots alone
+    .* | *.)   return 1 ;;   # no leading or trailing dot
+    *..*)      return 1 ;;   # no empty segment
+    *.*.*.*)   return 1 ;;   # no fourth segment
+    *.*.*)     return 0 ;;   # exactly three
+    *)         return 1 ;;
+  esac
+}
+
+resolve_ref() {
+  command -v curl >/dev/null 2>&1 || return 0
+
+  # GitHub defines /releases/latest as the most recent non-prerelease,
+  # non-draft release, so it cannot hand back a draft or an rc. `tag_name`
+  # precedes the free-text `body` in the payload, so the first match is the
+  # real key and release notes cannot forge an earlier one.
+  if body="$(curl -fsSL "$API/releases/latest" 2>/dev/null)"; then
+    if ref="$(_scrape "$body" tag_name)" && _valid_ref "$ref"; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  fi
+
+  # No release object published yet: fall back to the tags array. GitHub
+  # returns it newest-first in practice — and that ordering is observed, not a
+  # documented API guarantee. Correct only while every release tags a fresh
+  # HEAD, which is why this is the fallback.
+  if body="$(curl -fsSL "$API/tags" 2>/dev/null)"; then
+    if ref="$(_scrape "$body" name)" && _valid_ref "$ref"; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  fi
+  return 0
+}
+
+if [ -n "${NETMON_REF:-}" ]; then
+  # An explicit ref always wins, valid or not — it is the fork/branch escape hatch.
+  :
+elif [ -n "${NETMON_REPO:-}" ]; then
+  # A fork's releases are not upstream's; never resolve one against the other's API.
+  NETMON_REF=main
+else
+  NETMON_REF="$(resolve_ref)"
+fi
 NETMON_REF="${NETMON_REF:-main}"
 NETMON_DIR="${NETMON_PREFIX:-/opt/netmon}"
 LAUNCHER="/usr/local/bin/netmon"
@@ -412,7 +492,7 @@ do_install() {
 netmon installed.
   netmon run              live TUI (ephemeral)
   netmon run --log        live TUI + persist the JSONL record
-  netmon update           pull latest + re-sync, restart the service if running
+  netmon update           move to the newest release + re-sync, restart the service if running
   netmon service status   background recorder (systemctl passthrough)
 
 The background recorder unit is installed but not enabled.

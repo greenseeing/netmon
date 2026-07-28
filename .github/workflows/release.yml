@@ -1,0 +1,36 @@
+# On a v* tag: publish a GitHub release object for that tag.
+#
+# There is no artifact to build — netmon installs from source at the tag — so
+# the release carries no files. It exists to give install.sh an authoritative
+# "latest" (GitHub's /releases/latest excludes drafts and prereleases, which a
+# bare tag list cannot) and to give the CHANGELOG links somewhere to resolve.
+#
+# install.sh falls back to the tags API when no release object exists, so a
+# failure here degrades to the old behaviour rather than breaking installs.
+#
+# No one-time setup: the workflow's own token may write releases via
+# `permissions` below. Actions reads this workflow from the tagged commit,
+# not from main.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: notes
+        run: sh scripts/changelog-notes.sh "$GITHUB_REF_NAME" > release-notes.md
+      - name: publish
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: release-notes.md
+          # Explicit: a release left drafted serves nothing — /releases/latest
+          # excludes drafts, so install.sh and the updater would 404.
+          draft: false

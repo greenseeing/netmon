@@ -1,0 +1,26 @@
+# Correctness gate: the same three commands CONTRIBUTING.md names as the local
+# gate, on every push and pull request.
+#
+# Deliberately never runs on tags. Releasing must not depend on this passing,
+# and .github/workflows/release.yml owns the tag event.
+#
+# The tests decode crafted packets with scapy in-process — no capture
+# privileges, libpcap, or network access needed.
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: python:3.13-slim
+    steps:
+      - uses: actions/checkout@v7
+      - run: pip install --no-cache-dir uv
+      - run: uv sync --dev --extra tui
+      - run: uv run pytest -q
+      - run: uv run ruff check .
+      - run: uv run mypy netmon.py netmon_tui.py

@@ -103,3 +103,99 @@ class TestDeclaredFloorIsReal:
             requires = tomllib.load(f)["project"]["requires-python"]
         floor = tuple(int(p) for p in requires.removeprefix(">=").strip().split("."))
         assert sys.version_info[: len(floor)] >= floor
+
+
+RELEASE_SH = ROOT / "scripts" / "release.sh"
+NOTES_SH = ROOT / "scripts" / "changelog-notes.sh"
+CHANGELOG = ROOT / "CHANGELOG.md"
+
+# install.sh refuses to *install* a ref it does not recognise; release.sh must
+# refuse to *cut* one, and netmon.py's updater must refuse to *move* to one. The
+# three validators live in separate files and two separate languages (install.sh
+# is curl-piped and cannot source anything), so pin them to the same answer — a
+# version one accepts and another rejects either ships a tag that silently
+# serves `main` to fresh installs, or moves updates to a release installs never
+# get.
+NOT_A_VERSION = [
+    "0.3.0-rc1",  # prerelease
+    "1.2",  # only two segments
+    "1.2.3.4",  # four segments
+    "1.2.3.",  # trailing dot
+    "0..0",  # empty segment
+    "..",  # empty segments
+    "1.2.3;id",  # shell metacharacter
+    "1.2.3 && id",  # shell metacharacter
+    "$(id)",  # shell injection
+    "1.2.3|sh",  # pipe
+    "1" * 30 + ".2.3",  # over the 32-char cap
+]
+A_VERSION = ["0.1.0", "10.20.30"]
+
+
+def _install_sh_verdict(candidate: str) -> bool:
+    text = INSTALLER.read_text(encoding="utf-8")
+    match = re.search(r"^_valid_ref\(\) \{\n.*?^\}", text, re.MULTILINE | re.DOTALL)
+    assert match, "install.sh has no _valid_ref"
+    # The candidate travels as an argument, never interpolated: half this list is
+    # shell injection, and quoting it into the script would test the quoting.
+    done = subprocess.run(
+        ["bash", "-c", match.group(0) + '\n_valid_ref "$1"', "_", candidate],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done.returncode == 0
+
+
+class TestVersionValidatorLockstep:
+    @pytest.mark.parametrize("candidate", NOT_A_VERSION)
+    def test_install_sh_and_the_updater_refuse_the_same_junk(self, candidate: str) -> None:
+        import netmon
+
+        assert not _install_sh_verdict(candidate)
+        assert netmon._release_version(candidate) is None
+        assert netmon._release_version("v" + candidate) is None
+
+    @pytest.mark.parametrize("candidate", A_VERSION)
+    def test_install_sh_and_the_updater_accept_the_same_releases(self, candidate: str) -> None:
+        import netmon
+
+        assert _install_sh_verdict(candidate)
+        assert _install_sh_verdict("v" + candidate)
+        assert netmon._release_version(candidate) is not None
+        assert netmon._release_version("v" + candidate) is not None
+
+    @pytest.mark.parametrize("version", NOT_A_VERSION)
+    def test_release_sh_refuses_every_version_install_sh_would(
+        self, version: str, tmp_path: Path
+    ) -> None:
+        # cwd is an empty tmp dir, and the version guard runs before anything
+        # that touches git or the working tree, so nothing can be mutated here.
+        done = subprocess.run(
+            ["sh", str(RELEASE_SH), version],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode != 0, done.stdout
+        assert "version must look like" in done.stderr, done.stderr
+
+
+class TestReleaseNotes:
+    def test_the_running_version_has_an_extractable_changelog_section(self) -> None:
+        # What release.sh guards at cut time, enforced continuously: the version
+        # netmon reports must have a CHANGELOG section the tag workflow can turn
+        # into release notes. An en-dash or a missing date in the heading breaks
+        # the extraction, so this also pins the heading format.
+        import netmon
+
+        done = subprocess.run(
+            ["sh", str(NOTES_SH), f"v{netmon.__version__}", str(CHANGELOG)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip(), "empty release notes"

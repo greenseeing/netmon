@@ -1634,6 +1634,76 @@ class TestCmdUpdate:
         assert cmd_update([]) == 0
         assert "already up to date (aaa1111)" in capsys.readouterr().out
 
+    def _release_run(
+        self, listing: str, head: str, revisions: list[str], calls: list[list[str]]
+    ) -> Any:
+        shorts = iter(revisions)
+
+        def fake_run(argv: list[str], **kw: Any) -> Any:
+            calls.append(argv)
+            if "ls-remote" in argv:
+                return _completed(argv, 0, out=listing)
+            if "--short" in argv:
+                return _completed(argv, 0, out=next(shorts) + "\n")
+            if argv[-2:] == ["rev-parse", "HEAD"]:
+                return _completed(argv, 0, out=head + "\n")
+            if "--porcelain" in argv:
+                return _completed(argv, 0, out="")
+            return _completed(argv, 0, out="true")
+
+        return fake_run
+
+    def test_updates_to_the_newest_release_tag_not_the_newest_string(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # v0.10.0 beats v0.2.0 only under numeric comparison; an -rc tag and a
+        # non-version tag must never be "the latest release" at all.
+        monkeypatch.setattr(shutil, "which", self._which(systemctl=False))
+        listing = (
+            "cafe01\trefs/tags/v0.3.0-rc1\n"
+            "cafe02\trefs/tags/v0.2.0\n"
+            "cafe03\trefs/tags/docs-pre-migration\n"
+            "cafe04\trefs/tags/v0.10.0\n"
+        )
+        calls: list[list[str]] = []
+        fake_run = self._release_run(listing, "ffffff", ["aaa1111", "bbb2222"], calls)
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        joined = [" ".join(c) for c in calls]
+        fetch = "fetch --depth 1 origin refs/tags/v0.10.0:refs/tags/v0.10.0"
+        assert any(fetch in c for c in joined)
+        assert any("checkout --detach v0.10.0" in c for c in joined)
+        assert not any("pull" in c for c in calls)
+        assert "netmon updated aaa1111 -> bbb2222, v0.10.0" in capsys.readouterr().out
+
+    def test_already_at_the_newest_release_fetches_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", self._which(systemctl=False))
+        calls: list[list[str]] = []
+        fake_run = self._release_run(
+            "cafe02\trefs/tags/v0.2.0\n", "cafe02", ["aaa1111", "aaa1111"], calls
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        assert not any("fetch" in c or "checkout" in c or "pull" in c for c in calls)
+        assert "already up to date (aaa1111, v0.2.0)" in capsys.readouterr().out
+
+    def test_falls_back_to_main_when_no_release_tag_exists(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A fork with no releases, or the window before the first cut: the old
+        # pull-main behaviour, so the install is never stranded.
+        monkeypatch.setattr(shutil, "which", self._which(systemctl=False))
+        calls: list[list[str]] = []
+        fake_run = self._release_run(
+            "cafe01\trefs/tags/v0.3.0-rc1\n", "ffffff", ["aaa1111", "bbb2222"], calls
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert cmd_update([]) == 0
+        assert any(" ".join(c).endswith("pull --ff-only origin main") for c in calls)
+        assert "netmon updated aaa1111 -> bbb2222" in capsys.readouterr().out
+
 
 class TestCmdService:
     def test_unknown_action_prints_usage_and_exits_2(
@@ -5720,6 +5790,16 @@ class TestRunTuiMode:
 
 
 class TestCliDispatch:
+    def test_version_prints_the_one_authority_and_exits_zero(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import netmon
+
+        with pytest.raises(SystemExit) as exc:
+            main(["--version"])
+        assert exc.value.code == 0
+        assert capsys.readouterr().out == f"netmon {netmon.__version__}\n"
+
     def test_run_defaults_to_tui_and_ephemeral(self) -> None:
         args = _parse_run_args([])
         assert args.tui is True

@@ -65,6 +65,11 @@ from scapy.utils import PcapReader, PcapWriter
 
 log = structlog.get_logger()
 
+# The one authority for the version: hatchling reads it for package metadata
+# ([tool.hatch.version] in pyproject.toml), scripts/release.sh bumps it, --version
+# prints it. Nothing else may carry a version string.
+__version__ = "0.1.0"
+
 SERVICE_BY_PORT: dict[tuple[str, int], str] = {
     ("tcp", 21): "ftp",
     ("tcp", 22): "ssh",
@@ -3900,8 +3905,45 @@ def _pyproject_moved(
     return diff.returncode != 0 or "pyproject.toml" in diff.stdout.split()
 
 
+def _release_version(tag: str) -> tuple[int, ...] | None:
+    # install.sh's _valid_ref, in Python: an optional leading v, then exactly three
+    # all-digit dot-separated segments, 32 chars at most. The two validators cannot
+    # share code (install.sh is curl-piped and sources nothing), so
+    # tests/test_packaging.py pins them to the same verdicts — a tag one accepts and
+    # the other refuses would move updates to a release fresh installs never get.
+    bare = tag.removeprefix("v")
+    if len(bare) > 32:
+        return None
+    parts = bare.split(".")
+    if len(parts) != 3 or not all(p.isascii() and p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def _latest_release(
+    git_: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[str, str] | None:
+    # The newest release tag on the remote and its object id, or None when there is
+    # none. ls-remote asks the remote directly, so a shallow checkout need not fetch
+    # every tag to learn the answer. install.sh resolves the same fact from the
+    # releases API at install time; the shared vX.Y.Z allowlist is what keeps an
+    # -rc or hand-made tag from ever being "the latest release" on either path.
+    ls = git_("ls-remote", "--tags", "--refs", "origin")
+    if ls.returncode != 0:
+        return None
+    best: tuple[tuple[int, ...], str, str] | None = None
+    for line in ls.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        tag = ref.strip().removeprefix("refs/tags/")
+        version = _release_version(tag)
+        if version is not None and (best is None or version > best[0]):
+            best = (version, tag, sha.strip())
+    return None if best is None else (best[1], best[2])
+
+
 def cmd_update(argv: list[str]) -> int:
-    # git pull + rebuild this checkout. No raw socket, so no privileges needed for the git and
+    # Move this checkout to the newest release tag (or main while none exists) and
+    # rebuild. No raw socket, so no privileges needed for the git and
     # build work itself (restarting the service does need root — see below).
     dir_ = _install_dir()
     git = shutil.which("git")
@@ -3934,10 +3976,27 @@ def cmd_update(argv: list[str]) -> int:
         )
         return 1
     old = git_("rev-parse", "--short", "HEAD").stdout.strip()
-    pull = git_("pull", "--ff-only", "origin", "main")
-    if pull.returncode != 0:
-        print(pull.stderr.strip() or "git pull failed", file=sys.stderr)
-        return 1
+    release = _latest_release(git_)
+    if release is None:
+        # No release tag on the remote — a fork, or the window before the first cut.
+        # Tracking main is the old behaviour, and it beats stranding the install.
+        pull = git_("pull", "--ff-only", "origin", "main")
+        if pull.returncode != 0:
+            print(pull.stderr.strip() or "git pull failed", file=sys.stderr)
+            return 1
+    else:
+        tag, sha = release
+        if git_("rev-parse", "HEAD").stdout.strip() != sha:
+            fetched = git_("fetch", "--depth", "1", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
+            if fetched.returncode != 0:
+                print(fetched.stderr.strip() or "git fetch failed", file=sys.stderr)
+                return 1
+            # --detach: a release is a point, not a branch. `checkout -B <tag>` would
+            # create a branch shadowing the tag and confuse every later resolution.
+            checkout = git_("checkout", "--detach", tag)
+            if checkout.returncode != 0:
+                print(checkout.stderr.strip() or "git checkout failed", file=sys.stderr)
+                return 1
     new = git_("rev-parse", "--short", "HEAD").stdout.strip()
     sync = subprocess.run(plan.deps, cwd=dir_, text=True, check=False)
     if sync.returncode != 0:
@@ -3958,7 +4017,8 @@ def cmd_update(argv: list[str]) -> int:
     ):
         subprocess.run([systemctl, "restart", "netmon.service"], check=False)
         print("restarted netmon.service")
-    print(f"netmon updated {old} -> {new}" if old != new else f"already up to date ({new})")
+    at = new if release is None else f"{new}, {release[0]}"
+    print(f"netmon updated {old} -> {at}" if old != new else f"already up to date ({at})")
     return 0
 
 
@@ -4209,6 +4269,9 @@ def _parse_run_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "--version":
+        print(f"netmon {__version__}")
+        sys.exit(0)
     if argv and argv[0] == "update":
         sys.exit(cmd_update(argv[1:]))
     if argv and argv[0] == "service":

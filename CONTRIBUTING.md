@@ -50,7 +50,20 @@ export and compares.
   headless tool runs with no Textual installed. UI-only code and its dependency
   belong in `netmon_tui.py` behind the `tui` optional extra.
 - Every generated artifact gets a test that fails when it drifts from its source.
-  There is no CI here — `uv run pytest -q` *is* the gate.
+  CI (`.github/workflows/test.yml`) runs the same three commands on every push —
+  it confirms the gate, it is not a substitute for running it.
+
+## Cutting a release (maintainers)
+
+Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, then:
+
+```sh
+scripts/release.sh X.Y.Z
+```
+
+It bumps `__version__` in `netmon.py`, commits, tags `vX.Y.Z`, and pushes; the
+tag workflow publishes a GitHub release whose notes are that CHANGELOG section.
+`install.sh` and `netmon update` resolve the newest release from there.
 
 ## Licensing of contributions
 

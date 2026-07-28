@@ -1,10 +1,11 @@
 [project]
 name = "netmon"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Passive network monitor: DNS, TLS SNI, HTTP hosts, and connection flows with timestamped JSONL logging"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
+authors = [{ name = "greenseer" }]
 dependencies = [
     "scapy>=2.6.1",
     "pydantic>=2.11",
@@ -15,12 +16,21 @@ dependencies = [
 [project.optional-dependencies]
 tui = ["textual>=0.80"]
 
+[project.urls]
+Homepage = "https://github.com/greenseeing/netmon"
+Repository = "https://github.com/greenseeing/netmon"
+
 [project.scripts]
 netmon = "netmon:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Single source of truth for the version: __version__ in netmon.py.
+# scripts/release.sh bumps only that line; package metadata is read from it.
+[tool.hatch.version]
+path = "netmon.py"
 
 [tool.hatch.build.targets.wheel]
 # hatchling auto-detects netmon.py from the script name but misses the sibling
