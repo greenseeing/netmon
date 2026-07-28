@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Every capped structure reports what it holds and what it dropped, at its
+  interface.** The reassemblers gained `tracks`/`held`/`holdings`/`len` so their
+  memory-bounding contract is observable without reaching into `_flows` and
+  `_total` (the tests now read the same surface the coverage summary does), and
+  the three historical drop-counter names (`evicted`, `flushed`, `cleared`) —
+  which `summary.json` already reported as one "evicted" block — became one:
+  `dropped`. Capped structures register with the coverage ledger at construction,
+  so `summary.json`'s evicted block composes itself; the old hand-kept inventory
+  would silently omit any structure it forgot. `summary.json` is unchanged.
+
 - **`audit` and `query` read runs through one module.** Resolving the run the
   operator meant, deciding what counts as a run directory, reading rotation
   archives back, and turning the record into events were four functions with two

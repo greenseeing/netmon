@@ -692,11 +692,11 @@ class TestSplitClientHelloReassembly:
         proc = local_processor("192.168.1.50")
         key = ("192.168.1.50", 51000, "93.184.216.34", 443)
         proc.process(tcp_segment(b"\x16\x03\x01", flags="A", seq=BASE_SEQ))
-        assert key in proc.reassembler._flows
+        assert proc.reassembler.tracks(key)
         events = proc.process(tcp_segment(b"\x00\x2e\x02" + b"\x00" * 64, seq=BASE_SEQ + 3))
         assert [e for e in events if isinstance(e, TlsSniEvent)] == []
-        assert key not in proc.reassembler._flows
-        assert proc.reassembler._total == 0
+        assert not proc.reassembler.tracks(key)
+        assert proc.reassembler.holdings() == 0
 
     def test_fin_drops_buffer_so_late_segment_is_not_reassembled(self) -> None:
         proc = local_processor("192.168.1.50")
@@ -710,25 +710,82 @@ class TestSplitClientHelloReassembly:
         assert [e for e in events if isinstance(e, TlsSniEvent)] == []
 
 
+class TestBoundedSurface:
+    # The memory-bounding contract is observable at the interface: what a capped
+    # structure currently holds, and what it has given up. Tests and the coverage
+    # summary read the same surface — nothing reaches for _flows or _total.
+
+    def test_a_reassembler_says_what_it_holds_and_for_whom(self) -> None:
+        r = TcpReassembler(per_flow_cap=10, total_cap=1000)
+        key = ("a", 1, "b", 2)
+        r.add(key, 0, CH_RECORD_HEADER + b"\x00" * 50)
+        assert r.tracks(key)
+        assert r.held(key) == 10  # the per-flow cap clipped the buffer
+        assert r.holdings() == r.held(key)
+        assert len(r) == 1
+
+    def test_pre_anchor_pending_bytes_are_holdings_too(self) -> None:
+        # The pending pool is real memory the structure is answerable for, even
+        # though no stream has anchored yet.
+        r = TcpReassembler(pending_cap=4096)
+        r.add(("a", 1, "b", 2), 0, b"\x17\x03\x03 rejected, held pending")
+        assert r.holdings() > 0
+        assert len(r) == 0
+
+    def test_every_capped_structure_reports_drops_under_one_name(self) -> None:
+        # The coverage summary already reports evicted/flushed/cleared as a single
+        # block; one concept, one word.
+        capped = [
+            LruSet(cap=1),
+            NameLedger(cap=1),
+            BoundedCounter(cap=2),
+            FindingLedger(cap=1),
+            TcpReassembler(),
+            DnsTcpReassembler(),
+            QuicReassembler(),
+        ]
+        assert [c.dropped for c in capped] == [0] * len(capped)
+
+    def test_coverage_composes_the_drop_ledger_not_a_hand_kept_list(self) -> None:
+        proc = local_processor("192.168.1.50")
+        block = proc.summary()["coverage"]["evicted"]
+        assert set(block) == {
+            "names",
+            "flows",
+            "arp",
+            "router_ads",
+            "name_queries",
+            "dns_names",
+            "sni_names",
+            "internet_hosts",
+            "findings",
+            "tcp_streams",
+            "cert_streams",
+            "dns_tcp_streams",
+            "quic_streams",
+        }
+        assert all(v == 0 for v in block.values())
+
+
 class TestTcpReassembler:
     def test_untracked_when_first_bytes_are_neither_tls_nor_http(self) -> None:
         r = TcpReassembler()
         key = ("192.168.1.50", 51000, "93.184.216.34", 443)
         assert r.add(key, 0, b"\x17\x03\x03 encrypted app data") == b""
-        assert key not in r._flows
+        assert not r.tracks(key)
 
     def test_serverhello_direction_is_not_tracked(self) -> None:
         r = TcpReassembler()
         key = ("93.184.216.34", 443, "192.168.1.50", 51000)
         # A TLS record whose handshake type is ServerHello (0x02), not 0x01.
         assert r.add(key, 0, b"\x16\x03\x03\x00\x00\x02" + b"\x00" * 4000) == b""
-        assert key not in r._flows
+        assert not r.tracks(key)
 
     def test_per_flow_cap_bounds_a_single_buffer(self) -> None:
         r = TcpReassembler(per_flow_cap=10, total_cap=1000)
         key = ("a", 1, "b", 2)
         r.add(key, 0, CH_RECORD_HEADER + b"\x00" * 50)
-        assert r._flows[key].size == 10
+        assert r.held(key) == 10
 
     def test_total_cap_evicts_oldest_keeps_newest(self) -> None:
         # Over the byte cap evicts the least-recently-updated stream, not every one:
@@ -737,15 +794,15 @@ class TestTcpReassembler:
         old, new = ("a", 1, "b", 2), ("c", 3, "d", 4)
         r.add(old, 0, CH_RECORD_HEADER + b"\x00" * 19)  # 25 bytes
         r.add(new, 0, CH_RECORD_HEADER + b"\x00" * 19)  # total 50 > 30 -> evict oldest
-        assert old not in r._flows
-        assert new in r._flows
-        assert r._total == r._flows[new].size
+        assert not r.tracks(old)
+        assert r.tracks(new)
+        assert r.holdings() == r.held(new)
 
     def test_eviction_counts_only_the_streams_evicted(self) -> None:
         r = TcpReassembler(per_flow_cap=25, total_cap=40)
         r.add(("a", 1, "b", 2), 0, CH_RECORD_HEADER + b"\x00" * 19)
         r.add(("c", 3, "d", 4), 0, CH_RECORD_HEADER + b"\x00" * 19)
-        assert r.cleared == 1  # only the oldest, not a full wipe
+        assert r.dropped == 1  # only the oldest, not a full wipe
 
     def test_recently_updated_stream_survives_a_burst(self) -> None:
         # A stream refreshed just before a burst of new ones survives while an older
@@ -756,17 +813,17 @@ class TestTcpReassembler:
         r.add(idle, 0, CH_RECORD_HEADER + b"\x00" * 19)  # 25, total 50
         r.add(hot, 25, b"\xaa" * 10)  # refresh hot -> most recent; total 60
         r.add(burst, 0, CH_RECORD_HEADER + b"\x00" * 19)  # total 85 > 60 -> evict oldest (idle)
-        assert idle not in r._flows
-        assert hot in r._flows
-        assert burst in r._flows
+        assert not r.tracks(idle)
+        assert r.tracks(hot)
+        assert r.tracks(burst)
 
     def test_drop_removes_buffer_and_reclaims_total(self) -> None:
         r = TcpReassembler()
         key = ("a", 1, "b", 2)
         r.add(key, 0, CH_RECORD_HEADER + b"\x00" * 9)
         r.drop(key)
-        assert key not in r._flows
-        assert r._total == 0
+        assert not r.tracks(key)
+        assert r.holdings() == 0
 
     def test_the_give_up_bound_is_the_buffer_it_gives_up_on(self) -> None:
         # parse_client_hello calls a hello bigger than MAX_CLIENT_HELLO unassemblable. If
@@ -781,7 +838,7 @@ class TestTcpReassembler:
         r = TcpReassembler()
         key = ("a", 1, "b", 2)
         assert r.add(key, 0, b"\x16\x03\x03\xff\xff\x01" + b"\x00" * 64) == b""
-        assert key not in r._flows
+        assert not r.tracks(key)
 
     def test_short_ambiguous_prefix_anchors_provisionally(self) -> None:
         r = TcpReassembler()
@@ -794,8 +851,8 @@ class TestTcpReassembler:
         key = ("a", 1, "b", 2)
         r.add(key, 0, b"\x16\x03")
         assert r.add(key, 2, b"\x03\x00\x2e\x02") == b""  # settles as a ServerHello
-        assert key not in r._flows
-        assert r._total == 0
+        assert not r.tracks(key)
+        assert r.holdings() == 0
 
 
 class TestTcpReassemblerOverlapAndReorder:
@@ -845,7 +902,7 @@ class TestTcpReassemblerOverlapAndReorder:
         for i in range(1000):
             key = ("10.0.0.1", 1024 + i, "93.184.216.34", 443)
             r.add(key, 0, b"\x17\x03\x03 not a client hello" + bytes([i % 256]) * 200)
-        assert r._pending_total <= 4096
+        assert r.holdings() <= 4096
 
     def test_fin_drops_pending_so_late_anchor_finds_nothing(self) -> None:
         # A RST/FIN before the anchor arrives discards the buffered pre-anchor bytes,
@@ -880,7 +937,7 @@ class TestTcpReassemblerOverlapAndReorder:
         r = TcpReassembler()
         server_key = ("93.184.216.34", 443, "192.168.1.50", 51000)
         assert r.add(server_key, 0, b"\x16\x03\x03\x00\x00\x02" + b"\x00" * 4000) == b""
-        assert server_key not in r._flows
+        assert not r.tracks(server_key)
 
 
 DOT_RESOLVER = "149.112.112.11"
@@ -945,8 +1002,10 @@ class TestCiphertextFalseAnchor:
         # reassembler's LRU budget, which can evict genuinely pending ClientHellos.
         proc = local_processor(DOT_CLIENT)
         feed_dot(proc, false_anchor_ciphertext())
-        assert DOT_KEY not in proc.reassembler._flows
-        assert proc.reassembler._total == 0
+        assert not proc.reassembler.tracks(DOT_KEY)
+        # No anchored stream survives; rejected bytes may sit in the byte-bounded
+        # pending pool awaiting an anchor, which is its job, not a leak.
+        assert len(proc.reassembler) == 0
 
     def test_ciphertext_never_emits_an_sni_event(self) -> None:
         proc = local_processor(DOT_CLIENT)
@@ -1175,8 +1234,8 @@ class TestTls12CertificateSan:
         proc = local_processor("192.168.1.50")
         hello = pq_client_hello(b"guard.example.com")
         proc.process(tcp_segment(hello[:800], flags="A", seq=BASE_SEQ))
-        assert not proc.certs._pending
-        assert not proc.certs._flows
+        assert proc.certs.holdings() == 0
+        assert len(proc.certs) == 0
 
 
 def _flow_events(proc: PacketProcessor, n: int, base_port: int = 40000) -> list[Event]:
@@ -2183,10 +2242,10 @@ class TestQuicSniExtraction:
         dcids = [bytes([i]) + b"\x00" * 7 for i in range(5)]
         for dcid in dcids:
             assert r.add(encrypt_initial(dcid, partial)) is None  # never completes
-        assert len(r._crypto) <= 3
-        assert dcids[-1] in r._crypto  # newest survives
-        assert dcids[0] not in r._crypto  # oldest evicted
-        assert r.cleared == 2  # 5 fed, 3 kept -> 2 evicted, not a full wipe
+        assert len(r) <= 3
+        assert r.tracks(dcids[-1])  # newest survives
+        assert not r.tracks(dcids[0])  # oldest evicted
+        assert r.dropped == 2  # 5 fed, 3 kept -> 2 evicted, not a full wipe
 
     def test_flood_spares_the_recently_active_multi_initial(self) -> None:
         # A post-quantum ClientHello spans two Initials. A concurrent flood must not
@@ -2201,7 +2260,7 @@ class TestQuicSniExtraction:
         r.add(encrypt_initial(j1, crypto_frame(b"\x00" * 50)))  # older junk
         assert r.add(encrypt_initial(legit, crypto_frame(msg[:mid], offset=0), pn=0)) is None
         r.add(encrypt_initial(j2, crypto_frame(b"\x00" * 50)))  # breach: evicts oldest (j1)
-        assert legit in r._crypto  # the recently-active connection was spared
+        assert r.tracks(legit)  # the recently-active connection was spared
         hello = r.add(encrypt_initial(legit, crypto_frame(msg[mid:], offset=mid), pn=1))
         assert hello is not None
         assert hello.sni == "legit.example.com"
@@ -2679,7 +2738,7 @@ class TestLruSet:
         s: LruSet[str] = LruSet(cap=2)
         for k in ("a", "b", "c", "d"):
             s.add(k)
-        assert s.evicted == 2
+        assert s.dropped == 2
 
 
 class TestNameLedger:
@@ -2704,14 +2763,14 @@ class TestNameLedger:
         ledger.observe("1.2.3.4", "a.example.com")
         ledger.observe("1.2.3.4", "b.example.com")
         assert len(ledger) == 1
-        assert ledger.evicted == 0
+        assert ledger.dropped == 0
 
     def test_reobserve_at_capacity_does_not_evict(self) -> None:
         ledger = NameLedger(cap=2)
         ledger.observe("1.1.1.1", "a")
         ledger.observe("2.2.2.2", "b")
         ledger.observe("1.1.1.1", "a2")  # re-observe while full: no drift, no eviction
-        assert ledger.evicted == 0
+        assert ledger.dropped == 0
         assert len(ledger) == 2
         assert ledger.lookup("1.1.1.1") == "a2"
         assert ledger.lookup("2.2.2.2") == "b"
@@ -2768,7 +2827,7 @@ class TestNameLedger:
         ledger = NameLedger(cap=2)
         for i in range(5):
             ledger.observe(f"10.0.0.{i}", f"h{i}.example.com")
-        assert ledger.evicted == 3
+        assert ledger.dropped == 3
 
 
 class TestBoundedCounter:
@@ -2803,7 +2862,7 @@ class TestBoundedCounter:
         c = BoundedCounter(cap=10, keep=5)
         for i in range(11):
             c.add(f"k{i}")
-        assert c.flushed == 6
+        assert c.dropped == 6
 
 
 class TestBoundedProcessorMemory:
@@ -4618,7 +4677,7 @@ class TestDnsTcpReassembler:
         for _ in range(200):  # ~20 KB, all emitted, none of it should be retained
             r.add(key, seq, msg)
             seq += len(msg)
-        assert r._total < 2 * len(msg)  # only the (empty) tail is held, not cumulative
+        assert r.holdings() < 2 * len(msg)  # only the (empty) tail is held, not cumulative
 
     def test_partial_trailing_message_retained_after_earlier_emit(self) -> None:
         # Compacting away a completed message must not disturb the in-flight partial
@@ -4672,10 +4731,10 @@ class TestDnsTcpReassembler:
         old, new = ("a", 1, "b", 2), ("c", 3, "d", 4)
         r.add(old, 0, a[:20])
         r.add(new, 0, a[:25])  # total 45 > 40 -> evict the oldest, keep the newest
-        assert old not in r._flows
-        assert new in r._flows
-        assert r.cleared == 1
-        assert r._total == r._flows[new].size
+        assert not r.tracks(old)
+        assert r.tracks(new)
+        assert r.dropped == 1
+        assert r.holdings() == r.held(new)
 
     def test_process_reassembles_tcp_dns_answer_across_segments(self) -> None:
         proc = local_processor("192.168.1.50")
@@ -4712,8 +4771,11 @@ class TestDnsTcpReassembler:
         assert answers[0].value == "1.2.3.4"
 
     def test_dns_tcp_eviction_surfaces_in_coverage(self) -> None:
-        proc = local_processor("192.168.1.50")
-        proc.dns_tcp = DnsTcpReassembler(per_flow_cap=30, total_cap=40)
+        # Injection over attribute-swap: the drop ledger registers the instance that
+        # runs, so a swapped-in attribute would vanish from coverage accounting.
+        proc = PacketProcessor(
+            frozenset({"192.168.1.50"}), dns_tcp=DnsTcpReassembler(per_flow_cap=30, total_cap=40)
+        )
         proc.dns_tcp.add(("a", 1, "b", 2), 0, (b"\x00\x30" + b"\x00" * 20))
         proc.dns_tcp.add(("c", 3, "d", 4), 0, (b"\x00\x30" + b"\x00" * 25))
         assert proc.summary()["coverage"]["evicted"]["dns_tcp_streams"] == 1
@@ -5604,7 +5666,7 @@ class TestFindingLedger:
         for i in range(50):
             ledger.add(self._finding(f"noise{i}", Severity.LOW))
         assert len(ledger) == 10
-        assert ledger.evicted == 41
+        assert ledger.dropped == 41
         assert "keepme" in {f.subject for f, _ in ledger.top(10)}
 
 

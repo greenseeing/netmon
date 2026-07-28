@@ -881,7 +881,7 @@ class FindingLedger:
     # burying everything else.
     def __init__(self, cap: int = 500) -> None:
         self.cap = cap
-        self.evicted = 0
+        self.dropped = 0
         self._counts: dict[tuple[str, str], int] = {}
         self._findings: dict[tuple[str, str], Finding] = {}
 
@@ -898,7 +898,7 @@ class FindingLedger:
             )
             del self._counts[victim]
             del self._findings[victim]
-            self.evicted += 1
+            self.dropped += 1
         return first
 
     def top(self, n: int) -> list[tuple[Finding, int]]:
@@ -937,7 +937,7 @@ class FindingLedger:
                 }
                 for f, c in self.top(top)
             ],
-            "evicted": self.evicted,
+            "evicted": self.dropped,
         }
 
     def __len__(self) -> int:
@@ -1745,7 +1745,7 @@ def _evict_oldest[K, S](
     # was attacker-triggerable via publicly-derivable Initial keys). The most-recently-
     # touched stream — the one being processed — is at the tail and always kept: eviction
     # pops from the front and stops at the last entry. Returns the new total and the
-    # number evicted, which the caller folds into its `cleared` coverage counter.
+    # number evicted, which the caller folds into its `dropped` coverage counter.
     evicted = 0
     while len(streams) > 1 and (
         total > total_cap or (max_items is not None and len(streams) > max_items)
@@ -1772,10 +1772,19 @@ class QuicReassembler:
         self.max_conns = max_conns
         self.per_conn_cap = per_conn_cap
         self.total_cap = total_cap
-        self.cleared = 0
+        self.dropped = 0
         self.decrypt_failures = 0
         self._crypto: OrderedDict[bytes, dict[int, bytes]] = OrderedDict()
         self._total = 0
+
+    def tracks(self, dcid: bytes) -> bool:
+        return dcid in self._crypto
+
+    def holdings(self) -> int:
+        return self._total
+
+    def __len__(self) -> int:
+        return len(self._crypto)
 
     def add(self, datagram: bytes) -> TlsClientHello | None:
         off = 0
@@ -1817,7 +1826,7 @@ class QuicReassembler:
         self._total, evicted = _evict_oldest(
             self._crypto, self._total, self.total_cap, _crypto_size, self.max_conns
         )
-        self.cleared += evicted
+        self.dropped += evicted
         return hello
 
 
@@ -2175,7 +2184,7 @@ class TcpReassembler:
         self.total_cap = total_cap
         self.pending_cap = pending_cap
         self.start = start
-        self.cleared = 0
+        self.dropped = 0
         self._flows: OrderedDict[FlowKey, _Stream] = OrderedDict()
         self._total = 0
         # Segments seen before their flow's opening ClientHello/HTTP segment: a capture
@@ -2188,6 +2197,18 @@ class TcpReassembler:
 
     def tracks(self, key: FlowKey) -> bool:
         return key in self._flows
+
+    def held(self, key: FlowKey) -> int:
+        stream = self._flows.get(key)
+        return 0 if stream is None else stream.size
+
+    def holdings(self) -> int:
+        # Every byte this structure is answerable for: anchored streams plus the
+        # pre-anchor pending pool. The memory-bounding contract, as one number.
+        return self._total + self._pending_total
+
+    def __len__(self) -> int:
+        return len(self._flows)
 
     def add(self, key: FlowKey, seq: int, payload: bytes) -> bytes:
         stream = self._flows.get(key)
@@ -2218,7 +2239,7 @@ class TcpReassembler:
             stream.confirmed = opening is StreamStart.OPENS
         self._flows.move_to_end(key)  # this stream is the one being processed
         self._total, evicted = _evict_oldest(self._flows, self._total, self.total_cap, _stream_size)
-        self.cleared += evicted
+        self.dropped += evicted
         return merged
 
     def _store(self, stream: _Stream, seq: int, payload: bytes) -> None:
@@ -2288,12 +2309,22 @@ class DnsTcpReassembler:
         assert total_cap >= per_flow_cap, "total_cap must hold at least one per-flow buffer"
         self.per_flow_cap = per_flow_cap
         self.total_cap = total_cap
-        self.cleared = 0
+        self.dropped = 0
         self._flows: OrderedDict[FlowKey, _DnsStream] = OrderedDict()
         self._total = 0
 
     def tracks(self, key: FlowKey) -> bool:
         return key in self._flows
+
+    def held(self, key: FlowKey) -> int:
+        stream = self._flows.get(key)
+        return 0 if stream is None else stream.size
+
+    def holdings(self) -> int:
+        return self._total
+
+    def __len__(self) -> int:
+        return len(self._flows)
 
     def add(self, key: FlowKey, seq: int, payload: bytes) -> list[bytes]:
         stream = self._flows.get(key)
@@ -2312,7 +2343,7 @@ class DnsTcpReassembler:
             self._total, evicted = _evict_oldest(
                 self._flows, self._total, self.total_cap, _stream_size
             )
-            self.cleared += evicted
+            self.dropped += evicted
         assembled = _reassemble(stream.chunks)
         messages, consumed = self._complete_messages(assembled)
         if consumed:
@@ -2359,13 +2390,20 @@ class DnsTcpReassembler:
             self._total -= stream.size
 
 
+class Bounded(Protocol):
+    # What every capped structure owes the coverage ledger: how many entries it
+    # gave up under its cap. One concept, one word — the summary reports the
+    # whole family as a single "evicted" block, whatever each class once called it.
+    dropped: int
+
+
 class LruSet[K]:
     # Bounded membership with LRU eviction: re-seeing a key refreshes it, so
     # hot keys survive the cap while idle ones age out — unlike the previous
     # clear-at-cap, which forgot everything at once and re-emitted known flows.
     def __init__(self, cap: int) -> None:
         self.cap = cap
-        self.evicted = 0
+        self.dropped = 0
         self._entries: OrderedDict[K, None] = OrderedDict()
 
     def add(self, key: K) -> bool:
@@ -2375,7 +2413,7 @@ class LruSet[K]:
         self._entries[key] = None
         if len(self._entries) > self.cap:
             self._entries.popitem(last=False)
-            self.evicted += 1
+            self.dropped += 1
         return True
 
     def __len__(self) -> int:
@@ -2391,7 +2429,7 @@ class NameLedger:
     # authoritative per-connection SNI lives in tls.jsonl.
     def __init__(self, cap: int) -> None:
         self.cap = cap
-        self.evicted = 0
+        self.dropped = 0
         self._names: OrderedDict[str, str] = OrderedDict()
 
     def observe(self, ip: str, name: str) -> None:
@@ -2402,7 +2440,7 @@ class NameLedger:
         self._names[ip] = name
         if len(self._names) > self.cap:
             self._names.popitem(last=False)
-            self.evicted += 1
+            self.dropped += 1
 
     def observe_if_absent(self, ip: str, name: str) -> None:
         # A weak/placeholder name (e.g. an RA's RDNSS marker) only fills a gap: it
@@ -2431,7 +2469,7 @@ class BoundedCounter:
         self.cap = cap
         self.keep = keep if keep is not None else max(30, cap // 10)
         self.distinct_estimate = 0
-        self.flushed = 0
+        self.dropped = 0
         self._counts: Counter[str] = Counter()
 
     def add(self, key: str) -> None:
@@ -2440,7 +2478,7 @@ class BoundedCounter:
         self._counts[key] += 1
         if len(self._counts) > self.cap:
             kept = dict(self._counts.most_common(self.keep))
-            self.flushed += len(self._counts) - len(kept)
+            self.dropped += len(self._counts) - len(kept)
             self._counts = Counter(kept)
 
     def most_common(self, n: int) -> list[tuple[str, int]]:
@@ -2551,29 +2589,44 @@ class PacketProcessor:
         flow_cap: int = 200_000,
         discovery_cap: int = 65_536,
         finding_cap: int = 500,
+        dns_tcp: DnsTcpReassembler | None = None,
     ) -> None:
         self.redact_query = redact_query
         self.local_ips = local_ips
-        self.reassembler = TcpReassembler()
-        self.certs = TcpReassembler(start=_server_stream_start)
-        self.dns_tcp = DnsTcpReassembler()
-        self.quic = QuicReassembler()
-        self.names = NameLedger(name_cap)
-        self.seen_flows: LruSet[FlowTuple] = LruSet(flow_cap)
-        self.arp_seen: LruSet[Any] = LruSet(discovery_cap)
-        self.ra_seen: LruSet[Any] = LruSet(discovery_cap)
-        self.name_query_seen: LruSet[Any] = LruSet(discovery_cap)
-        self.dns_names = BoundedCounter(counter_cap)
-        self.sni_names = BoundedCounter(counter_cap)
-        self.remote_hosts = BoundedCounter(counter_cap)
+        self._capped: dict[str, Bounded] = {}
+        self.reassembler = self._bounded("tcp_streams", TcpReassembler())
+        self.certs = self._bounded("cert_streams", TcpReassembler(start=_server_stream_start))
+        # Injected, not created, when a caller needs different caps: the drop ledger
+        # registers whatever instance will actually run, so a substitute stays counted.
+        # `is None`, never `or`: an empty reassembler is falsy (len 0) and `or` would
+        # silently discard the injected instance for a default one.
+        self.dns_tcp = self._bounded(
+            "dns_tcp_streams", DnsTcpReassembler() if dns_tcp is None else dns_tcp
+        )
+        self.quic = self._bounded("quic_streams", QuicReassembler())
+        self.names = self._bounded("names", NameLedger(name_cap))
+        self.seen_flows: LruSet[FlowTuple] = self._bounded("flows", LruSet(flow_cap))
+        self.arp_seen: LruSet[Any] = self._bounded("arp", LruSet(discovery_cap))
+        self.ra_seen: LruSet[Any] = self._bounded("router_ads", LruSet(discovery_cap))
+        self.name_query_seen: LruSet[Any] = self._bounded("name_queries", LruSet(discovery_cap))
+        self.dns_names = self._bounded("dns_names", BoundedCounter(counter_cap))
+        self.sni_names = self._bounded("sni_names", BoundedCounter(counter_cap))
+        self.remote_hosts = self._bounded("internet_hosts", BoundedCounter(counter_cap))
         self.event_counts: Counter[str] = Counter()
-        self.findings = FindingLedger(finding_cap)
+        self.findings = self._bounded("findings", FindingLedger(finding_cap))
         self.tls_sni_cleartext = 0
         self.tls_sni_ech = 0
         self.coverage = Coverage()
         self.dns_parse_failures = 0
         self.nbns_parse_failures = 0
         self._lo_recent: dict[int, float] = {}
+
+    def _bounded[B: Bounded](self, label: str, structure: B) -> B:
+        # Registration happens at construction, so a capped structure cannot exist
+        # without joining the coverage ledger's evicted block — the previous
+        # hand-kept inventory in _coverage() silently omitted anything it forgot.
+        self._capped[label] = structure
+        return structure
 
     def _is_loopback_duplicate(self, pkt: Packet, t: float) -> bool:
         # Linux delivers each loopback frame to raw sockets twice (TX and RX copy)
@@ -3104,21 +3157,7 @@ class PacketProcessor:
         return {
             "packets": self.coverage.packets,
             "fate": dict(self.coverage.fate),
-            "evicted": {
-                "names": self.names.evicted,
-                "flows": self.seen_flows.evicted,
-                "arp": self.arp_seen.evicted,
-                "router_ads": self.ra_seen.evicted,
-                "name_queries": self.name_query_seen.evicted,
-                "dns_names": self.dns_names.flushed,
-                "sni_names": self.sni_names.flushed,
-                "internet_hosts": self.remote_hosts.flushed,
-                "findings": self.findings.evicted,
-                "tcp_streams": self.reassembler.cleared,
-                "cert_streams": self.certs.cleared,
-                "dns_tcp_streams": self.dns_tcp.cleared,
-                "quic_streams": self.quic.cleared,
-            },
+            "evicted": {label: capped.dropped for label, capped in self._capped.items()},
             "parse_failed": {
                 "quic_initial": self.quic.decrypt_failures,
                 "dns": self.dns_parse_failures,
