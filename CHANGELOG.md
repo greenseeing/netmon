@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-29
+
 ### Changed
 
 - **A rated service's severity, note, and advice travel as one row.** Three
@@ -585,6 +587,7 @@ the wire:
   packet can no longer stop monitoring. DNS/LLMNR question parsing was
   additionally hardened to never mistake a resource record for a question.
 
-[Unreleased]: https://github.com/greenseeing/netmon/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/greenseeing/netmon/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/greenseeing/netmon/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/greenseeing/netmon/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/greenseeing/netmon/releases/tag/v0.1.0
