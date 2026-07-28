@@ -68,7 +68,7 @@ log = structlog.get_logger()
 # The one authority for the version: hatchling reads it for package metadata
 # ([tool.hatch.version] in pyproject.toml), scripts/release.sh bumps it, --version
 # prints it. Nothing else may carry a version string.
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 SERVICE_BY_PORT: dict[tuple[str, int], str] = {
     ("tcp", 21): "ftp",
