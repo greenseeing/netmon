@@ -23,7 +23,7 @@ import time
 from collections import Counter, OrderedDict
 from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
 from pathlib import Path
@@ -1229,12 +1229,16 @@ class DashboardModel:
     # here. The `filter` is a view: add_event never drops, so toggling a filter
     # re-reveals events already in the ring.
     def __init__(
-        self, cap: int = 1000, rate_window: int = 60, clock: Callable[[], float] = time.time
+        self,
+        cap: int = 1000,
+        rate_window: int = 60,
+        clock: Callable[[], float] = time.time,
+        filter: EventFilter | None = None,
     ) -> None:
         self.cap = cap
         self._clock = clock
         self.rate = RateBucketer(rate_window)
-        self.filter: EventFilter = EventFilter()
+        self._filter = EventFilter() if filter is None else filter
         self._recent: OrderedDict[str, Event] = OrderedDict()
         self._seq = 0
         self._added: list[tuple[str, Event]] = []
@@ -1269,8 +1273,28 @@ class DashboardModel:
     def rate_series(self) -> list[float]:
         return self.rate.series(self._clock())
 
+    @property
+    def filter(self) -> EventFilter:
+        # Readable — it is an immutable value — but never assignable: mutation goes
+        # through retune(), which is what keeps the unexpressed dimensions alive.
+        return self._filter
+
+    def retune(
+        self, kinds: frozenset[str], directions: frozenset[str], scopes: frozenset[str]
+    ) -> None:
+        # The checkbox bar can only express three of the filter's six dimensions;
+        # host and the leak dimensions survive a retune untouched — a view that
+        # rebuilt the whole filter from the bar silently wiped them.
+        self._filter = replace(self._filter, kinds=kinds, directions=directions, scopes=scopes)
+
+    def filter_note(self) -> str | None:
+        # None when nothing is hidden; else what to tell the operator. The border
+        # title and the empty-feed message both hang off this one question — a feed
+        # that is hiding events must never read as a quiet network.
+        return None if self._filter.is_unconstrained() else self._filter.label()
+
     def passes(self, event: Event) -> bool:
-        return self.filter.matches(event)
+        return self._filter.matches(event)
 
 
 EXT_SERVER_NAME = 0x0000
@@ -3647,15 +3671,11 @@ class Session:
     writer: Writer
     capture: Capture
     pcap_sink: PcapSink | None = None
-
-
-def persist_enabled(args: argparse.Namespace) -> bool:
-    # Single source of truth for "does this run write to the run dir". Privacy-relevant,
-    # so the JSONL writer, the TUI diagnostic log, and the pcap sink read it here rather
-    # than each re-deciding. Absent `log` means a programmatic caller (the tests) that
-    # wants files; the CLI sets it — `run` -> False (ephemeral), `run --log`/legacy -> True.
-    # `--pcap` writes raw evidence to disk, so it persists the run regardless of `--log`.
-    return getattr(args, "log", True) or bool(getattr(args, "pcap", False))
+    # The decisions build_session made, carried past the seam: nothing downstream —
+    # the dashboard included — reads the raw argparse.Namespace to re-derive them.
+    persist: bool = True  # does this run write to the run dir? Privacy-relevant.
+    replay: str | None = None  # the -r path when replaying; None means live capture
+    bpf: str | None = None
 
 
 def build_session(args: argparse.Namespace) -> Session:
@@ -3666,11 +3686,16 @@ def build_session(args: argparse.Namespace) -> Session:
     # would delete each archive the moment it is created.
     rotate_bytes = max(0, int(getattr(args, "rotate_mb", 0) or 0)) * 1_000_000
     rotate_keep = max(1, int(getattr(args, "rotate_keep", 10) or 10))
-    # persist_enabled() is True whenever --pcap is set, so the writer creates the run
-    # dir before the pcap sink opens capture.pcap inside it.
+    # The one place "does this run write to the run dir" is decided; Session.persist
+    # carries it. Absent `log` means a programmatic caller (the tests) that wants
+    # files; the CLI sets it — `run` -> False (ephemeral), `run --log`/legacy -> True.
+    # `--pcap` writes raw evidence to disk, so it persists the run regardless of
+    # `--log` — and the writer then creates the run dir before the pcap sink opens
+    # capture.pcap inside it.
+    persist = getattr(args, "log", True) or bool(getattr(args, "pcap", False))
     writer: Writer = (
         JsonlWriter(out_dir, rotate_bytes=rotate_bytes, rotate_keep=rotate_keep)
-        if persist_enabled(args)
+        if persist
         else NullWriter()
     )
     pcap_sink = (
@@ -3685,18 +3710,23 @@ def build_session(args: argparse.Namespace) -> Session:
         # scapy's iface=None means conf.iface (default route only), not all interfaces
         ifaces = [args.iface] if args.iface else [i.name for i in get_working_ifaces()]
         capture = LiveCapture(ifaces, args.bpf)
-    return Session(out_dir, processor, writer, capture, pcap_sink)
+    return Session(
+        out_dir, processor, writer, capture, pcap_sink,
+        persist=persist, replay=args.read, bpf=args.bpf,
+    )
 
 
-def announce_start(args: argparse.Namespace, session: Session) -> None:
+def announce_start(session: Session) -> None:
     evidence = str(session.pcap_sink.path) if session.pcap_sink is not None else None
-    if args.read:
-        log.info("replay_started", pcap=args.read, output=str(session.out_dir), evidence=evidence)
+    if session.replay:
+        log.info(
+            "replay_started", pcap=session.replay, output=str(session.out_dir), evidence=evidence
+        )
     elif isinstance(session.capture, LiveCapture):
         log.info(
             "capture_started",
             ifaces=session.capture.ifaces,
-            bpf=args.bpf,
+            bpf=session.bpf,
             output=str(session.out_dir),
             local_ips=sorted(session.processor.local_ips),
             evidence=evidence,
@@ -3793,7 +3823,7 @@ async def run(args: argparse.Namespace) -> None:
     session = build_session(args)
     tui = getattr(args, "tui", False)  # Namespace in tests may lack .tui — never bare-access
     if not tui:
-        announce_start(args, session)
+        announce_start(session)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, session.capture.stop)
@@ -3807,7 +3837,7 @@ async def run(args: argparse.Namespace) -> None:
         if tui:
             from netmon_tui import run_dashboard
 
-            await run_dashboard(session, args)
+            await run_dashboard(session)
         else:
             await consume(session, log_event if not args.quiet else (lambda _e: None))
     finally:

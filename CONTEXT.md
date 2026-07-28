@@ -14,5 +14,6 @@ around it.
 | **finding / rule / severity** | What an event *discloses*, rated. A rule may only claim what the event's own fields prove. Never persisted — recomputed. |
 | **projection** | A *total* derived function over `Event` (`event_host`, `assess`, …). Total is the point. |
 | **run directory** | A recorded run on disk: per-kind JSONL, rotation archives, `summary.json`. The read side (resolve the run the operator meant, validate, read archives back as one record) is owned by the `RunDirectory` module — `audit` and `query` consume runs only through it. |
+| **session** | One run's live state and the decisions the composition root made for it (`persist`, `replay`, `bpf`). The headless loop and the dashboard share it and differ only in the per-event sink; nothing downstream re-reads the command line. |
 | **holdings / dropped** | The two facts every capped structure owes the coverage ledger: what it currently holds (`holdings()`, bytes or entries) and how many entries it gave up under its cap (`dropped`). Registered at construction; `summary.json`'s evicted block composes from the registry. |
 | **one authority per fact** | The house rule: each piece of knowledge lives in exactly one place; everything else derives or is pinned to it by a test. |

@@ -6,7 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A dashboard filter change can no longer silently discard leak constraints.**
+  Retuning the checkbox bar rebuilt the whole filter from the bar's three groups,
+  wiping any `min_severity`/`rules` constraint the filter carried (the bar cannot
+  express them). The model now owns filter mutation: `retune()` changes only the
+  dimensions the bar speaks, and the filter is no longer assignable from outside.
+
 ### Changed
+
+- **Flag decisions stop at the composition root.** `build_session` is the one
+  reader of the parsed command line; `Session` now carries what it decided
+  (`persist`, `replay`, `bpf`), so the dashboard and `announce_start` consume the
+  session instead of re-deriving flags from a raw `argparse.Namespace` — the
+  defensive `getattr` chains and the second `persist_enabled()` call in the view
+  are gone, along with `persist_enabled()` itself.
 
 - **Every capped structure reports what it holds and what it dropped, at its
   interface.** The reassemblers gained `tracks`/`held`/`holdings`/`len` so their

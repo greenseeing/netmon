@@ -1905,14 +1905,18 @@ class TestStatsAndAnnounce:
         monkeypatch.setattr(
             netmon, "log", argparse.Namespace(info=lambda ev, **kw: records.append((ev, kw)))
         )
-        args = _legacy_parser().parse_args(["-r", "x.pcap", "-o", str(tmp_path)])
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         sink = PcapSink(run_dir / "capture.pcap")
         session = Session(
-            run_dir, local_processor(), NullWriter(), ReplayCapture(Path("x.pcap")), sink
+            run_dir,
+            local_processor(),
+            NullWriter(),
+            ReplayCapture(Path("x.pcap")),
+            sink,
+            replay="x.pcap",
         )
-        announce_start(args, session)
+        announce_start(session)
         sink.close()
         assert records[0][0] == "replay_started"
         assert str(records[0][1]["evidence"]).endswith("capture.pcap")
@@ -1926,14 +1930,13 @@ class TestStatsAndAnnounce:
         monkeypatch.setattr(
             netmon, "log", argparse.Namespace(info=lambda ev, **kw: records.append((ev, kw)))
         )
-        args = _legacy_parser().parse_args(["-o", str(tmp_path)])
         session = Session(
             tmp_path / "run",
             local_processor("192.168.1.50"),
             NullWriter(),
             LiveCapture(["eth0"], None),
         )
-        announce_start(args, session)
+        announce_start(session)
         assert records[0][0] == "capture_started"
         assert records[0][1]["ifaces"] == ["eth0"]
         assert records[0][1]["local_ips"] == ["192.168.1.50"]
@@ -5032,16 +5035,52 @@ class TestDashboardModelFilter:
         assert m.passes(q("x")) is True
 
     def test_filter_selects_kinds(self) -> None:
-        m = DashboardModel()
-        m.filter = EventFilter(kinds=frozenset({"tls_sni"}))
+        m = DashboardModel(filter=EventFilter(kinds=frozenset({"tls_sni"})))
         assert m.passes(sni_to("github.com")) is True
         assert m.passes(q("x")) is False
 
     def test_filter_never_drops_from_ring(self) -> None:
-        m = DashboardModel(cap=100)
-        m.filter = EventFilter(kinds=frozenset({"http"}))
+        m = DashboardModel(cap=100, filter=EventFilter(kinds=frozenset({"http"})))
         m.add_event(q("a"))  # filter is a view; the ring keeps everything
         assert len(m.recent(1000)) == 1
+
+    def test_retune_preserves_the_dimensions_the_bar_cannot_express(self) -> None:
+        # The checkbox bar speaks kind/direction/scope; host and the leak dimensions
+        # arrive from elsewhere and must survive a retune — rebuilding the whole
+        # filter from the bar's selections silently wiped them.
+        m = DashboardModel(
+            filter=EventFilter(
+                host="bank", min_severity=Severity.HIGH, rules=frozenset({"cleartext-http"})
+            )
+        )
+        m.retune(
+            kinds=frozenset({"dns_query"}),
+            directions=frozenset(DIRECTION_VALUES),
+            scopes=frozenset(SCOPE_VALUES),
+        )
+        assert m.filter.kinds == {"dns_query"}
+        assert m.filter.host == "bank"
+        assert m.filter.min_severity is Severity.HIGH
+        assert m.filter.rules == {"cleartext-http"}
+
+    def test_filter_note_names_whats_hidden_or_says_nothing(self) -> None:
+        m = DashboardModel()
+        assert m.filter_note() is None  # nothing hidden, nothing to announce
+        m.retune(
+            kinds=frozenset({"dns_query"}),
+            directions=frozenset(DIRECTION_VALUES),
+            scopes=frozenset(SCOPE_VALUES),
+        )
+        note = m.filter_note()
+        assert note is not None
+        assert "kind 1/" in note
+
+    def test_the_filter_is_not_assignable_from_outside(self) -> None:
+        # The model owns filter mutation; a view that could assign the attribute
+        # could also silently drop dimensions again.
+        m = DashboardModel()
+        with pytest.raises(AttributeError):
+            m.filter = EventFilter()  # type: ignore[misc, method-assign]
 
 
 class TestEventDirection:

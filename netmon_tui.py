@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from typing import ClassVar, Literal, cast
 
 import structlog
 from rich.text import Text
@@ -32,7 +32,6 @@ from netmon import (
     CopyResult,
     DashboardModel,
     Event,
-    EventFilter,
     PacketProcessor,
     Session,
     Severity,
@@ -44,12 +43,8 @@ from netmon import (
     event_to_cells,
     event_to_detail,
     open_private_new,
-    persist_enabled,
     printable,
 )
-
-if TYPE_CHECKING:
-    import argparse
 
 log = structlog.get_logger()
 
@@ -236,7 +231,7 @@ class NetmonApp(App[None]):
         self._following = True  # True while pinned to the top, tracking the newest row
         self._frozen: list[tuple[str, Event]] | None = None  # snapshot shown while paused
         self._detail_event: Event | None = None  # event in the detail pane, for `y` copy
-        self._indicated_state: tuple[str, str] | None = None  # last (mode, filter) painted
+        self._indicated_state: tuple[str, str | None] | None = None  # last (mode, note) painted
 
     def compose(self) -> ComposeResult:
         # markup=False on every panel: this app renders data, never markup. _paint is
@@ -386,8 +381,8 @@ class NetmonApp(App[None]):
         # change so the 10 Hz tick doesn't refresh the border every frame. The filter belongs
         # here for the same reason the mode does: a feed that is hiding events must never be
         # mistaken for a quiet network.
-        label = self.model.filter.label()
-        state = (mode, label)
+        note = self.model.filter_note()
+        state = (mode, note)
         if state == self._indicated_state:
             return
         self._indicated_state = state
@@ -395,11 +390,9 @@ class NetmonApp(App[None]):
         feed.set_class(mode == "PAUSED", "paused")
         feed.set_class(mode == "INSPECT", "inspecting")
         title = _FEED_TITLE[mode]
-        # Text, not str: border_title runs a str through markup parsing, and label() can carry
-        # a host substring the operator typed.
-        feed.border_title = Text(
-            title if self.model.filter.is_unconstrained() else f"{title} · filter: {label}"
-        )
+        # Text, not str: border_title runs a str through markup parsing, and the note can
+        # carry a host substring the operator typed.
+        feed.border_title = Text(title if note is None else f"{title} · filter: {note}")
 
     def _render_leaks(self, proc: PacketProcessor) -> None:
         rows = proc.findings.top(10)
@@ -488,9 +481,7 @@ class NetmonApp(App[None]):
             # "nothing matched" and "nothing happened" are different facts, and an operator
             # who unticked every box must not read the second when the first is true.
             empty = (
-                "(no events)"
-                if self.model.filter.is_unconstrained()
-                else ("(no rows match the filter)")
+                "(no events)" if self.model.filter_note() is None else "(no rows match the filter)"
             )
             self._set_detail(None, empty)
         elif self._selected_key is None:
@@ -542,25 +533,21 @@ class NetmonApp(App[None]):
             bar.display = True
             self.query_one("#f-kinds", SelectionList).focus()
 
-    def _selected_filter(self) -> EventFilter:
-        def chosen(wid: str) -> frozenset[str]:
-            return frozenset(self.query_one(wid, SelectionList).selected)
-
-        return EventFilter(
-            kinds=chosen("#f-kinds"),
-            directions=chosen("#f-dirs"),
-            scopes=chosen("#f-scopes"),
-            host=self.model.filter.host,
-        )
-
     def on_selection_list_selected_changed(
         self, _message: SelectionList.SelectedChanged[str]
     ) -> None:
-        # One handler for all three lists: the filter is rebuilt from the three selections,
-        # so there is no per-list state to keep in sync. Re-filters the live tail while
-        # following, or the frozen snapshot while paused/inspecting — _rebuild_feed already
-        # draws from _frozen, so filtering never yanks a reader off their scroll position.
-        self.model.filter = self._selected_filter()
+        # One handler for all three lists: the model is retuned from the three selections,
+        # so there is no per-list state to keep in sync — and retune() preserves the
+        # dimensions the bar cannot express (host, the leak constraints). Re-filters the
+        # live tail while following, or the frozen snapshot while paused/inspecting —
+        # _rebuild_feed already draws from _frozen, so filtering never yanks a reader off
+        # their scroll position.
+        def chosen(wid: str) -> frozenset[str]:
+            return frozenset(self.query_one(wid, SelectionList).selected)
+
+        self.model.retune(
+            kinds=chosen("#f-kinds"), directions=chosen("#f-dirs"), scopes=chosen("#f-scopes")
+        )
         self._rebuild_feed()
 
     def action_follow(self) -> None:
@@ -604,21 +591,22 @@ class NetmonApp(App[None]):
             self.notify("copy failed: no clipboard available", severity="warning")
 
 
-async def run_dashboard(session: Session, args: argparse.Namespace) -> None:
+async def run_dashboard(session: Session) -> None:
     # Redirect structlog to a file while Textual owns stdout, so a stray log line
     # can't garble the compositor; restore on the way out so run()'s final
     # capture_stopped prints cleanly after the terminal is released. Headless when
     # there is no tty (tests) — production reaches here only past main()'s tty guard.
     app = NetmonApp(session, DashboardModel())
-    # --log persists diagnostics next to the JSONL record; without it the run is
-    # ephemeral so structlog goes to the void — never stdout, which Textual owns.
-    if persist_enabled(args):
+    # A persisting run keeps diagnostics next to the JSONL record; an ephemeral one
+    # sends structlog to the void — never stdout, which Textual owns. The decision
+    # was made at build_session; the view only reads it.
+    if session.persist:
         diag = open_private_new(session.out_dir / "netmon.log")
     else:
         diag = os.fdopen(os.open(os.devnull, os.O_WRONLY), "w", encoding="utf-8")
     with diag as fp:
         configure_logging(stream=fp)
-        announce_start(args, session)  # capture_started/replay_started -> the log file
+        announce_start(session)  # capture_started/replay_started -> the log file
         try:
             await app.run_async(headless=not sys.stdout.isatty())
         finally:

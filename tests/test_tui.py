@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 from pathlib import Path
 
@@ -704,9 +703,8 @@ class TestNetmonAppHardening:
             raise OSError("disk full")
 
         monkeypatch.setattr(JsonlWriter, "write", boom)
-        args = argparse.Namespace(read=None, iface=None, bpf=None, tui=True)
         with pytest.raises(OSError, match="disk full"):
-            await run_dashboard(session, args)
+            await run_dashboard(session)
 
 
 # The exact shape that killed the overnight run: a wire-derived string in which a `[`
