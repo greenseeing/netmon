@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`audit` and `query` read runs through one module.** Resolving the run the
+  operator meant, deciding what counts as a run directory, reading rotation
+  archives back, and turning the record into events were four functions with two
+  different failure conventions and three copies of the on-disk naming knowledge.
+  `RunDirectory` now owns the read side of the run layout behind one interface
+  (`open` → `events`); every way a run can fail to open is the same signal, with
+  the reason on stderr. No behaviour change — same messages, same stream contract
+  (stdout is data, stderr is voice).
+
 ## [0.1.0] - 2026-07-28
 
 Initial public release.

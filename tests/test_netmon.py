@@ -1290,9 +1290,9 @@ class TestOutputRotation:
         for ev in events:
             writer.write(ev)
         writer.close()
-        from netmon import _load_run_events
+        from netmon import RunDirectory
 
-        read = list(_load_run_events(tmp_path / "run", frozenset(KIND_VALUES)))
+        read = list(RunDirectory(tmp_path / "run").events(frozenset(KIND_VALUES)))
         assert len(read) == len(events)  # nothing lost across the roll
 
     def test_pcap_sink_rolls_and_bounds_the_ring(self, tmp_path: Path) -> None:
@@ -6353,6 +6353,83 @@ class TestEventToCsvRow:
         row = event_to_csv_row(q("x"))
         assert row[0] == TS
         assert row[0] != event_to_cells(q("x"))[0]
+
+
+class TestRunDirectory:
+    # The one interface audit and query read runs through. Every "no" is the same
+    # signal — None, reason already on stderr — so callers never juggle two
+    # failure conventions.
+
+    def _run(self, root: Path, name: str) -> Path:
+        run = root / name
+        run.mkdir()
+        (run / "summary.json").write_text("{}", encoding="utf-8")
+        return run
+
+    def test_a_missing_directory_is_one_no_with_the_reason_on_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from netmon import RunDirectory
+
+        assert RunDirectory.open(str(tmp_path / "gone"), "logs", "audit") is None
+        assert "no such run directory" in capsys.readouterr().err
+
+    def test_a_directory_without_run_files_is_not_a_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from netmon import RunDirectory
+
+        (tmp_path / "notarun").mkdir()
+        assert RunDirectory.open(str(tmp_path / "notarun"), "logs", "query") is None
+        assert "not a netmon run directory" in capsys.readouterr().err
+
+    def test_a_zero_event_run_is_still_a_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A completed run always leaves summary.json even when it captured nothing;
+        # an empty record is a fact, not a bad path.
+        from netmon import RunDirectory
+
+        run = self._run(tmp_path, "run-20260728-000000")
+        opened = RunDirectory.open(str(run), "logs", "audit")
+        assert opened is not None
+        assert opened.path == run
+
+    def test_default_is_the_newest_run_by_name_not_mtime(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from netmon import RunDirectory
+
+        old = self._run(tmp_path, "run-20260101-000000")
+        new = self._run(tmp_path, "run-20260728-000000")
+        os.utime(old)  # touched after: mtime now lies about which is newest
+        opened = RunDirectory.open(None, str(tmp_path), "audit")
+        assert opened is not None
+        assert opened.path == new
+        # Announced on stderr — stdout is the data stream a query redirects.
+        assert f"reading {new}" in capsys.readouterr().err
+
+    def test_no_runs_at_all_says_how_to_make_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from netmon import RunDirectory
+
+        assert RunDirectory.open(None, str(tmp_path), "audit") is None
+        err = capsys.readouterr().err
+        assert "no runs found" in err
+        assert "netmon run --log" in err
+
+    def test_events_skip_an_unparseable_line_never_the_file(self, tmp_path: Path) -> None:
+        from netmon import RunDirectory
+
+        run = tmp_path / "run"
+        run.mkdir()
+        good = _flow_events(local_processor("192.168.1.50"), 1)[0]
+        (run / "flows.jsonl").write_text(
+            "not json\n" + good.model_dump_json(exclude_none=True) + "\n", encoding="utf-8"
+        )
+        got = list(RunDirectory(run).events(frozenset(KIND_VALUES)))
+        assert len(got) == 1  # the truncated tail is skipped, the record survives
 
 
 class TestQueryCsv:

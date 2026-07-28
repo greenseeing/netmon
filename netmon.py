@@ -4099,29 +4099,74 @@ def _filter_from_args(args: argparse.Namespace) -> EventFilter:
     )
 
 
-def _load_run_events(run_dir: Path, kinds: frozenset[str]) -> Iterator[Event]:
-    # Read only the file(s) the requested kinds live in — all of them when unfiltered —
-    # skipping any a partial run never wrote. A line that will not parse (a truncated
-    # tail, a hand-edited file) is skipped, not fatal: a query is a read-only view and
-    # must never crash on the record it is inspecting.
-    names = {KIND_TO_FILE[k] for k in kinds}
-    for name in sorted(names):
-        # Rotation (--rotate-mb) rolls a kind's overflow into numbered archives
-        # beside the active file; the query reads them all as one record. Reads
-        # follow symlinks — a query runs unprivileged on the reader's own run dir,
-        # so the write-side CWE-59 discipline does not apply here.
-        stem, _, suffix = name.partition(".")
-        for path in [*_rotation_archives(run_dir, stem, suffix), run_dir / name]:
-            if not path.exists():
-                continue
-            with path.open(encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        yield EVENT_ADAPTER.validate_json(line)
-                    except ValueError:
-                        continue
+class RunDirectory:
+    # The one authority for what a recorded run looks like on disk: how the run the
+    # operator meant is resolved, what makes a directory a run at all, how rotation
+    # archives read back, and how the record becomes events again. audit and query
+    # consume runs only through here; the write side shares only _rotation_archives,
+    # the naming's single listing.
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    @classmethod
+    def open(cls, run_dir: str | None, output: str, prog: str) -> "RunDirectory | None":
+        # Every way a run can fail to open is the same "no": None, with the reason
+        # already said on stderr — callers never juggle a second failure convention.
+        if run_dir is not None:
+            path = Path(run_dir)
+        else:
+            root = Path(output)
+            # Sort by NAME, not mtime: run dirs are run-YYYYmmdd-HHMMSS, so the name
+            # sorts chronologically, while mtime does not — reading an old run, or
+            # rsyncing one, touches it and would make it masquerade as the newest.
+            runs = sorted((p for p in root.glob("run-*") if p.is_dir()), key=lambda p: p.name)
+            if not runs:
+                print(
+                    f"netmon {prog}: no runs found in {root}/ — record one first "
+                    f"(`netmon run --log -o {root}`), or name a run directory",
+                    file=sys.stderr,
+                )
+                return None
+            path = runs[-1]
+            # Say which one, and say it on STDERR: stdout is the data. A "using ..."
+            # line on stdout would land as the first row of
+            # `netmon query --format csv > leaks.csv`.
+            print(f"netmon {prog}: reading {path}", file=sys.stderr)
+        if not path.is_dir():
+            print(f"netmon {prog}: no such run directory: {path}", file=sys.stderr)
+            return None
+        # A completed run always leaves summary.json even if it captured nothing, so a
+        # zero-event run is recognised (prints nothing) rather than mistaken for a bad path.
+        run_files = set(KIND_TO_FILE.values()) | {"summary.json"}
+        if not any((path / name).exists() for name in run_files):
+            print(f"netmon {prog}: not a netmon run directory: {path}", file=sys.stderr)
+            return None
+        return cls(path)
+
+    def events(self, kinds: frozenset[str]) -> Iterator[Event]:
+        # Read only the file(s) the requested kinds live in — all of them when
+        # unfiltered — skipping any a partial run never wrote. A line that will not
+        # parse (a truncated tail, a hand-edited file) is skipped, not fatal: a query
+        # is a read-only view and must never crash on the record it is inspecting.
+        names = {KIND_TO_FILE[k] for k in kinds}
+        for name in sorted(names):
+            # Rotation (--rotate-mb) rolls a kind's overflow into numbered archives
+            # beside the active file; the query reads them all as one record. Reads
+            # follow symlinks — a query runs unprivileged on the reader's own run dir,
+            # so the write-side CWE-59 discipline does not apply here.
+            stem, _, suffix = name.partition(".")
+            for path in [*_rotation_archives(self.path, stem, suffix), self.path / name]:
+                if not path.exists():
+                    continue
+                with path.open(encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            yield EVENT_ADAPTER.validate_json(line)
+                        except ValueError:
+                            continue
 
 
 def _event_time(ev: Event) -> datetime:
@@ -4156,40 +4201,6 @@ def _add_run_dir_arg(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _resolve_run_dir(args: argparse.Namespace, prog: str) -> Path | None:
-    if args.run_dir is not None:
-        return Path(args.run_dir)
-    root = Path(args.output)
-    # Sort by NAME, not mtime: run dirs are run-YYYYmmdd-HHMMSS, so the name sorts
-    # chronologically, while mtime does not — reading an old run, or rsyncing one, touches it
-    # and would make it masquerade as the newest.
-    runs = sorted((p for p in root.glob("run-*") if p.is_dir()), key=lambda p: p.name)
-    if not runs:
-        print(
-            f"netmon {prog}: no runs found in {root}/ — record one first "
-            f"(`netmon run --log -o {root}`), or name a run directory",
-            file=sys.stderr,
-        )
-        return None
-    # Say which one, and say it on STDERR: stdout is the data. A "using ..." line on stdout
-    # would land as the first row of `netmon query --format csv > leaks.csv`.
-    print(f"netmon {prog}: reading {runs[-1]}", file=sys.stderr)
-    return runs[-1]
-
-
-def _open_run_dir(run_dir: Path, prog: str) -> bool:
-    if not run_dir.is_dir():
-        print(f"netmon {prog}: no such run directory: {run_dir}", file=sys.stderr)
-        return False
-    # A completed run always leaves summary.json even if it captured nothing, so a
-    # zero-event run is recognised (prints nothing) rather than mistaken for a bad path.
-    run_files = set(KIND_TO_FILE.values()) | {"summary.json"}
-    if not any((run_dir / name).exists() for name in run_files):
-        print(f"netmon {prog}: not a netmon run directory: {run_dir}", file=sys.stderr)
-        return False
-    return True
-
-
 def _audit_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="netmon audit",
@@ -4210,25 +4221,25 @@ def cmd_audit(argv: list[str]) -> int:
     # recomputed from the record, so this works on a run captured BEFORE the rules existed.
     # Nothing was migrated; the evidence was always sufficient.
     args = _audit_parser().parse_args(argv)
-    run_dir = _resolve_run_dir(args, "audit")
-    if run_dir is None or not _open_run_dir(run_dir, "audit"):
+    run = RunDirectory.open(args.run_dir, args.output, "audit")
+    if run is None:
         return 1
     floor = SEVERITY_RANK[Severity(args.min_severity)]
     ledger = FindingLedger(cap=1000)
-    for event in _load_run_events(run_dir, frozenset(KIND_VALUES)):
+    for event in run.events(frozenset(KIND_VALUES)):
         finding = assess(event)
         if finding is not None and SEVERITY_RANK[finding.severity] >= floor:
             ledger.add(finding)
     rows = ledger.top(1000)
     if not rows:
-        print(f"no findings at or above {args.min_severity} in {run_dir}")
+        print(f"no findings at or above {args.min_severity} in {run.path}")
         # Not an assurance: netmon has no notion of "unusual", so this says no known-shape
         # disclosure was recorded — not that nothing leaked.
         print("(this means no known-shape disclosure was recorded, not that nothing leaked)")
         return 0
     counts = ledger.by_severity()
     tally = ", ".join(f"{counts[s]} {s}" for s in ("high", "medium", "low") if counts.get(s))
-    print(f"{run_dir}: {tally}\n")
+    print(f"{run.path}: {tally}\n")
     for finding, count in rows:
         seen = f" (x{count})" if count > 1 else ""
         print(f"[{str(finding.severity).upper():>6}] {finding.rule}{seen}")
@@ -4241,11 +4252,11 @@ def cmd_audit(argv: list[str]) -> int:
 
 def cmd_query(argv: list[str]) -> int:
     args = _query_parser().parse_args(argv)
-    run_dir = _resolve_run_dir(args, "query")
-    if run_dir is None or not _open_run_dir(run_dir, "query"):
+    run = RunDirectory.open(args.run_dir, args.output, "query")
+    if run is None:
         return 1
     selection = _filter_from_args(args)
-    events = [ev for ev in _load_run_events(run_dir, selection.kinds) if selection.matches(ev)]
+    events = [ev for ev in run.events(selection.kinds) if selection.matches(ev)]
     events.sort(key=_event_time)  # one timeline across per-kind files
     if args.format == "csv":
         # lineterminator="\n": the excel dialect's default \r\n would leave a stray CR in a
