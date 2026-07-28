@@ -62,10 +62,8 @@ from netmon import (
     QUIC_V2,
     RA_RDNSS_NAME,
     SCOPE_VALUES,
-    SERVICE_ADVICE,
     SERVICE_BY_PORT,
     SERVICE_LEAK,
-    SERVICE_NOTES,
     SEVERITY_GLYPH,
     SEVERITY_RANK,
     SEVERITY_STYLE,
@@ -5284,6 +5282,7 @@ def http_to(dst: str, method: str = "GET", host: str | None = None, **kw: Any) -
 
 
 def flow_to(service: str, remote_ip: str, port: int = 25, birth: Birth = "observed") -> FlowEvent:
+    row = SERVICE_LEAK.get(service)
     return FlowEvent(
         ts=TS,
         proto="tcp",
@@ -5295,7 +5294,7 @@ def flow_to(service: str, remote_ip: str, port: int = 25, birth: Birth = "observ
         remote_ip=remote_ip,
         remote_port=port,
         service=service,
-        note=SERVICE_NOTES.get(service),
+        note=row.note if row else None,
     )
 
 
@@ -5648,10 +5647,24 @@ class TestFindingRuleCoverage:
         ]
         assert {f.rule for f in reached if f is not None} == set(Rule)
 
-    def test_service_tables_do_not_drift(self) -> None:
-        assert set(SERVICE_LEAK) <= set(SERVICE_BY_PORT.values()), "a severity for no known port"
-        assert set(SERVICE_NOTES) <= set(SERVICE_LEAK), "a noted service with no severity"
-        assert set(SERVICE_ADVICE) <= set(SERVICE_LEAK), "advice for a service never rated"
+    def test_every_rated_service_is_a_port_with_a_name(self) -> None:
+        # The one join the row type cannot enforce: a catalog key must be a name
+        # SERVICE_BY_PORT can actually produce. Note⊆rated and advice⊆rated, which this
+        # test used to pin across three dicts, are now impossible states — a row carries
+        # its severity or it does not construct.
+        assert set(SERVICE_LEAK) <= set(SERVICE_BY_PORT.values()), "a profile for no known port"
+
+    def test_a_rated_service_carries_its_whole_profile_in_one_row(self) -> None:
+        ftp = SERVICE_LEAK["ftp"]
+        assert ftp.severity is Severity.HIGH
+        assert "sftp" in ftp.advice
+        ntp = SERVICE_LEAK["ntp"]
+        assert ntp.note is not None and "clock" in ntp.note
+
+    def test_an_unannotated_service_reads_as_a_generic_cleartext_channel(self) -> None:
+        http = SERVICE_LEAK["http"]
+        assert http.note is None
+        assert "prefer its TLS port" in http.advice
 
     def test_severity_rank_covers_every_severity(self) -> None:
         assert set(SEVERITY_RANK) == set(Severity)

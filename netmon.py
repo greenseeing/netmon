@@ -134,18 +134,6 @@ CAPTIVE_PORTAL_HOSTS = frozenset(
     }
 )
 
-# Light per-service annotations for flows that are themselves a disclosure the
-# reader would otherwise miss: NTP betrays the device clock/OS, and STARTTLS
-# mail ports carry auth and content in cleartext before the TLS upgrade.
-SERVICE_NOTES: dict[str, str] = {
-    "ntp": "clock sync — reveals device/OS presence",
-    "smtp": "STARTTLS mail — auth/content may precede TLS",
-    "smtp-submission": "STARTTLS mail — auth/content may precede TLS",
-    "imap": "STARTTLS mail — auth/content may precede TLS",
-    "pop3": "STARTTLS mail — auth/content may precede TLS",
-}
-
-
 DNS_RCODES = {
     0: "NOERROR",
     1: "FORMERR",
@@ -611,28 +599,63 @@ class Finding(NamedTuple):
     advice: str  # what the operator can do about it
 
 
-# How much a flow to each cleartext-capable service costs you. SERVICE_NOTES stays the one
-# authority for the prose; this is the one authority for the severity, and a test pins that
-# neither grows a key the other -- or SERVICE_BY_PORT -- has never heard of.
+_DEFAULT_PLAINTEXT_ADVICE = "this service carries its content in the clear — prefer its TLS port"
+
+
+class ServiceLeak(NamedTuple):
+    # What a flow to one cleartext-capable service costs you, in one row: the severity, the
+    # annotation for flows that are themselves a disclosure the reader would otherwise miss
+    # (note), and what the operator can do about it (advice). Three dicts used to carry these
+    # and a test pinned their key sets together; in a row, a noted or advised service that
+    # was never rated cannot be written down at all.
+    #
+    # The advice default names a TLS port, which is right for most cleartext services and
+    # WRONG for NTP -- there is no such port to prefer, and telling someone to dial a port
+    # that does not exist is worse than saying nothing. NTP overrides it with NTS.
+    severity: Severity
+    note: str | None = None
+    advice: str = _DEFAULT_PLAINTEXT_ADVICE
+
+
+_STARTTLS_MAIL = ServiceLeak(
+    # MEDIUM is the whole discipline in miniature: netmon does not read the payload, so it
+    # cannot know whether the client upgraded with STARTTLS before authenticating. HIGH
+    # would be claiming a credential leak nobody observed.
+    Severity.MEDIUM,
+    note="STARTTLS mail — auth/content may precede TLS",
+    advice="this port carries auth in cleartext unless the client upgrades with STARTTLS, and "
+    "netmon cannot see whether it did — re-run with --pcap and open the flow in tshark to "
+    "settle it",
+)
+
+# The one authority for a rated service's whole profile. A key here must be a name
+# SERVICE_BY_PORT can produce; a test pins that.
 #
-# ftp is HIGH because the protocol puts USER/PASS on the wire by design. The mail ports are
-# MEDIUM, and the reason is the whole discipline in miniature: netmon does not read their
-# payload, so it cannot know whether the client upgraded with STARTTLS before authenticating.
-# Rating them HIGH would be claiming a credential leak nobody observed.
+# ftp is HIGH because the protocol puts USER/PASS on the wire by design.
 #
 # `dns` is deliberately absent: the DnsQueryEvent is the authority for that disclosure, and
 # listing it here too would count every plaintext lookup twice, once as a flow and once as a
 # query. `http` cannot take that shortcut -- see _HTTP_SERVICES.
-SERVICE_LEAK: dict[str, Severity] = {
-    "ftp": Severity.HIGH,
-    "telnet": Severity.HIGH,
-    "smtp": Severity.MEDIUM,
-    "smtp-submission": Severity.MEDIUM,
-    "imap": Severity.MEDIUM,
-    "pop3": Severity.MEDIUM,
-    "ntp": Severity.LOW,
-    "http": Severity.LOW,
-    "http-alt": Severity.LOW,
+SERVICE_LEAK: dict[str, ServiceLeak] = {
+    "ftp": ServiceLeak(
+        Severity.HIGH,
+        advice="FTP puts credentials and every file on the wire by design — use sftp/scp, or ftps",
+    ),
+    "telnet": ServiceLeak(
+        Severity.HIGH, advice="telnet is a cleartext shell, credentials included — use ssh"
+    ),
+    "smtp": _STARTTLS_MAIL,
+    "smtp-submission": _STARTTLS_MAIL,
+    "imap": _STARTTLS_MAIL,
+    "pop3": _STARTTLS_MAIL,
+    "ntp": ServiceLeak(
+        Severity.LOW,
+        note="clock sync — reveals device/OS presence",
+        advice="NTP has no TLS port to prefer: NTS (RFC 8915) is what authenticates it — chrony "
+        "and ntpsec support it, systemd-timesyncd does not",
+    ),
+    "http": ServiceLeak(Severity.LOW),
+    "http-alt": ServiceLeak(Severity.LOW),
 }
 
 # HTTP is the one service with TWO possible witnesses, so it is the one service where "which
@@ -643,29 +666,6 @@ SERVICE_LEAK: dict[str, Severity] = {
 # kill the double-count would make an ongoing plaintext connection invisible, which is the
 # opposite of the job.
 _HTTP_SERVICES = frozenset({"http", "http-alt"})
-
-_STARTTLS_ADVICE = (
-    "this port carries auth in cleartext unless the client upgrades with STARTTLS, and "
-    "netmon cannot see whether it did — re-run with --pcap and open the flow in tshark to "
-    "settle it"
-)
-
-_DEFAULT_PLAINTEXT_ADVICE = "this service carries its content in the clear — prefer its TLS port"
-
-# Advice the operator can actually act on, per service. The fallback names a TLS port, which
-# is right for most cleartext services and WRONG for NTP -- there is no such port to prefer;
-# NTS (RFC 8915) is the answer, and telling someone to dial a port that does not exist is
-# worse than saying nothing. A key here must be a key in SERVICE_LEAK; a test pins that.
-SERVICE_ADVICE: dict[str, str] = {
-    "ftp": "FTP puts credentials and every file on the wire by design — use sftp/scp, or ftps",
-    "telnet": "telnet is a cleartext shell, credentials included — use ssh",
-    "ntp": "NTP has no TLS port to prefer: NTS (RFC 8915) is what authenticates it — chrony "
-    "and ntpsec support it, systemd-timesyncd does not",
-    "smtp": _STARTTLS_ADVICE,
-    "smtp-submission": _STARTTLS_ADVICE,
-    "imap": _STARTTLS_ADVICE,
-    "pop3": _STARTTLS_ADVICE,
-}
 
 # A name that was only ever meant for your own network. Leaking one to a public resolver
 # hands over your internal topology — hostnames, naming scheme, sometimes the org chart.
@@ -852,11 +852,12 @@ def assess(event: Event) -> Finding | None:
 
         case "flow":
             flow = cast(FlowEvent, event)
-            severity = SERVICE_LEAK.get(flow.service, Severity.LOW)
-            if flow.service not in SERVICE_LEAK:
+            leak = SERVICE_LEAK.get(flow.service)
+            if leak is None:
                 return None
             if flow.service in _HTTP_SERVICES and flow.birth != "pre-existing":
                 return None  # its HttpEvent said it already
+            severity = leak.severity
             if scope not in _OFF_NET:
                 severity = _DEMOTE[severity]
             where = flow.hostname or flow.remote_ip
@@ -864,11 +865,9 @@ def assess(event: Event) -> Finding | None:
                 rule=Rule.PLAINTEXT_SERVICE,
                 severity=severity,
                 subject=f"{flow.service} {where}",
-                leaked=SERVICE_NOTES.get(
-                    flow.service, f"a cleartext-capable {flow.service} channel was opened"
-                ),
+                leaked=leak.note or f"a cleartext-capable {flow.service} channel was opened",
                 to=f"{where}:{flow.remote_port} ({scope})",
-                advice=SERVICE_ADVICE.get(flow.service, _DEFAULT_PLAINTEXT_ADVICE),
+                advice=leak.advice,
             )
 
     return None
@@ -3138,6 +3137,7 @@ class PacketProcessor:
         service = SERVICE_BY_PORT.get(
             (proto, remote_port), SERVICE_BY_PORT.get((proto, local_port), f"{proto}/{remote_port}")
         )
+        leak = SERVICE_LEAK.get(service)
         return [
             FlowEvent(
                 ts=ts,
@@ -3151,7 +3151,7 @@ class PacketProcessor:
                 remote_port=remote_port,
                 service=service,
                 hostname=hostname,
-                note=SERVICE_NOTES.get(service),
+                note=leak.note if leak else None,
             )
         ]
 

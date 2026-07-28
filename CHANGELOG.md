@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A rated service's severity, note, and advice travel as one row.** Three
+  parallel dicts (`SERVICE_NOTES`, `SERVICE_LEAK`, `SERVICE_ADVICE`) carried a
+  service's leak profile, joined only by a drift test. `SERVICE_LEAK` now maps
+  a service name to a `ServiceLeak` row, so a noted or advised service that was
+  never rated cannot be written down at all; the test keeps only the join the
+  type cannot enforce — every rated service must be a name `SERVICE_BY_PORT`
+  can produce.
+
 ## [0.1.1] - 2026-07-28
 
 ### Fixed
